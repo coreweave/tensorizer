@@ -1,0 +1,2 @@
+torch
+protobuf>=3.19.5
