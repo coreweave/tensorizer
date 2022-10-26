@@ -211,7 +211,7 @@ add_custom_command(
         OUTPUT "tensors/go.mod"
         WORKING_DIRECTORY "${GENERATED_PROTOBUF_PATH}"
         COMMAND rm -f go.mod
-        COMMAND go mod init github.com/${PROJECT_REF}
+        COMMAND go mod init github.com/${PROJECT_REF}/tensors
         COMMAND go mod tidy
         DEPENDS ${GENERATED_PROTOBUF_FILES_golang_grpc})
 
