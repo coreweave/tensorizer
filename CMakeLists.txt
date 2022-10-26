@@ -17,7 +17,7 @@ string(TOLOWER ${PROJECT_REF} PROJECT_REF)
 
 find_package(PkgConfig REQUIRED)
 find_package(Protobuf REQUIRED)
-set(PROTO_PATH "${PROJECT_SOURCE_DIR}/src/proto")
+set(PROTO_PATH "${PROJECT_SOURCE_DIR}/proto")
 set(GENERATED_PROTOBUF_PATH "${PROJECT_SOURCE_DIR}/tensors")
 file(MAKE_DIRECTORY ${GENERATED_PROTOBUF_PATH})
 
@@ -49,7 +49,7 @@ set(python_exec "${PYBUILD_PATH}/bin/python3")
 set(python_args "-m" "grpc_tools.protoc")
 set(python_plugin "")
 set(python_output "--python_out=")
-set(python_output_dir "${PROJECT_SOURCE_DIR}/tensors")
+set(python_output_dir "${PROJECT_SOURCE_DIR}")
 file(MAKE_DIRECTORY "${python_output_dir}")
 file(WRITE "${PROJECT_SOURCE_DIR}/tensors/__init__.py")
 set(python_exts "_pb2.py")
@@ -70,9 +70,9 @@ if (NOT ${EXIT_CODE} EQUAL 0)
 endif()
 
 set(golang_plugin "")
-set(golang_output "--go_out=")
-set(golang_output_dir "${PROJECT_SOURCE_DIR}/tensors")
-file(MAKE_DIRECTORY "${golang_output_dir}")
+set(golang_output "--go_out=paths=source_relative:")
+set(golang_output_dir "./")
+file(MAKE_DIRECTORY "${golang_output_dir}/tensors")
 set(golang_exts ".go")
 
 # Javascript / Typescript target support
@@ -204,11 +204,11 @@ add_target_languages(
 )
 
 # Generate base protobufs
-add_protobufs(${CMAKE_SOURCE_DIR}/src/proto/tensors.proto)
+add_protobufs(${CMAKE_SOURCE_DIR}/proto/tensors.proto)
 generate_interfaces()
 
 add_custom_command(
-        OUTPUT "${golang_output_dir}/go.mod"
+        OUTPUT "tensors/go.mod"
         WORKING_DIRECTORY "${GENERATED_PROTOBUF_PATH}"
         COMMAND rm -f go.mod
         COMMAND go mod init github.com/${PROJECT_REF}
