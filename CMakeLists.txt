@@ -18,7 +18,7 @@ string(TOLOWER ${PROJECT_REF} PROJECT_REF)
 find_package(PkgConfig REQUIRED)
 find_package(Protobuf REQUIRED)
 set(PROTO_PATH "${PROJECT_SOURCE_DIR}/src/proto")
-set(GENERATED_PROTOBUF_PATH "${PROJECT_SOURCE_DIR}/gooseai")
+set(GENERATED_PROTOBUF_PATH "${PROJECT_SOURCE_DIR}/tensors")
 file(MAKE_DIRECTORY ${GENERATED_PROTOBUF_PATH})
 
 ## Python target support
@@ -49,9 +49,9 @@ set(python_exec "${PYBUILD_PATH}/bin/python3")
 set(python_args "-m" "grpc_tools.protoc")
 set(python_plugin "")
 set(python_output "--python_out=")
-set(python_output_dir "${PROJECT_SOURCE_DIR}/gooseai")
+set(python_output_dir "${PROJECT_SOURCE_DIR}/tensors")
 file(MAKE_DIRECTORY "${python_output_dir}")
-file(WRITE "${PROJECT_SOURCE_DIR}/gooseai/__init__.py")
+file(WRITE "${PROJECT_SOURCE_DIR}/tensors/__init__.py")
 set(python_exts "_pb2.py")
 
 ## Golang target support
@@ -71,7 +71,7 @@ endif()
 
 set(golang_plugin "")
 set(golang_output "--go_out=")
-set(golang_output_dir "${PROJECT_SOURCE_DIR}/gooseai")
+set(golang_output_dir "${PROJECT_SOURCE_DIR}/tensors")
 file(MAKE_DIRECTORY "${golang_output_dir}")
 set(golang_exts ".go")
 
@@ -96,7 +96,7 @@ set(javascript_exec "${PROJECT_SOURCE_DIR}/src/bin/protoc")
 set(javascript_plugin "--plugin=protoc-gen-ts=${NODE_BIN_DIRECTORY}/protoc-gen-ts")
 set(javascript_args "")
 set(javascript_output "--js_out=import_style=commonjs,binary:")
-set(javascript_output_dir "${PROJECT_SOURCE_DIR}/gooseai")
+set(javascript_output_dir "${PROJECT_SOURCE_DIR}/tensors")
 file(MAKE_DIRECTORY "${javascript_output_dir}")
 set(javascript_exts "_pb.js")
 
@@ -104,7 +104,7 @@ set(typescript_web_exec "${PROJECT_SOURCE_DIR}/src/bin/protoc")
 set(typescript_web_plugin  "--plugin=protoc-gen-ts=${NODE_BIN_DIRECTORY}/protoc-gen-ts")
 set(typescript_web_args "")
 set(typescript_web_output "--ts_out=service=grpc-web:")
-set(typescript_web_output_dir "${PROJECT_SOURCE_DIR}/gooseai")
+set(typescript_web_output_dir "${PROJECT_SOURCE_DIR}/tensors")
 file(MAKE_DIRECTORY "${typescript_output_dir}")
 set(typescript_web_exts "_grpc_pb_service.d.ts;_grpc_pb_service.js")
 
@@ -112,7 +112,7 @@ set(typescript_node_exec "${PROJECT_SOURCE_DIR}/src/bin/protoc")
 set(typescript_node_plugin "--plugin=protoc-gen-ts=${NODE_BIN_DIRECTORY}/protoc-gen-ts" "--plugin=protoc-gen-grpc=${NODE_BIN_DIRECTORY}/grpc_tools_node_protoc_plugin")
 set(typescript_node_args "")
 set(typescript_node_output "--ts_out=service=grpc-node:")
-set(typescript_node_output_dir "${PROJECT_SOURCE_DIR}/gooseai")
+set(typescript_node_output_dir "${PROJECT_SOURCE_DIR}/tensors")
 file(MAKE_DIRECTORY "${typescript_output_dir}")
 set(typescript_node_exts "_grpc_pb.d.ts")
 
@@ -137,7 +137,7 @@ macro(_generate_interface LANG INTERFACE_FILE)
     set(OUTPUT_FILES)
     set(CMD_EXEC)
     foreach(_ext ${${LANG}_exts})
-        set(OUTPUT_FILE_NAME "${${LANG}_output_dir}/${_PROTOBUF_SHORT}/${_PROTOBUF_SHORT}${_ext}")
+        set(OUTPUT_FILE_NAME "${${LANG}_output_dir}/${_PROTOBUF_SHORT}${_ext}")
         list(APPEND GENERATED_PROTOBUF_FILES_${LANG} "${OUTPUT_FILE_NAME}")
         list(APPEND OUTPUT_FILES "${OUTPUT_FILE_NAME}")
         message("${INTERFACE_FILE} => ${OUTPUT_FILE_NAME}")
@@ -211,7 +211,7 @@ add_custom_command(
         OUTPUT "${golang_output_dir}/go.mod"
         WORKING_DIRECTORY "${GENERATED_PROTOBUF_PATH}"
         COMMAND rm -f go.mod
-        COMMAND go mod init github.com/${PROJECT_REF}/gooseai
+        COMMAND go mod init github.com/${PROJECT_REF}
         COMMAND go mod tidy
         DEPENDS ${GENERATED_PROTOBUF_FILES_golang_grpc})
 
@@ -221,5 +221,5 @@ add_custom_target(
         ${GENERATED_PROTOBUF_FILES_python}
         ${GENERATED_PROTOBUF_FILES_golang}
         ${GENERATED_PROTOBUF_FILES_javascript}
-        ${PROJECT_SOURCE_DIR}/gooseai/go.mod
+        ${PROJECT_SOURCE_DIR}/tensors/go.mod
 )

@@ -1,4 +1,4 @@
-module github.com/coreweave/tensorizer/gooseai
+module github.com/coreweave/tensorizer
 
 go 1.18
 

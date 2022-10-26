@@ -1,6 +1,6 @@
 syntax = 'proto3';
 package tensors;
-option go_package = "./;tensors";
+option go_package = "github.com/coreweave/tensorizer/tensors";
 
 enum Dtype {
   DT_INVALID = 0;
