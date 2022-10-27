@@ -3,7 +3,6 @@ from torch import Tensor
 import numpy as np
 import tensors.tensors_pb2 as tensors_pb
 from typing import OrderedDict
-import time
 
 DtypePbs = {
     torch.float32: tensors_pb.DT_FLOAT32,
