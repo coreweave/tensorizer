@@ -64,14 +64,17 @@ PbNpyDtypes = {
     tensors_pb.DT_QUINT4_2: np.uint8,
 }
 
-def serialize(t: Tensor, attribute: tensors_pb.AttributeType = None) -> tensors_pb.Tensor:
+
+def serialize_tensor(t: Tensor, attribute: tensors_pb.AttributeType = None) -> \
+        tensors_pb.Tensor:
     assert isinstance(t, Tensor)
-    assert attribute is None or attribute in [tensors_pb.AT_PARAMETER, tensors_pb.AT_BUFFER]
-    
+    assert attribute is None or attribute in [tensors_pb.AT_PARAMETER,
+                                              tensors_pb.AT_BUFFER]
+
     extra_opts = {}
     if attribute is not None:
         extra_opts = {'attr_type': attribute}
-    
+
     return tensors_pb.Tensor(
         dtype=DtypePbs[t.dtype],
         shape=t.shape,
@@ -79,17 +82,20 @@ def serialize(t: Tensor, attribute: tensors_pb.AttributeType = None) -> tensors_
         **extra_opts
     )
 
-def deserialize(t: tensors_pb.Tensor) -> Union[Tensor, Tuple[Tensor, 'tensors_pb.AttributeType']]:
+
+def deserialize_tensor(t: tensors_pb.Tensor) -> \
+        Union[Tensor, Tuple[Tensor, 'tensors_pb.AttributeType']]:
     mv = bytearray(t.data)
     tensor = torch.as_tensor(np.ndarray.__new__(np.memmap,
-                           t.shape,
-                           dtype=PbNpyDtypes[t.dtype],
-                           buffer=mv,
-                           offset=0))
+                                                t.shape,
+                                                dtype=PbNpyDtypes[t.dtype],
+                                                buffer=mv,
+                                                offset=0))
     if t.HasField("attr_type"):
         return tensor, t.attr_type
     else:
         return tensor
+
 
 def serialize_model(model: torch.nn.Module, file_stream: BinaryIO) -> None:
     modules = list()
@@ -100,14 +106,14 @@ def serialize_model(model: torch.nn.Module, file_stream: BinaryIO) -> None:
             v = param.cpu().detach()
             param_attr = tensors_pb.Attribute(
                 name=name,
-                tensor=serialize(v, tensors_pb.AT_PARAMETER)
+                tensor=serialize_tensor(v, tensors_pb.AT_PARAMETER)
             )
             attributes.append(param_attr)
         for name, buffer in module.named_buffers(recurse=False):
             v = buffer.cpu().detach()
             buffer_attr = tensors_pb.Attribute(
                 name=name,
-                tensor=serialize(v, tensors_pb.AT_BUFFER)
+                tensor=serialize_tensor(v, tensors_pb.AT_BUFFER)
             )
             attributes.append(buffer_attr)
         module_attr = tensors_pb.Attribute(
@@ -117,11 +123,12 @@ def serialize_model(model: torch.nn.Module, file_stream: BinaryIO) -> None:
             )
         )
         modules.append(module_attr)
-    model_proto = tensors_pb.Module( # models are just modules as attributes
+    model_proto = tensors_pb.Module(  # models are just modules as attributes
         name="",
         attributes=modules,
     )
     file_stream.write(model_proto.SerializeToString())
+
 
 def deserialize_model(model: torch.nn.Module, file_stream: BinaryIO) -> None:
     model_proto = tensors_pb.Module()
@@ -130,13 +137,14 @@ def deserialize_model(model: torch.nn.Module, file_stream: BinaryIO) -> None:
     modules: OrderedDict[str, torch.nn.Module] = OrderedDict()
     for name, module in model.named_modules():
         modules[name] = module
-    
+
     for module_attr in model_proto.attributes:
         module = modules[module_attr.name]
         for attr in module_attr.module.attributes:
-            if attr.tensor.attr_type == tensors_pb.AT_PARAMETER:
-                module._parameters[attr.name] = deserialize(attr.tensor)[0]
-            elif attr.tensor.attr_type == tensors_pb.AT_BUFFER:
-                module._buffers[attr.name] = deserialize(attr.tensor)[0]
-            else:
-                raise ValueError("Unknown attribute type")
+            if attr.tensor.HasField("attr_type"):
+                if attr.tensor.attr_type == tensors_pb.AT_PARAMETER:
+                    module._parameters[attr.name] = deserialize_tensor(attr.tensor)[0]
+                elif attr.tensor.attr_type == tensors_pb.AT_BUFFER:
+                    module._buffers[attr.name] = deserialize_tensor(attr.tensor)[0]
+                else:
+                    raise ValueError("Unknown attribute type")
