@@ -1,3 +1,4 @@
+import io
 import serializer
 import unittest
 import torch
@@ -22,3 +23,17 @@ class TestSerializer(unittest.TestCase):
         t_serialized = serializer.serialize(t)
         t_deserialized = serializer.deserialize(t_serialized)
         self.assertTrue(torch.equal(t, t_deserialized))
+
+    def test_serializer_model(self):
+        class TestModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.rand(2, 3))
+
+        model = TestModel()
+        model2 = TestModel()
+        f = io.BytesIO()
+        serializer.serialize_model(model, f)
+        f.seek(0)
+        serializer.deserialize_model(model2, f)
+        self.assertTrue(torch.equal(model.weight, model2.weight))
