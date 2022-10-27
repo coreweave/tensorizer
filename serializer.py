@@ -64,25 +64,6 @@ PbNpyDtypes = {
     tensors_pb.DT_QUINT4_2: np.uint8,
 }
 
-def no_init_or_tensor(loading_code):
-    def dummy(self):
-        return
-
-    modules = [torch.nn.Linear, torch.nn.Embedding, torch.nn.LayerNorm]
-    original = {}
-    for mod in modules:
-        original[mod] = mod.reset_parameters
-        mod.reset_parameters = dummy
-    original_empty = torch.empty
-
-    torch.empty = lambda *args, **kwargs: original_empty(*args, **{**kwargs, "device": "meta"})
-
-    result = loading_code()
-    for mod in modules:
-        mod.reset_parameters = original[mod]
-    torch.empty = original_empty
-
-    return result
 
 def serialize(t: Tensor) -> tensors_pb.Tensor:
     assert isinstance(t, Tensor)
