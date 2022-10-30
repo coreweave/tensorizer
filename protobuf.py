@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 import numpy as np
 import tensors.tensors_pb2 as tensors_pb
+from tensors.tensors_pb2 import Tensor as TensorPb
 from typing import OrderedDict, Tuple, Union, BinaryIO
 
 DtypePbs = {
@@ -78,7 +79,7 @@ def serialize_tensor(t: Tensor, attribute: tensors_pb.AttributeType = None) -> \
     return tensors_pb.Tensor(
         dtype=DtypePbs[t.dtype],
         shape=t.shape,
-        data=t.detach().numpy().tobytes(),
+        data=t.cpu().detach().numpy().tobytes(),
         **extra_opts
     )
 
