@@ -3,16 +3,21 @@
 # Fast LLM model serialization and deserialization          (c) 2022 Coreweave
 ##############################################################################
 
-import fcntl
+# try to import UNIX only dependencies
+try:
+    import fcntl
+    import resource
+except ImportError:
+    fcntl = None
+    resource = None
+
 import subprocess
-import resource
 import io
 from io import SEEK_SET, SEEK_END
 import numpy
 import struct
 import torch
 import typing
-from dotmap import DotMap
 import time
 import logging
 import sys
@@ -690,6 +695,16 @@ def serialize_model(m: torch.nn.Module, out_prefix: str):
     # torch.save(m, f"{out_prefix}.model", _use_new_zipfile_serialization=False)
 
 
+def get_ram_usage_str() -> str:
+    if resource is not None:
+        maxrss_b4 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (
+            1000 * 1000
+        )
+        maxrss_b4_gb = f"{maxrss_b4:0.2f}gb CPU RAM used"
+    else:
+        maxrss_b4_gb = "unknown CPU RAM used"
+    return maxrss_b4_gb
+
 def load_model(path_uri: str) -> torch.nn.Module:
     """
     Given a path prefix, load:
@@ -703,7 +718,14 @@ def load_model(path_uri: str) -> torch.nn.Module:
     if path_uri.startswith("https://") or path_uri.startswith("http://"):
         config_uri = f"{path_uri}/config.json"
         tensors_uri = f"{path_uri}/tensors"
-        tensor_loader = lambda: CURLStreamFile(tensors_uri)
+        if fcntl is not None:
+            # We have fcntl, so we can use the fast CURL-based loader.
+            logger.info("Using CURL for downloading tensors")
+            tensor_loader = lambda: CURLStreamFile(tensors_uri)
+        else:
+            # Fallback to slow requests-based loader.
+            logger.info("Using native requests for downloading tensors")
+            tensor_loader = lambda: RequestsStreamFile(tensors_uri)
     else:
         tensors_uri = f"{path_uri}/tensors"
         config_uri = "file://" + os.path.join(
@@ -716,11 +738,7 @@ def load_model(path_uri: str) -> torch.nn.Module:
             config_uri = f"{os.path.dirname(path_uri)}/config.json"
             tensor_loader = lambda: open(tensor_uri, "rb")
     
-    maxrss_b4 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (
-        1000 * 1000
-    )
-    maxrss_b4_gb = f"{maxrss_b4:0.2f}gb CPU RAM used"
-    logger.info(f"Loading {tensors_uri}, {maxrss_b4_gb}")
+    logger.info(f"Loading {tensors_uri}, {get_ram_usage_str()}")
     begin_load = time.time()
 
     try:
@@ -742,15 +760,13 @@ def load_model(path_uri: str) -> torch.nn.Module:
     tensor_deserializer.load_tensors(model, dtype="float16")
 
     tensor_load_s = time.time() - begin_load
-    maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1000 * 1000)
-    maxrss_gb = f"{maxrss:0.2f}gb CPU RAM used"
     rate_str = convert_bytes(
         tensor_deserializer.total_bytes_read / tensor_load_s
     )
     tensors_sz = convert_bytes(tensor_deserializer.total_bytes_read)
     logger.info(
         f"Model tensors loaded in {tensor_load_s:0.2f}s, read "
-        + f"{tensors_sz} @ {rate_str}/s, {maxrss_gb}"
+        + f"{tensors_sz} @ {rate_str}/s, {get_ram_usage_str()}"
     )
 
     return model
@@ -773,12 +789,10 @@ def hf_main():
     cudadev = torch.cuda.current_device()
     gb_gpu = int(torch.cuda.get_device_properties(0).total_memory /
                  (1000 * 1000 * 1000))
-    gb_cpu = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1000 * 1000)
 
     logger.info("GPU: " + torch.cuda.get_device_name(cudadev))
     logger.info("GPU RAM: " + str(gb_gpu) + "gb")
-    logger.info("PYTHON USED RAM: " + str(gb_cpu) + "gb")
-
+    logger.info("PYTHON USED RAM: " + get_ram_usage_str())
 
     serialize_model(model, output_prefix)
     if os.path.isdir(output_prefix):
