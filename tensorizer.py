@@ -18,6 +18,7 @@ import logging
 import sys
 import pathlib
 import os
+import requests
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error" # disable missing keys and unexpected key warnings
 
@@ -253,58 +254,74 @@ class CURLStreamFile(object):
             raise (Exception("Seeking is unsupported"))
 
 
-class ResponseStream(object):
+class RequestsStreamFile(object):
     """
-    This is intended to provide a file-like wrapper around an iterator that
-    yields block chunks. Useful for wrapping around streaming `reaponse`
-    requests, but not as fast as `CURLStreamFile`
+    RequestsStreamFile implements a file-like object around an HTTP download, the
+    intention being to not buffer more than we have to. Not as fast or efficient
+    as CURLStreamFile, but it works on Windows.
     """
 
-    def __init__(self, request_iterator):
-        self._iterator = request_iterator
+    def __init__(self, uri: str) -> None:
+        self._uri = uri
         self._curr = 0
-        self._buff = bytearray()
+        self._r = requests.get(uri, stream=True)
         self.closed = False
 
-    def _read_until(self, goal_position):
-        while len(self._buff) + self._curr < goal_position:
-            try:
-                self._buff.extend(next(self._iterator))
-            except StopIteration:
-                break
-        if len(self._buff) + self._curr >= goal_position:
-            ret_buff = bytes(self._buff[: goal_position - self._curr])
-            self._buff = self._buff[goal_position - self._curr :]
-            self._curr = goal_position
+    def _read_until(
+        self, goal_position: int, ba: Union[bytearray, None] = None
+    ) -> Union[bytes, int]:
+        if ba is None:
+            rq_sz = goal_position - self._curr
+            ret_buff = self._r.raw.read(rq_sz)
+            ret_buff_sz = len(ret_buff)
+        else:
+            rq_sz = len(ba)
+            ret_buff_sz = self._r.raw.readinto(ba)
+            ret_buff = ba
+        if ret_buff_sz != rq_sz:
+            self.closed = True
+            raise (IOError(f"Requested {rq_sz} != {ret_buff_sz}"))
+        self._curr += ret_buff_sz
+        if ba is None:
             return ret_buff
+        else:
+            return ret_buff_sz
 
-    def tell(self):
+    def tell(self) -> int:
         return self._curr
 
-    def readinto(self, ba: bytearray):
+    def readinto(self, ba: bytearray) -> int:
         goal_position = self._curr + len(ba)
-        return self._read_until(goal_position)
+        return self._read_until(goal_position, ba)
 
-    def read(self, size=None):
+    def read(self, size=None) -> bytes:
         if self.closed:
-            raise IOError("ResponseStream closed.")
+            raise (IOError("RequestsStreamFile closed."))
+        if size is None:
+            return self._r.raw.read()
         goal_position = self._curr + size
         return self._read_until(goal_position)
 
     @staticmethod
-    def writable():
+    def writable() -> bool:
         return False
 
     @staticmethod
-    def fileno():
+    def fileno() -> int:
         return -1
+
+    def close(self):
+        self.closed = True
+        self._r.close()
+        del self._r
 
     def readline(self):
         raise Exception("Unimplemented")
 
-    def close(self):
-        self.closed = True
-        del self._iterator
+    """
+    This seek() implementation is effectively a no-op, and will throw an
+    exception for anything other than a seek to the current position.
+    """
 
     def seek(self, position, whence=SEEK_SET):
         if position == self._curr:
