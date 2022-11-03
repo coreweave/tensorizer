@@ -31,16 +31,20 @@ thisPath = str(pathlib.Path(__file__).parent.resolve())
 sys.path.append(thisPath + "/../../transformers/src")
 sys.path.append(thisPath + "/../../")
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, CLIPTextModel, CLIPTokenizer, CLIPTextConfig
 from transformers.modeling_utils import no_init_weights, PreTrainedModel
 from tokenizers import Tokenizer
+
+from diffusers import AutoencoderKL, UNet2DConditionModel, StableDiffusionPipeline, LMSDiscreteScheduler
+from diffusers.modeling_utils import ModelMixin
+from diffusers.configuration_utils import ConfigMixin
 
 import json
 from urllib import request
 import tempfile
 
 from collections import OrderedDict
-from typing import Tuple, Union, List, Iterator, Callable
+from typing import Optional, Tuple, Union, List, Iterator, Callable
 
 lz4 = None
 
@@ -598,7 +602,7 @@ class GooseTensorizer:
         tensor_ct = 0
         for idx, typ, name, arr in self.read_tensors():
             gradient = False
-            if arr.dtype != "bool":
+            if arr.dtype not in ["bool", "long"]:
                 gradient = True
                 if dtype is not None and arr.dtype != dtype:
                     arr = arr.astype(dtype)
@@ -665,18 +669,55 @@ def state_dict(
     return destination
 
 
-def serialize_model(m: torch.nn.Module, out_prefix: str):
+def get_ram_usage_str() -> str:
+    if resource is not None:
+        maxrss_b4 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (
+            1000 * 1000
+        )
+        maxrss_b4_gb = f"{maxrss_b4:0.2f}gb CPU RAM used"
+    else:
+        maxrss_b4_gb = "unknown CPU RAM used"
+    return maxrss_b4_gb
+
+
+def serialize_model(
+    model: torch.nn.Module, config: Optional[Union[ConfigMixin, AutoConfig, dict]],
+    model_directory: str, model_prefix: str = ""
+):
     """
     Remove the tensors from a PyTorch model, convert them to NumPy
     arrays and serialize them to GooseTensor format. The stripped
     model is also serialized to pytorch format.
+
+    Args:
+        model: The model to serialize.
+        config: The model's configuration. This is optional and only
+            required for HuggingFace Transformers models. Diffusers
+            models do not require this.
+        model_directory: The directory to save the serialized model to.
+        model_prefix: The prefix to use for the serialized model files. This
+            is purely optional and it allows for multiple models to be
+            serialized to the same directory. A good example are Stable
+            Diffusion models.
     """
-    os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
-    f = open(f"{out_prefix}.tensors", "wb")
-    ts = GooseTensorizer(f)
+
+    os.makedirs(model_directory, exist_ok=True)
+    dir_prefix = f"{model_directory}/{model_prefix}"
+
+    if config is None:
+        config = model
+    if config is not None:
+        if hasattr(config, "to_json_file"):
+            config.to_json_file(f"{dir_prefix}config.json")
+        if isinstance(config, dict):
+            open(f"{dir_prefix}config.json", "w").write(
+                json.dumps(config, indent=2)
+            )
+
+    ts = GooseTensorizer(open(f"{dir_prefix}tensors", "wb"))
 
     idx = 0
-    for module_name, module in m.named_modules():
+    for module_name, module in model.named_modules():
         for name, param in module.named_parameters(recurse=False):
             v = param.cpu().detach().numpy()
             ts.write_tensor(idx, module_name + "." + name, TENSOR_PARAM, v)
@@ -694,70 +735,73 @@ def serialize_model(m: torch.nn.Module, out_prefix: str):
     # torch.save(y, f"{out_prefix}.state", _use_new_zipfile_serialization=False)
     # torch.save(m, f"{out_prefix}.model", _use_new_zipfile_serialization=False)
 
-
-def get_ram_usage_str() -> str:
-    if resource is not None:
-        maxrss_b4 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (
-            1000 * 1000
-        )
-        maxrss_b4_gb = f"{maxrss_b4:0.2f}gb CPU RAM used"
-    else:
-        maxrss_b4_gb = "unknown CPU RAM used"
-    return maxrss_b4_gb
-
-def load_model(path_uri: str) -> torch.nn.Module:
+def load_model(
+    path_uri: str,
+    modelclass: Union[PreTrainedModel, ModelMixin, ConfigMixin] = None,
+    configclass: Optional[Union[ConfigMixin, AutoConfig]] = None,
+    model_prefix: str = None, dtype: str = None
+) -> torch.nn.Module:
     """
-    Given a path prefix, load:
-      * model object from `{prefix}.model`
-      * tensors into the model from `{prefix}.tensors`
+    Given a path prefix, load the model with a custom extension
 
-    Given an URL, load:
-      * model object from `/model`
-      * tensors into the model from `/tensors`
+    Args:
+        path_uri: path to the model. Can be a local path or a URI
+        modelclass: The model class to load the tensors into.
+        configclass: The config class to load the model config into. This must be
+            set if you are loading a model from HuggingFace Transformers.
+        model_prefix: The prefix to use to distinguish between multiple serialized models.
+        dtype: The dtype to load the tensors into. If None, the dtype is inferred from the model.
     """
+
+    if model_prefix is None:
+        model_prefix = ""
+
     if path_uri.startswith("https://") or path_uri.startswith("http://"):
-        config_uri = f"{path_uri}/config.json"
-        tensors_uri = f"{path_uri}/tensors"
+        config_uri = f"{path_uri}/{model_prefix}config.json"
+        tensors_uri = f"{path_uri}/{model_prefix}tensors"
         if fcntl is not None:
             # We have fcntl, so we can use the fast CURL-based loader.
-            logger.info("Using CURL for downloading tensors")
+            logger.info("Using CURL for tensor streaming")
             tensor_loader = lambda: CURLStreamFile(tensors_uri)
         else:
             # Fallback to slow requests-based loader.
-            logger.info("Using native requests for downloading tensors")
+            logger.info("Using requests for tensor streaming")
             tensor_loader = lambda: RequestsStreamFile(tensors_uri)
     else:
-        tensors_uri = f"{path_uri}/tensors"
+        tensors_uri = f"{path_uri}/{model_prefix}tensors"
         config_uri = "file://" + os.path.join(
-            os.path.dirname(path_uri), "config.json"
+            os.path.dirname(path_uri), f"{model_prefix}config.json"
         )
-        if os.path.exists(tensors_uri):
-            tensor_loader = lambda: open(tensors_uri, "rb")
-        else:
-            tensor_uri = f"{path_uri}.tensors"
-            config_uri = f"{os.path.dirname(path_uri)}/config.json"
-            tensor_loader = lambda: open(tensor_uri, "rb")
+        if not os.path.exists(config_uri):
+            config_uri = f"{path_uri}/{model_prefix}config.json"
+        tensor_loader = lambda: open(tensors_uri, "rb")
     
     logger.info(f"Loading {tensors_uri}, {get_ram_usage_str()}")
     begin_load = time.time()
 
-    try:
-        with tempfile.TemporaryDirectory() as dir:
-            config_path = os.path.join(dir, "config.json")
-            request.urlretrieve(config_uri, config_path)
-            config = AutoConfig.from_pretrained(dir)
-            config.gradient_checkpointing = True
-    except ValueError:
-        config = AutoConfig.from_pretrained(os.path.dirname(path_uri))
-
     tensor_deserializer = GooseTensorizer(tensor_loader())
-    
-    model = no_init_or_tensor(
-        lambda: AutoModelForCausalLM.from_pretrained(
-            None, config=config, state_dict=OrderedDict()
+
+    if configclass is not None:
+        try:
+            with tempfile.TemporaryDirectory() as dir:
+                request.urlretrieve(config_uri, os.path.join(dir, "config.json"))
+                config = configclass.from_pretrained(dir)
+                config.gradient_checkpointing = True
+        except ValueError:
+            config = configclass.from_pretrained(config_uri)
+        model = no_init_or_tensor(
+            lambda: modelclass.from_pretrained(
+                None, config=config, state_dict=OrderedDict()
+            )
         )
-    )
-    tensor_deserializer.load_tensors(model, dtype="float16")
+    else:
+        try:
+            config = json.loads(request.urlopen(config_uri).read().decode("utf-8"))
+        except ValueError:
+            config = json.load(open(config_uri))
+        model = no_init_or_tensor(lambda: modelclass(**config))
+
+    tensor_deserializer.load_tensors(model, dtype=dtype)
 
     tensor_load_s = time.time() - begin_load
     rate_str = convert_bytes(
@@ -771,9 +815,59 @@ def load_model(path_uri: str) -> torch.nn.Module:
 
     return model
 
+def df_main():
+    if len(sys.argv) != 3:
+        logger.fatal(f"{sys.argv[0]} [input-directory] [output-prefix]")
+        logger.fatal(f"Example: hakurei/waifu-diffusion waifu-diffusion")
+        sys.exit(1)
+    
+    output_prefix = sys.argv[2]
+    print("MODEL PATH:", sys.argv[1])
+    print("OUTPUT PREFIX:", output_prefix)
+
+    hf_api_token = os.environ.get("HF_API_TOKEN")
+
+    pipeline = StableDiffusionPipeline.from_pretrained(sys.argv[1], use_auth_token=hf_api_token)
+
+    cudadev = torch.cuda.current_device()
+    gb_gpu = int(torch.cuda.get_device_properties(0).total_memory /
+                 (1000 * 1000 * 1000))
+
+    logger.info("GPU: " + torch.cuda.get_device_name(cudadev))
+    logger.info("GPU RAM: " + str(gb_gpu) + "gb")
+    logger.info("PYTHON USED RAM: " + get_ram_usage_str())
+
+    serialize_model(pipeline.text_encoder.eval(), pipeline.text_encoder.config, output_prefix, "encoder")
+    serialize_model(pipeline.vae.eval(), None, output_prefix, "vae")
+    serialize_model(pipeline.unet.eval(), None, output_prefix, "unet")
+    
+    pipeline.tokenizer.save_pretrained(output_prefix)
+
+    # validate
+    logger.info("Validating serialization")
+    vae = load_model(output_prefix, AutoencoderKL, None, "vae")
+    unet = load_model(output_prefix, UNet2DConditionModel, None, "unet")
+    encoder = load_model(output_prefix, CLIPTextModel, CLIPTextConfig, "encoder")
+
+    pipeline = StableDiffusionPipeline(
+        text_encoder=encoder,
+        vae=vae,
+        unet=unet,
+        tokenizer=CLIPTokenizer.from_pretrained(sys.argv[1], subfolder="tokenizer"),
+        scheduler = LMSDiscreteScheduler(beta_end=0.012, beta_schedule="scaled_linear", beta_start=0.00085, num_train_timesteps=1000, trained_betas=None),
+        safety_checker=None,
+        feature_extractor=None
+    ).to("cuda")
+
+    prompt = "a photo of an astronaut riding a horse on mars"
+    with torch.autocast("cuda"):
+        image = pipeline(prompt).images[0]
+    image.save("test.png")
+
 def hf_main():
     if len(sys.argv) != 3:
         logger.fatal(f"{sys.argv[0]} [input-directory] [output-prefix]")
+        logger.fatal(f"Example: distilgpt2 distilgpt2")
         sys.exit(1)
 
     output_prefix = sys.argv[2]
@@ -782,7 +876,6 @@ def hf_main():
 
     from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
-    model_name = os.path.basename(sys.argv[1])
     model_config = AutoConfig.from_pretrained(sys.argv[1])
     model = AutoModelForCausalLM.from_pretrained(sys.argv[1], config=model_config, torch_dtype=torch.float16)
 
@@ -794,20 +887,12 @@ def hf_main():
     logger.info("GPU RAM: " + str(gb_gpu) + "gb")
     logger.info("PYTHON USED RAM: " + get_ram_usage_str())
 
-    serialize_model(model, output_prefix)
-    if os.path.isdir(output_prefix):
-        addl_prefix = output_prefix
-    else:
-        addl_prefix = os.path.dirname(output_prefix)
-    if addl_prefix == "":
-        addl_prefix = "."
+    serialize_model(model, model_config, output_prefix)
 
-    tokenizer = AutoTokenizer.from_pretrained(sys.argv[1])
-    tokenizer.save_pretrained(addl_prefix)
-    model_config.save_pretrained(addl_prefix)
+    tokenizer = AutoTokenizer.from_pretrained(sys.argv[1]).save_pretrained(output_prefix)
 
     logger.info("Validating serialization")
-    model = load_model(output_prefix).eval()
+    model = load_model(output_prefix, AutoModelForCausalLM, AutoConfig, None, "float16").eval()
 
     # test generation
     tokenizer = AutoTokenizer.from_pretrained(sys.argv[1])
@@ -869,4 +954,5 @@ def goose_main():
 
 
 if __name__ == "__main__":
+    logger.info("The main() functions in this file are not to be use directly and are only for reference.")
     hf_main()
