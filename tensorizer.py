@@ -624,9 +624,9 @@ class GooseTensorizer:
 
         tensor_ct = 0
         for idx, typ, name, arr in self.read_tensors():
-            gradient = False
-            if arr.dtype not in ["bool", "long"]:
-                gradient = True
+            gradient = True
+            if arr.dtype not in ["float", "complex"]:
+                gradient = False
                 if dtype is not None and arr.dtype != dtype:
                     arr = arr.astype(dtype)
             obj_path, attr = name.rsplit(".", 1)
@@ -846,7 +846,7 @@ def load_model(
 def df_main():
     if len(sys.argv) != 3:
         logger.fatal(f"{sys.argv[0]} [input-directory] [output-prefix]")
-        logger.fatal(f"Example: hakurei/waifu-diffusion waifu-diffusion")
+        logger.fatal(f"Example: runwayml/stable-diffusion-v1-5 stable-diffusion-v1-5")
         sys.exit(1)
 
     output_prefix = sys.argv[2]
@@ -914,7 +914,7 @@ def df_main():
 def hf_main():
     if len(sys.argv) != 3:
         logger.fatal(f"{sys.argv[0]} [input-directory] [output-prefix]")
-        logger.fatal(f"Example: distilgpt2 distilgpt2")
+        logger.fatal(f"Example: EleutherAI/gpt-neo-125M gpt-neo-125M")
         sys.exit(1)
 
     output_prefix = sys.argv[2]
@@ -960,60 +960,11 @@ def hf_main():
     )
 
 
-def goose_main():
-    if len(sys.argv) != 3:
-        logger.fatal(f"{sys.argv[0]} [input-directory] [output-prefix]")
-        sys.exit(1)
-
-    from lm_node.base import GPTModel
-
-    model_name = os.path.basename(sys.argv[1])
-    output_prefix = sys.argv[2]
-    config = DotMap()
-    config.model_type = "GPT"
-    config.model_name = model_name
-    config.model_path = sys.argv[1]
-    config.is_dev = True
-    config.model_alias = None
-    config.prefix_path = None
-    config.deepspeed_enabled = False
-    config.load_serialized = False
-    print("MODEL PATH:", config.model_path)
-
-    cudadev = torch.cuda.current_device()
-    gb_gpu = int(
-        torch.cuda.get_device_properties(0).total_memory / (1000 * 1000 * 1000)
-    )
-    gb_cpu = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1000 * 1000)
-
-    logger.info("GPU: " + torch.cuda.get_device_name(cudadev))
-    logger.info("GPU RAM: " + str(gb_gpu) + "gb")
-    logger.info("PYTHON USED RAM: " + str(gb_cpu) + "gb")
-
-    model = GPTModel(config)
-    serialize_model(model.model, output_prefix)
-    if os.path.isdir(output_prefix):
-        addl_prefix = output_prefix
-    else:
-        addl_prefix = os.path.dirname(output_prefix)
-    if addl_prefix == "":
-        addl_prefix = "."
-    model.tokenizer.save_pretrained(addl_prefix)
-    model.model.config.to_json_file(addl_prefix + "/config.json")
-    open(addl_prefix + "/unitrim.json", mode="w").write(
-        model.unitrim.serialize()
-    )
-    open(addl_prefix + "/wordtokens.json", mode="w").write(
-        json.dumps(model.word_tokens)
-    )
-
-    logger.info("Validating serialization")
-    model = load_model(f"{output_prefix}")
-    logger.info(f"force_fp32_attn: {model.config.force_fp32_attn}")
-
-
 if __name__ == "__main__":
     logger.info(
         "The main() functions in this file are not to be use directly and are only for reference."
     )
-    hf_main()
+    try:
+        hf_main()
+    except OSError:
+        df_main()
