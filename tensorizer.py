@@ -3,39 +3,62 @@
 # Fast LLM model serialization and deserialization          (c) 2022 Coreweave
 ##############################################################################
 
-import fcntl
+# try to import UNIX only dependencies
+try:
+    import fcntl
+    import resource
+except ImportError:
+    fcntl = None
+    resource = None
+
 import subprocess
-import resource
 import io
 from io import SEEK_SET, SEEK_END
 import numpy
 import struct
 import torch
 import typing
-from dotmap import DotMap
-import pickle
-import pickletools
 import time
 import logging
 import sys
 import pathlib
+import os
+import requests
+
+os.environ[
+    "TRANSFORMERS_VERBOSITY"
+] = "error"  # disable missing keys and unexpected key warnings
 
 thisPath = str(pathlib.Path(__file__).parent.resolve())
 sys.path.append(thisPath + "/../../transformers/src")
 sys.path.append(thisPath + "/../../")
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoConfig,
+    CLIPTextModel,
+    CLIPTokenizer,
+    CLIPTextConfig,
+)
 from transformers.modeling_utils import no_init_weights, PreTrainedModel
-from lm_node.unitrim import Unitrimmer
 from tokenizers import Tokenizer
 
+from diffusers import (
+    AutoencoderKL,
+    UNet2DConditionModel,
+    StableDiffusionPipeline,
+    LMSDiscreteScheduler,
+)
+from diffusers.modeling_utils import ModelMixin
+from diffusers.configuration_utils import ConfigMixin
+
 import json
-import os
 from urllib import request
 import tempfile
 
 from collections import OrderedDict
-from typing import Tuple, Union, List, Iterator, Callable
+from typing import Optional, Tuple, Union, List, Iterator, Callable
 
 lz4 = None
 
@@ -125,24 +148,6 @@ def convert_bytes(num):
         num /= step_unit
 
 
-def no_init(loading_code: Callable[[], PreTrainedModel]) -> PreTrainedModel:
-    def dummy(self):
-        return
-
-    modules = [torch.nn.Linear, torch.nn.Embedding, torch.nn.LayerNorm]
-    original = {}
-    for mod in modules:
-        original[mod] = mod.reset_parameters
-        mod.reset_parameters = dummy
-
-    with no_init_weights():
-        result = loading_code()
-    for mod in modules:
-        mod.reset_parameters = original[mod]
-
-    return result
-
-
 def no_init_or_tensor(loading_code):
     def dummy(self):
         return
@@ -153,7 +158,11 @@ def no_init_or_tensor(loading_code):
         original[mod] = mod.reset_parameters
         mod.reset_parameters = dummy
     original_empty = torch.empty
-    torch.empty = lambda *a, **b: None
+
+    # when torch.empty is called, make it map to meta device by replacing the device in kwargs.
+    torch.empty = lambda *args, **kwargs: original_empty(
+        *args, **{**kwargs, "device": "meta"}
+    )
 
     with no_init_weights():
         result = loading_code()
@@ -271,54 +280,74 @@ class CURLStreamFile(object):
             raise (Exception("Seeking is unsupported"))
 
 
-class ResponseStream(object):
+class RequestsStreamFile(object):
     """
-    This is intended to provide a file-like wrapper around an iterator that
-    yields block chunks. Useful for wrapping around streaming `reaponse`
-    requests, but not as fast as `CURLStreamFile`
+    RequestsStreamFile implements a file-like object around an HTTP download, the
+    intention being to not buffer more than we have to. Not as fast or efficient
+    as CURLStreamFile, but it works on Windows.
     """
 
-    def __init__(self, request_iterator):
-        self._iterator = request_iterator
+    def __init__(self, uri: str) -> None:
+        self._uri = uri
         self._curr = 0
-        self._buff = bytearray()
+        self._r = requests.get(uri, stream=True)
         self.closed = False
 
-    def _read_until(self, goal_position):
-        while len(self._buff) + self._curr < goal_position:
-            try:
-                self._buff.extend(next(self._iterator))
-            except StopIteration:
-                break
-        if len(self._buff) + self._curr >= goal_position:
-            ret_buff = bytes(self._buff[: goal_position - self._curr])
-            self._buff = self._buff[goal_position - self._curr :]
-            self._curr = goal_position
+    def _read_until(
+        self, goal_position: int, ba: Union[bytearray, None] = None
+    ) -> Union[bytes, int]:
+        if ba is None:
+            rq_sz = goal_position - self._curr
+            ret_buff = self._r.raw.read(rq_sz)
+            ret_buff_sz = len(ret_buff)
+        else:
+            rq_sz = len(ba)
+            ret_buff_sz = self._r.raw.readinto(ba)
+            ret_buff = ba
+        if ret_buff_sz != rq_sz:
+            self.closed = True
+            raise (IOError(f"Requested {rq_sz} != {ret_buff_sz}"))
+        self._curr += ret_buff_sz
+        if ba is None:
             return ret_buff
+        else:
+            return ret_buff_sz
 
-    def tell(self):
+    def tell(self) -> int:
         return self._curr
 
-    def read(self, size=None):
+    def readinto(self, ba: bytearray) -> int:
+        goal_position = self._curr + len(ba)
+        return self._read_until(goal_position, ba)
+
+    def read(self, size=None) -> bytes:
         if self.closed:
-            raise IOError("ResponseStream closed.")
+            raise (IOError("RequestsStreamFile closed."))
+        if size is None:
+            return self._r.raw.read()
         goal_position = self._curr + size
         return self._read_until(goal_position)
 
     @staticmethod
-    def writable():
+    def writable() -> bool:
         return False
 
     @staticmethod
-    def fileno():
+    def fileno() -> int:
         return -1
+
+    def close(self):
+        self.closed = True
+        self._r.close()
+        del self._r
 
     def readline(self):
         raise Exception("Unimplemented")
 
-    def close(self):
-        self.closed = True
-        del self._iterator
+    """
+    This seek() implementation is effectively a no-op, and will throw an
+    exception for anything other than a seek to the current position.
+    """
 
     def seek(self, position, whence=SEEK_SET):
         if position == self._curr:
@@ -347,71 +376,26 @@ class GooseTensorizer:
             import lz4.frame
 
     @staticmethod
-    def _pickle_dump_fix(obj, memo_start_idx=0) -> Tuple[bytes, int]:
+    def _dump_shape(obj) -> Tuple[bytes, int]:
         """
-        Pickle and object and optimize its string by changing MEMOIZE into PUT,
-        removing unused PUT/MEMOIZE, fixing GET opcodes, and remove PROTO,
-        FRAME, and STOP opcodes.
-
-        Returns the pickle bytes, and the end memo index.
+        Returns shape of the tensor
         """
-        p = pickle.dumps(obj, 4)
-        oldids = set()
-        newids = {}
-        opcodes = []
+        bstr = struct.pack("<B", len(obj))
+        for i in obj:
+            bstr += struct.pack("<I", i)
+        return bstr
 
-        # Trick to avoid instantiating objects (we use the "is" operator)
-        put = "PUT"
-        get = "GET"
-
-        ops = list(pickletools.genops(p))
-        ops = [(x[0], x[1], x[2], y[2]) for x, y in zip(ops[:-1], ops[1:])] + [
-            (ops[-1][0], ops[-1][1], ops[-1][2], len(p))
-        ]
-        for opcode, arg, pos, end_pos in ops:
-            if opcode.name in ("FRAME", "STOP"):
-                # Ignore these
-                pass
-            elif opcode.name == "PROTO":
-                # Ignore, but check that it's version 4
-                assert arg == 4, "Pickle version should be 4"
-            elif "PUT" in opcode.name:
-                oldids.add(arg)
-                opcodes.append((put, arg))
-            elif opcode.name == "MEMOIZE":
-                idx = len(oldids)
-                oldids.add(idx)
-                opcodes.append((put, idx))
-            elif "GET" in opcode.name:
-                newids[arg] = None
-                opcodes.append((get, arg))
-            else:
-                opcodes.append((pos, end_pos))
-        del oldids
-
-        out = []
-        memo_put_idx = memo_start_idx
-        for op, arg in opcodes:
-            if op is put:
-                if arg not in newids:
-                    continue
-                newids[arg] = memo_put_idx
-                if memo_put_idx < 256:
-                    data = pickle.BINPUT + struct.pack("<B", memo_put_idx)
-                else:
-                    data = pickle.LONG_BINPUT + struct.pack("<I", memo_put_idx)
-                memo_put_idx += 1
-            elif op is get:
-                memo_get_idx = newids[arg]
-                if memo_get_idx < 256:
-                    data = pickle.BINGET + struct.pack("<B", memo_get_idx)
-                else:
-                    data = pickle.LONG_BINGET + struct.pack("<I", memo_get_idx)
-            else:
-                data = p[op:arg]
-
-            out.append(data)
-        return b"".join(out), memo_put_idx
+    @staticmethod
+    def _read_shapes(obj, num_elems) -> List[int]:
+        """
+        Read the tensor shapes.
+        """
+        bstr = obj
+        shape = []
+        for i in range(num_elems):
+            shape.append(struct.unpack("<I", bstr[0:4])[0])
+            bstr = bstr[4:]
+        return shape
 
     @property
     def total_bytes_read(self) -> int:
@@ -484,7 +468,7 @@ class GooseTensorizer:
         self._file.write(dtype_bytes)
 
         # ... and shape
-        self._file.write(self._pickle_dump_fix(tensor.shape)[0])
+        self._file.write(self._dump_shape(tensor.shape))
 
         # Reserve room for our 64-bit tensor length
         tensor_size_loc = self._file.tell()
@@ -547,40 +531,6 @@ class GooseTensorizer:
             f"{idx}:{typ}:{name} - {tensor.shape} -> {ds_bytes}{comp_report}"
         )
 
-    @staticmethod
-    def _read_shapes(shape_bytes) -> List[int]:
-        """
-        Read the tensor shapes from pickled format.
-        """
-        shape_buf = io.BytesIO(shape_bytes)
-        shapelist = []
-        while True:
-            shapeelementtype = shape_buf.read(1)
-            if shapeelementtype == pickle.BININT1:
-                shapeelement = struct.unpack("<B", shape_buf.read(1))[0]
-            elif shapeelementtype == pickle.BININT2:
-                shapeelement = struct.unpack("<H", shape_buf.read(2))[0]
-            elif shapeelementtype == pickle.BININT:
-                shapeelement = struct.unpack("<i", shape_buf.read(4))[0]
-            elif shapeelementtype == pickle.EMPTY_TUPLE:
-                break
-            elif shapeelementtype in (
-                pickle.TUPLE1,
-                pickle.TUPLE2,
-                pickle.TUPLE3,
-                pickle.TUPLE,
-            ):
-                # End of tuple
-                break
-            elif shapeelementtype == pickle.MARK:
-                continue  # ignore mark
-            else:
-                assert False, "Invalid element type: 0x{:02x}".format(
-                    ord(shapeelementtype)
-                )
-            shapelist.append(shapeelement)
-        return shapelist
-
     def read_tensors(self) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
@@ -603,8 +553,19 @@ class GooseTensorizer:
                 dtype_len = struct.unpack("<B", headers[idx : idx + 1])[0]
                 dtype_end = idx + dtype_len + 1
                 dtype = headers[idx + 1 : dtype_end]
+                # read the shape amount, according to the serialized format. the shape length is
+                # 1 byte after the dtype end.
+                shape_len = struct.unpack(
+                    "<B", headers[dtype_end : dtype_end + 1]
+                )[0]
+                # the shape elements are <I so we read 4 bytes. _read_shapes takes in the
+                # header object and the number of elements in the shape.
+                # the amount of bytes for the shape is 4 * the number of elements in the shape.
+                # so, we need to read 4 * shape_len bytes after the dtype end + 1 byte for the
+                # shape length. sort of convoluted, but it works.
                 shapelist = self._read_shapes(
-                    headers[dtype_end : header_len - 8]
+                    headers[dtype_end + 1 : (dtype_end + 1) + (4 * shape_len)],
+                    shape_len,
                 )
                 datalength = struct.unpack("<q", headers[header_len - 8 :])[0]
                 if datalength > len(self._buffer):
@@ -663,9 +624,9 @@ class GooseTensorizer:
 
         tensor_ct = 0
         for idx, typ, name, arr in self.read_tensors():
-            gradient = False
-            if arr.dtype != "bool":
-                gradient = True
+            gradient = True
+            if arr.dtype not in ["float", "complex"]:
+                gradient = False
                 if dtype is not None and arr.dtype != dtype:
                     arr = arr.astype(dtype)
             obj_path, attr = name.rsplit(".", 1)
@@ -681,68 +642,6 @@ class GooseTensorizer:
         self.total_tensor_bytes = self._file.tell()
         self._file.close()
         return tensor_ct
-
-
-def get_tokenizer(
-    path_uri: str, args={}
-) -> Tuple[Tokenizer, Unitrimmer, List[int]]:
-    """
-    Given a path prefix, load and return:
-      * tokenizer loaded from `{prefix}/tokenizer.json`
-      * unitrim loaded from `{prefix}/unitrim.json`
-
-    Given an URL, load:
-      * tokenizer loaded from `/tokenizer.json`
-      * unitrim loaded from `/unitrim.json`
-    """
-
-    tokenizer_uri = f"{path_uri}"
-    unitrim_uri = f"{path_uri}/unitrim.json"
-    wordtokens_uri = f"{path_uri}/wordtokens.json"
-
-    if path_uri.startswith("https://") or path_uri.startswith("http://"):
-        unitrim_loader = lambda: Unitrimmer(
-            io.BytesIO(CURLStreamFile(unitrim_uri).read())
-        )
-        wordtokens_loader = lambda: json.loads(
-            CURLStreamFile(wordtokens_uri).read()
-        )
-    else:
-        unitrim_loader = lambda: Unitrimmer(open(unitrim_uri, "r"))
-        wordtokens_loader = lambda: json.load(open(wordtokens_uri, "r"))
-
-    with tempfile.TemporaryDirectory() as dir:
-        for tokenizer_file in [
-            "config.json",
-            "tokenizer.json",
-            "vocab.json",
-            "merges.txt",
-            "special_tokens_map.json",
-        ]:
-            tokenizer_path = "/".join([tokenizer_uri, tokenizer_file])
-            logger.info(f"Loading {tokenizer_path}")
-            request.urlretrieve(tokenizer_path, "/".join([dir, tokenizer_file]))
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(dir, **args)
-        except Exception as e:
-            logger.error(f"Failed to load tokenizer from {tokenizer_uri}!")
-            raise e
-
-    try:
-        logger.info(f"Loading {unitrim_uri}")
-        unitrim = unitrim_loader()
-    except Exception as e:
-        logger.error(f"Failed to load unitrim from {unitrim_uri}!")
-        raise e
-
-    try:
-        logger.info(f"Loading {wordtokens_uri}")
-        wordtokens = wordtokens_loader()
-    except Exception as e:
-        logger.error(f"Failed to load wordtokens.json from {unitrim_uri}!")
-        raise e
-
-    return tokenizer, unitrim, wordtokens
 
 
 def save_to_state_dict(m, destination, prefix, keep_vars):
@@ -793,19 +692,57 @@ def state_dict(
     return destination
 
 
-def serialize_model(m: torch.nn.Module, out_prefix: str):
+def get_ram_usage_str() -> str:
+    if resource is not None:
+        maxrss_b4 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (
+            1000 * 1000
+        )
+        maxrss_b4_gb = f"{maxrss_b4:0.2f}gb CPU RAM used"
+    else:
+        maxrss_b4_gb = "unknown CPU RAM used"
+    return maxrss_b4_gb
+
+
+def serialize_model(
+    model: torch.nn.Module,
+    config: Optional[Union[ConfigMixin, AutoConfig, dict]],
+    model_directory: str,
+    model_prefix: str = "model",
+):
     """
     Remove the tensors from a PyTorch model, convert them to NumPy
     arrays and serialize them to GooseTensor format. The stripped
     model is also serialized to pytorch format.
+
+    Args:
+        model: The model to serialize.
+        config: The model's configuration. This is optional and only
+            required for HuggingFace Transformers models. Diffusers
+            models do not require this.
+        model_directory: The directory to save the serialized model to.
+        model_prefix: The prefix to use for the serialized model files. This
+            is purely optional and it allows for multiple models to be
+            serialized to the same directory. A good example are Stable
+            Diffusion models. Default is "model".
     """
-    os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
-    f = open(f"{out_prefix}.tensors", "wb")
-    ts = GooseTensorizer(f)
+
+    os.makedirs(model_directory, exist_ok=True)
+    dir_prefix = f"{model_directory}/{model_prefix}"
+
+    if config is None:
+        config = model
+    if config is not None:
+        if hasattr(config, "to_json_file"):
+            config.to_json_file(f"{dir_prefix}-config.json")
+        if isinstance(config, dict):
+            open(f"{dir_prefix}-config.json", "w").write(
+                json.dumps(config, indent=2)
+            )
+
+    ts = GooseTensorizer(open(f"{dir_prefix}.tensors", "wb"))
 
     idx = 0
-    for module_name, module in m.named_modules():
-        print(module_name)
+    for module_name, module in model.named_modules():
         for name, param in module.named_parameters(recurse=False):
             v = param.cpu().detach().numpy()
             ts.write_tensor(idx, module_name + "." + name, TENSOR_PARAM, v)
@@ -818,123 +755,216 @@ def serialize_model(m: torch.nn.Module, out_prefix: str):
 
     ts.finalize()
 
-    # m.train(False)
 
-    # torch.save(y, f"{out_prefix}.state", _use_new_zipfile_serialization=False)
-    # torch.save(m, f"{out_prefix}.model", _use_new_zipfile_serialization=False)
-
-
-def load_model(path_uri: str) -> torch.nn.Module:
+def load_model(
+    path_uri: str,
+    modelclass: Union[PreTrainedModel, ModelMixin, ConfigMixin] = None,
+    configclass: Optional[Union[ConfigMixin, AutoConfig]] = None,
+    model_prefix: str = "model",
+    dtype: str = None,
+) -> torch.nn.Module:
     """
-    Given a path prefix, load:
-      * model object from `{prefix}.model`
-      * tensors into the model from `{prefix}.tensors`
+    Given a path prefix, load the model with a custom extension
 
-    Given an URL, load:
-      * model object from `/model`
-      * tensors into the model from `/tensors`
+    Args:
+        path_uri: path to the model. Can be a local path or a URI
+        modelclass: The model class to load the tensors into.
+        configclass: The config class to load the model config into. This must be
+            set if you are loading a model from HuggingFace Transformers.
+        model_prefix: The prefix to use to distinguish between multiple serialized models. The default is "model".
+        dtype: The dtype to load the tensors into. If None, the dtype is inferred from the model.
     """
+
+    if model_prefix is None:
+        model_prefix = "model"
+
     if path_uri.startswith("https://") or path_uri.startswith("http://"):
-        config_uri = f"{path_uri}/config.json"
-        tensors_uri = f"{path_uri}/tensors"
-        tensor_loader = lambda: CURLStreamFile(tensors_uri)
+        config_uri = f"{path_uri}/{model_prefix}-config.json"
+        tensors_uri = f"{path_uri}/{model_prefix}.tensors"
+        if fcntl is not None:
+            # We have fcntl, so we can use the fast CURL-based loader.
+            logger.info("Using CURL for tensor streaming")
+            tensor_loader = lambda: CURLStreamFile(tensors_uri)
+        else:
+            # Fallback to slow requests-based loader.
+            logger.info("Using requests for tensor streaming")
+            tensor_loader = lambda: RequestsStreamFile(tensors_uri)
     else:
-        tensors_uri = f"{path_uri}/tensors"
+        tensors_uri = f"{path_uri}/{model_prefix}.tensors"
         config_uri = "file://" + os.path.join(
-            os.path.dirname(path_uri), "config.json"
+            os.path.dirname(path_uri), f"{model_prefix}-config.json"
         )
+        if not os.path.exists(config_uri):
+            config_uri = f"{path_uri}/{model_prefix}-config.json"
         tensor_loader = lambda: open(tensors_uri, "rb")
 
-    # begin_model_load = time.time()
-    maxrss_b4 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (
-        1000 * 1000
-    )
-    maxrss_b4_gb = f"{maxrss_b4:0.2f}gb CPU RAM used"
-    logger.info(f"Loading {tensors_uri}, {maxrss_b4_gb}")
+    logger.info(f"Loading {tensors_uri}, {get_ram_usage_str()}")
     begin_load = time.time()
-
-    with tempfile.TemporaryDirectory() as dir:
-        config_path = os.path.join(dir, "config.json")
-        request.urlretrieve(config_uri, config_path)
-        config = AutoConfig.from_pretrained(dir)
-        config.gradient_checkpointing = True
 
     tensor_deserializer = GooseTensorizer(tensor_loader())
 
-    # TODO: suppress warnings about missing tensors from `state_dict`
-    model = no_init_or_tensor(
-        lambda: AutoModelForCausalLM.from_pretrained(
-            None, config=config, state_dict=OrderedDict()
+    if configclass is not None:
+        try:
+            with tempfile.TemporaryDirectory() as dir:
+                request.urlretrieve(
+                    config_uri, os.path.join(dir, "config.json")
+                )
+                config = configclass.from_pretrained(dir)
+                config.gradient_checkpointing = True
+        except ValueError:
+            config = configclass.from_pretrained(config_uri)
+        model = no_init_or_tensor(
+            lambda: modelclass.from_pretrained(
+                None, config=config, state_dict=OrderedDict()
+            )
         )
-    )
-    tensor_deserializer.load_tensors(model, dtype="float16")
+    else:
+        try:
+            config = json.loads(
+                request.urlopen(config_uri).read().decode("utf-8")
+            )
+        except ValueError:
+            with open(config_uri, "r") as f:
+                config = json.load(f)
+        model = no_init_or_tensor(lambda: modelclass(**config))
+
+    tensor_deserializer.load_tensors(model, dtype=dtype)
 
     tensor_load_s = time.time() - begin_load
-    maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1000 * 1000)
-    maxrss_gb = f"{maxrss:0.2f}gb CPU RAM used"
     rate_str = convert_bytes(
         tensor_deserializer.total_bytes_read / tensor_load_s
     )
     tensors_sz = convert_bytes(tensor_deserializer.total_bytes_read)
     logger.info(
         f"Model tensors loaded in {tensor_load_s:0.2f}s, read "
-        + f"{tensors_sz} @ {rate_str}/s, {maxrss_gb}"
+        + f"{tensors_sz} @ {rate_str}/s, {get_ram_usage_str()}"
     )
 
     return model
 
 
-def main():
+def df_main():
     if len(sys.argv) != 3:
         logger.fatal(f"{sys.argv[0]} [input-directory] [output-prefix]")
+        logger.fatal(f"Example: runwayml/stable-diffusion-v1-5 stable-diffusion-v1-5")
         sys.exit(1)
 
-    from lm_node.base import GPTModel
-
-    model_name = os.path.basename(sys.argv[1])
     output_prefix = sys.argv[2]
-    config = DotMap()
-    config.model_type = "GPT"
-    config.model_name = model_name
-    config.model_path = sys.argv[1]
-    config.is_dev = True
-    config.model_alias = None
-    config.prefix_path = None
-    config.deepspeed_enabled = False
-    config.load_serialized = False
-    print("MODEL PATH:", config.model_path)
+    print("MODEL PATH:", sys.argv[1])
+    print("OUTPUT PREFIX:", output_prefix)
+
+    hf_api_token = os.environ.get("HF_API_TOKEN")
+
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        sys.argv[1], use_auth_token=hf_api_token
+    )
 
     cudadev = torch.cuda.current_device()
     gb_gpu = int(
         torch.cuda.get_device_properties(0).total_memory / (1000 * 1000 * 1000)
     )
-    gb_cpu = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1000 * 1000)
 
     logger.info("GPU: " + torch.cuda.get_device_name(cudadev))
     logger.info("GPU RAM: " + str(gb_gpu) + "gb")
-    logger.info("PYTHON USED RAM: " + str(gb_cpu) + "gb")
+    logger.info("PYTHON USED RAM: " + get_ram_usage_str())
 
-    model = GPTModel(config)
-    serialize_model(model.model, output_prefix)
-    if os.path.isdir(output_prefix):
-        addl_prefix = output_prefix
-    else:
-        addl_prefix = os.path.dirname(output_prefix)
-    if addl_prefix == "":
-        addl_prefix = "."
-    model.tokenizer.save_pretrained(addl_prefix)
-    model.model.config.to_json_file(addl_prefix + "/config.json")
-    open(addl_prefix + "/unitrim.json", mode="w").write(
-        model.unitrim.serialize()
+    serialize_model(
+        pipeline.text_encoder.eval(),
+        pipeline.text_encoder.config,
+        output_prefix,
+        "encoder",
     )
-    open(addl_prefix + "/wordtokens.json", mode="w").write(
-        json.dumps(model.word_tokens)
+    serialize_model(pipeline.vae.eval(), None, output_prefix, "vae")
+    serialize_model(pipeline.unet.eval(), None, output_prefix, "unet")
+
+    pipeline.tokenizer.save_pretrained(output_prefix)
+
+    # validate
+    logger.info("Validating serialization")
+    vae = load_model(output_prefix, AutoencoderKL, None, "vae")
+    unet = load_model(output_prefix, UNet2DConditionModel, None, "unet")
+    encoder = load_model(
+        output_prefix, CLIPTextModel, CLIPTextConfig, "encoder"
+    )
+
+    pipeline = StableDiffusionPipeline(
+        text_encoder=encoder,
+        vae=vae,
+        unet=unet,
+        tokenizer=CLIPTokenizer.from_pretrained(
+            sys.argv[1], subfolder="tokenizer"
+        ),
+        scheduler=LMSDiscreteScheduler(
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            beta_start=0.00085,
+            num_train_timesteps=1000,
+            trained_betas=None,
+        ),
+        safety_checker=None,
+        feature_extractor=None,
+    ).to("cuda")
+
+    prompt = "a photo of an astronaut riding a horse on mars"
+    with torch.autocast("cuda"):
+        image = pipeline(prompt).images[0]
+    image.save("test.png")
+
+
+def hf_main():
+    if len(sys.argv) != 3:
+        logger.fatal(f"{sys.argv[0]} [input-directory] [output-prefix]")
+        logger.fatal(f"Example: EleutherAI/gpt-neo-125M gpt-neo-125M")
+        sys.exit(1)
+
+    output_prefix = sys.argv[2]
+    print("MODEL PATH:", sys.argv[1])
+    print("OUTPUT PREFIX:", output_prefix)
+
+    from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
+
+    model_config = AutoConfig.from_pretrained(sys.argv[1])
+    model = AutoModelForCausalLM.from_pretrained(
+        sys.argv[1], config=model_config, torch_dtype=torch.float16
+    )
+
+    cudadev = torch.cuda.current_device()
+    gb_gpu = int(
+        torch.cuda.get_device_properties(0).total_memory / (1000 * 1000 * 1000)
+    )
+
+    logger.info("GPU: " + torch.cuda.get_device_name(cudadev))
+    logger.info("GPU RAM: " + str(gb_gpu) + "gb")
+    logger.info("PYTHON USED RAM: " + get_ram_usage_str())
+
+    serialize_model(model, model_config, output_prefix)
+
+    tokenizer = AutoTokenizer.from_pretrained(sys.argv[1]).save_pretrained(
+        output_prefix
     )
 
     logger.info("Validating serialization")
-    model = load_model(f"{output_prefix}")
-    logger.info(f"force_fp32_attn: {model.config.force_fp32_attn}")
+    model = load_model(
+        output_prefix, AutoModelForCausalLM, AutoConfig, None, "float16"
+    ).eval()
+
+    # test generation
+    tokenizer = AutoTokenizer.from_pretrained(sys.argv[1])
+    input_ids = tokenizer.encode(
+        "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
+    ).to("cuda")
+    with torch.no_grad():
+        output = model.generate(input_ids, max_new_tokens=50, do_sample=True)
+    logger.info(
+        f"Test Output: {tokenizer.decode(output[0], skip_special_tokens=True)}"
+    )
 
 
 if __name__ == "__main__":
-    main()
+    logger.info(
+        "The main() functions in this file are not to be use directly and are only for reference."
+    )
+    try:
+        hf_main()
+    except OSError:
+        df_main()
