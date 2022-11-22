@@ -1,0 +1,14 @@
+{
+    "name": "tensorizer",
+    "version": "0.1.0",
+    "description": "",
+    "main": "index.js",
+    "scripts": {},
+    "keywords": [],
+    "author": "CoreWeave",
+    "license": "MIT",
+    "dependencies": {
+      "grpc-tools": "^1.11.2",
+      "ts-protoc-gen": "^0.15.0"
+    }
+  }

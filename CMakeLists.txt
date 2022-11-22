@@ -37,7 +37,7 @@ execute_process(COMMAND ${PYBUILD_PATH}/bin/pip3 show grpcio-tools grpcio protob
         RESULT_VARIABLE EXIT_CODE
         OUTPUT_QUIET)
 if (NOT ${EXIT_CODE} EQUAL 0)
-    execute_process(COMMAND ${PYBUILD_PATH}/bin/pip3 install -r ${PROJECT_SOURCE_DIR}/src/proto/requirements.txt
+    execute_process(COMMAND ${PYBUILD_PATH}/bin/pip3 install -r ${PROJECT_SOURCE_DIR}/proto/requirements.txt
                     RESULT_VARIABLE EXIT_CODE)
     if (NOT ${EXIT_CODE} EQUAL 0)
         message(FATAL_ERROR
@@ -71,50 +71,41 @@ endif()
 
 set(golang_plugin "")
 set(golang_output "--go_out=paths=source_relative:")
-set(golang_output_dir "./")
+set(golang_output_dir "${PROJECT_SOURCE_DIR}")
 file(MAKE_DIRECTORY "${golang_output_dir}/tensors")
 set(golang_exts ".go")
 
 # Javascript / Typescript target support
-#execute_process(COMMAND npm version
-#       RESULT_VARIABLE EXIT_CODE
-#       OUTPUT_QUIET)
-#if (NOT ${EXIT_CODE} EQUAL 0)
-#   message(FATAL_ERROR
-#           "npm is not installed. Please ensure that it is installed by using your favorite package manager.")
-#endif()
+execute_process(COMMAND npm --version 
+        RESULT_VARIABLE EXIT_CODE OUTPUT_QUIET)
+if (NOT ${EXIT_CODE} EQUAL 0)
+    message(FATAL_ERROR
+            "npm is not installed. Please ensure that it is installed by using your favorite package manager.")
+endif()
 
-#execute_process(COMMAND npm install
-#       RESULT_VARIABLE EXIT_CODE)
-#if (NOT ${EXIT_CODE} EQUAL 0)
-#   message(FATAL_ERROR
-#           "npm install failed!")
-#endif()
+execute_process(COMMAND npm install 
+        RESULT_VARIABLE EXIT_CODE)
+if (NOT ${EXIT_CODE} EQUAL 0)
+    message(FATAL_ERROR
+            "npm install failed!")
+endif()
 set(NODE_BIN_DIRECTORY "${PROJECT_SOURCE_DIR}/node_modules/.bin")
 
-set(javascript_exec "${PROJECT_SOURCE_DIR}/src/bin/protoc")
+set(javascript_exec "protoc")
 set(javascript_plugin "--plugin=protoc-gen-ts=${NODE_BIN_DIRECTORY}/protoc-gen-ts")
 set(javascript_args "")
 set(javascript_output "--js_out=import_style=commonjs,binary:")
-set(javascript_output_dir "${PROJECT_SOURCE_DIR}/tensors")
+set(javascript_output_dir "${PROJECT_SOURCE_DIR}")
 file(MAKE_DIRECTORY "${javascript_output_dir}")
 set(javascript_exts "_pb.js")
 
-set(typescript_web_exec "${PROJECT_SOURCE_DIR}/src/bin/protoc")
-set(typescript_web_plugin  "--plugin=protoc-gen-ts=${NODE_BIN_DIRECTORY}/protoc-gen-ts")
-set(typescript_web_args "")
-set(typescript_web_output "--ts_out=service=grpc-web:")
-set(typescript_web_output_dir "${PROJECT_SOURCE_DIR}/tensors")
+set(typescript_exec "protoc")
+set(typescript_plugin  "--plugin=protoc-gen-ts=${NODE_BIN_DIRECTORY}/protoc-gen-ts")
+set(typescript_args "")
+set(typescript_output "--ts_out=")
+set(typescript_output_dir "${PROJECT_SOURCE_DIR}")
 file(MAKE_DIRECTORY "${typescript_output_dir}")
-set(typescript_web_exts "_grpc_pb_service.d.ts;_grpc_pb_service.js")
-
-set(typescript_node_exec "${PROJECT_SOURCE_DIR}/src/bin/protoc")
-set(typescript_node_plugin "--plugin=protoc-gen-ts=${NODE_BIN_DIRECTORY}/protoc-gen-ts" "--plugin=protoc-gen-grpc=${NODE_BIN_DIRECTORY}/grpc_tools_node_protoc_plugin")
-set(typescript_node_args "")
-set(typescript_node_output "--ts_out=service=grpc-node:")
-set(typescript_node_output_dir "${PROJECT_SOURCE_DIR}/tensors")
-file(MAKE_DIRECTORY "${typescript_output_dir}")
-set(typescript_node_exts "_grpc_pb.d.ts")
+set(typescript_exts "_pb.d.ts")
 
 ## Protobuf and GRPC stub building macros
 macro (_add_pb_file _src TYP VAR)
@@ -201,6 +192,8 @@ endmacro()
 add_target_languages(
         python
         golang
+        javascript
+        typescript
 )
 
 # Generate base protobufs
@@ -221,5 +214,6 @@ add_custom_target(
         ${GENERATED_PROTOBUF_FILES_python}
         ${GENERATED_PROTOBUF_FILES_golang}
         ${GENERATED_PROTOBUF_FILES_javascript}
+        ${GENERATED_PROTOBUF_FILES_typescript}
         ${PROJECT_SOURCE_DIR}/tensors/go.mod
 )
