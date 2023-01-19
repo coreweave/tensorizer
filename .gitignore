@@ -18,3 +18,4 @@ pybuild
 # Python
 *.pyc
 *.egg-info
+build/
