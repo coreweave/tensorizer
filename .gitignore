@@ -14,3 +14,7 @@ _deps
 # Project specific
 node_modules
 pybuild
+
+# Python
+*.pyc
+*.egg-info
