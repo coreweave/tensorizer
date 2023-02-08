@@ -1,5 +1,5 @@
-import os
-import tensorizer
+from tensorizer import tensorizer
+
 import unittest
 import torch
 
