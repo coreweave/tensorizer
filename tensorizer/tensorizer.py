@@ -856,13 +856,6 @@ def df_main(args: argparse.Namespace) -> None:
         args.input_directory, use_auth_token=hf_api_token
     )
 
-    cudadev = torch.cuda.current_device()
-    gb_gpu = int(
-        torch.cuda.get_device_properties(0).total_memory / (1000 * 1000 * 1000)
-    )
-
-    logger.info("GPU: " + torch.cuda.get_device_name(cudadev))
-    logger.info("GPU RAM: " + str(gb_gpu) + "gb")
     logger.info("PYTHON USED RAM: " + get_ram_usage_str())
 
     serialize_model(
@@ -919,13 +912,6 @@ def hf_main(args):
         args.input_directory, config=model_config, torch_dtype=torch.float16
     )
 
-    cudadev = torch.cuda.current_device()
-    gb_gpu = int(
-        torch.cuda.get_device_properties(0).total_memory / (1000 * 1000 * 1000)
-    )
-
-    logger.info("GPU: " + torch.cuda.get_device_name(cudadev))
-    logger.info("GPU RAM: " + str(gb_gpu) + "gb")
     logger.info("PYTHON USED RAM: " + get_ram_usage_str())
 
     serialize_model(model, model_config, output_prefix)
