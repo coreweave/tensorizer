@@ -24,6 +24,7 @@ import sys
 import pathlib
 import os
 import requests
+import argparse
 
 os.environ[
     "TRANSFORMERS_VERBOSITY"
@@ -843,20 +844,16 @@ def load_model(
     return model
 
 
-def df_main():
-    if len(sys.argv) != 3:
-        logger.fatal(f"{sys.argv[0]} [input-directory] [output-prefix]")
-        logger.fatal(f"Example: runwayml/stable-diffusion-v1-5 stable-diffusion-v1-5")
-        sys.exit(1)
+def df_main(args: argparse.Namespace) -> None:
 
-    output_prefix = sys.argv[2]
-    print("MODEL PATH:", sys.argv[1])
+    output_prefix = args.output_prefix
+    print("MODEL PATH:", args.input_directory)
     print("OUTPUT PREFIX:", output_prefix)
 
     hf_api_token = os.environ.get("HF_API_TOKEN")
 
     pipeline = StableDiffusionPipeline.from_pretrained(
-        sys.argv[1], use_auth_token=hf_api_token
+        args.input_directory, use_auth_token=hf_api_token
     )
 
     cudadev = torch.cuda.current_device()
@@ -879,53 +876,47 @@ def df_main():
 
     pipeline.tokenizer.save_pretrained(output_prefix)
 
-    # validate
-    logger.info("Validating serialization")
-    vae = load_model(output_prefix, AutoencoderKL, None, "vae")
-    unet = load_model(output_prefix, UNet2DConditionModel, None, "unet")
-    encoder = load_model(
-        output_prefix, CLIPTextModel, CLIPTextConfig, "encoder"
-    )
+    if args.validate:
+        logger.info("Validating serialization")
+        vae = load_model(output_prefix, AutoencoderKL, None, "vae")
+        unet = load_model(output_prefix, UNet2DConditionModel, None, "unet")
+        encoder = load_model(
+            output_prefix, CLIPTextModel, CLIPTextConfig, "encoder"
+        )
 
-    pipeline = StableDiffusionPipeline(
-        text_encoder=encoder,
-        vae=vae,
-        unet=unet,
-        tokenizer=CLIPTokenizer.from_pretrained(
-            sys.argv[1], subfolder="tokenizer"
-        ),
-        scheduler=LMSDiscreteScheduler(
-            beta_end=0.012,
-            beta_schedule="scaled_linear",
-            beta_start=0.00085,
-            num_train_timesteps=1000,
-            trained_betas=None,
-        ),
-        safety_checker=None,
-        feature_extractor=None,
-    ).to("cuda")
+        pipeline = StableDiffusionPipeline(
+            text_encoder=encoder,
+            vae=vae,
+            unet=unet,
+            tokenizer=CLIPTokenizer.from_pretrained(
+                args.input_directory, subfolder="tokenizer"
+            ),
+            scheduler=LMSDiscreteScheduler(
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                beta_start=0.00085,
+                num_train_timesteps=1000,
+                trained_betas=None,
+            ),
+            safety_checker=None,
+            feature_extractor=None,
+        ).to("cuda")
 
-    prompt = "a photo of an astronaut riding a horse on mars"
-    with torch.autocast("cuda"):
-        image = pipeline(prompt).images[0]
-    image.save("test.png")
+        prompt = "a photo of an astronaut riding a horse on mars"
+        with torch.autocast("cuda"):
+            image = pipeline(prompt).images[0]
 
 
-def hf_main():
-    if len(sys.argv) != 3:
-        logger.fatal(f"{sys.argv[0]} [input-directory] [output-prefix]")
-        logger.fatal(f"Example: EleutherAI/gpt-neo-125M gpt-neo-125M")
-        sys.exit(1)
-
-    output_prefix = sys.argv[2]
-    print("MODEL PATH:", sys.argv[1])
+def hf_main(args):
+    output_prefix = args.output_prefix
+    print("MODEL PATH:", args.input_directory)
     print("OUTPUT PREFIX:", output_prefix)
 
     from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
-    model_config = AutoConfig.from_pretrained(sys.argv[1])
+    model_config = AutoConfig.from_pretrained(args.input_directory)
     model = AutoModelForCausalLM.from_pretrained(
-        sys.argv[1], config=model_config, torch_dtype=torch.float16
+        args.input_directory, config=model_config, torch_dtype=torch.float16
     )
 
     cudadev = torch.cuda.current_device()
@@ -939,32 +930,43 @@ def hf_main():
 
     serialize_model(model, model_config, output_prefix)
 
-    tokenizer = AutoTokenizer.from_pretrained(sys.argv[1]).save_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(args.input_directory).save_pretrained(
         output_prefix
     )
 
-    logger.info("Validating serialization")
-    model = load_model(
-        output_prefix, AutoModelForCausalLM, AutoConfig, None, "float16"
-    ).eval()
+    if args.validate:
+        logger.info("Validating serialization")
+        model = load_model(
+            output_prefix, AutoModelForCausalLM, AutoConfig, None, "float16"
+        ).eval()
 
-    # test generation
-    tokenizer = AutoTokenizer.from_pretrained(sys.argv[1])
-    input_ids = tokenizer.encode(
-        "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
-    ).to("cuda")
-    with torch.no_grad():
-        output = model.generate(input_ids, max_new_tokens=50, do_sample=True)
-    logger.info(
-        f"Test Output: {tokenizer.decode(output[0], skip_special_tokens=True)}"
-    )
+        # test generation
+        tokenizer = AutoTokenizer.from_pretrained(args.input_directory)
+        input_ids = tokenizer.encode(
+            "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
+        ).to("cuda")
+        with torch.no_grad():
+            output = model.generate(input_ids, max_new_tokens=50, do_sample=True)
+        logger.info(
+            f"Test Output: {tokenizer.decode(output[0], skip_special_tokens=True)}"
+        )
 
+def main():
+    # usage: tensorizer [input-directory] [output-prefix] [model-type]
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_directory", type=str, help="Path to model directory or HF model ID")
+    parser.add_argument("output_prefix", type=str, help="Path to output directory")
+    parser.add_argument("--model_type", type=str, choices=["transformers", "diffusers"], required=True, help="Framework used for the model")
+    parser.add_argument("--validate", action="store_true", help="Validate serialization by running a test inference")
+    args = parser.parse_args()
+
+    if args.model_type == "transformers":
+        hf_main(args)
+    elif args.model_type == "diffusers":
+        df_main(args)
+    else:
+        raise ValueError(f"Unknown model type {args.model_type} (transformers or diffusers)")
 
 if __name__ == "__main__":
-    logger.info(
-        "The main() functions in this file are not to be use directly and are only for reference."
-    )
-    try:
-        hf_main()
-    except OSError:
-        df_main()
+    main()
