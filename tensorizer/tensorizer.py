@@ -703,21 +703,26 @@ def get_ram_usage_str() -> str:
         maxrss_b4_gb = "unknown CPU RAM used"
     return maxrss_b4_gb
 
+
 def get_vram_usage_str() -> str:
     if torch.cuda.is_available():
         gb_gpu = int(
-            torch.cuda.get_device_properties(0).total_memory / (1000 * 1000 * 1000)
+            torch.cuda.get_device_properties(0).total_memory
+            / (1000 * 1000 * 1000)
         )
         return f"{str(gb_gpu)}gb"
     return "N/A"
+
 
 def get_gpu_name() -> str:
     if torch.cuda.is_available():
         return torch.cuda.get_device_name(0)
     return "N/A"
 
+
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def serialize_model(
     model: torch.nn.Module,
@@ -916,7 +921,9 @@ def df_main(args: argparse.Namespace) -> None:
         ).to(device)
 
         prompt = "a photo of an astronaut riding a horse on mars"
-        with torch.autocast("cuda" if torch.cuda.is_available() else "cpu"): # for some reason device_type needs to be a string instead of an actual device
+        with torch.autocast(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        ):  # for some reason device_type needs to be a string instead of an actual device
             pipeline(prompt).images[0]
 
 
@@ -939,15 +946,20 @@ def hf_main(args):
 
     serialize_model(model, model_config, output_prefix)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.input_directory).save_pretrained(
-        output_prefix
-    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.input_directory
+    ).save_pretrained(output_prefix)
 
     if args.validate:
         device = get_device()
         logger.info("Validating serialization")
         model = load_model(
-            output_prefix, AutoModelForCausalLM, AutoConfig, None, device, "float16"
+            output_prefix,
+            AutoModelForCausalLM,
+            AutoConfig,
+            None,
+            device,
+            "float16",
         ).eval()
         # test generation
         tokenizer = AutoTokenizer.from_pretrained(args.input_directory)
@@ -955,19 +967,38 @@ def hf_main(args):
             "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
         ).to(device)
         with torch.no_grad():
-            output = model.generate(input_ids, max_new_tokens=50, do_sample=True)
+            output = model.generate(
+                input_ids, max_new_tokens=50, do_sample=True
+            )
         logger.info(
             f"Test Output: {tokenizer.decode(output[0], skip_special_tokens=True)}"
         )
+
 
 def main():
     # usage: tensorizer [input-directory] [output-prefix] [model-type]
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("input_directory", type=str, help="Path to model directory or HF model ID")
-    parser.add_argument("output_prefix", type=str, help="Path to output directory")
-    parser.add_argument("--model_type", type=str, choices=["transformers", "diffusers"], required=True, help="Framework used for the model")
-    parser.add_argument("--validate", action="store_true", help="Validate serialization by running a test inference")
+    parser.add_argument(
+        "input_directory",
+        type=str,
+        help="Path to model directory or HF model ID",
+    )
+    parser.add_argument(
+        "output_prefix", type=str, help="Path to output directory"
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["transformers", "diffusers"],
+        required=True,
+        help="Framework used for the model",
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate serialization by running a test inference",
+    )
     args = parser.parse_args()
 
     if args.model_type == "transformers":
@@ -975,7 +1006,10 @@ def main():
     elif args.model_type == "diffusers":
         df_main(args)
     else:
-        raise ValueError(f"Unknown model type {args.model_type} (transformers or diffusers)")
+        raise ValueError(
+            f"Unknown model type {args.model_type} (transformers or diffusers)"
+        )
+
 
 if __name__ == "__main__":
     main()
