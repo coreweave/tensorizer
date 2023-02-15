@@ -704,6 +704,26 @@ def get_ram_usage_str() -> str:
     return maxrss_b4_gb
 
 
+def get_vram_usage_str() -> str:
+    if torch.cuda.is_available():
+        gb_gpu = int(
+            torch.cuda.get_device_properties(0).total_memory
+            / (1000 * 1000 * 1000)
+        )
+        return f"{str(gb_gpu)}gb"
+    return "N/A"
+
+
+def get_gpu_name() -> str:
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name(0)
+    return "N/A"
+
+
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def serialize_model(
     model: torch.nn.Module,
     config: Optional[Union[ConfigMixin, AutoConfig, dict]],
@@ -762,6 +782,7 @@ def load_model(
     modelclass: Union[PreTrainedModel, ModelMixin, ConfigMixin] = None,
     configclass: Optional[Union[ConfigMixin, AutoConfig]] = None,
     model_prefix: str = "model",
+    device: torch.device = "cpu",
     dtype: str = None,
 ) -> torch.nn.Module:
     """
@@ -829,7 +850,7 @@ def load_model(
                 config = json.load(f)
         model = no_init_or_tensor(lambda: modelclass(**config))
 
-    tensor_deserializer.load_tensors(model, dtype=dtype)
+    tensor_deserializer.load_tensors(model, device=device, dtype=dtype)
 
     tensor_load_s = time.time() - begin_load
     rate_str = convert_bytes(
@@ -845,7 +866,6 @@ def load_model(
 
 
 def df_main(args: argparse.Namespace) -> None:
-
     output_prefix = args.output_prefix
     print("MODEL PATH:", args.input_directory)
     print("OUTPUT PREFIX:", output_prefix)
@@ -856,13 +876,9 @@ def df_main(args: argparse.Namespace) -> None:
         args.input_directory, use_auth_token=hf_api_token
     )
 
-    cudadev = torch.cuda.current_device()
-    gb_gpu = int(
-        torch.cuda.get_device_properties(0).total_memory / (1000 * 1000 * 1000)
-    )
-
-    logger.info("GPU: " + torch.cuda.get_device_name(cudadev))
-    logger.info("GPU RAM: " + str(gb_gpu) + "gb")
+    logger.info("Serializing model")
+    logger.info("GPU: " + get_gpu_name())
+    logger.info("GPU RAM: " + get_vram_usage_str())
     logger.info("PYTHON USED RAM: " + get_ram_usage_str())
 
     serialize_model(
@@ -877,11 +893,13 @@ def df_main(args: argparse.Namespace) -> None:
     pipeline.tokenizer.save_pretrained(output_prefix)
 
     if args.validate:
+        device = get_device()
+
         logger.info("Validating serialization")
-        vae = load_model(output_prefix, AutoencoderKL, None, "vae")
+        vae = load_model(output_prefix, AutoencoderKL, None, "vae", device)
         unet = load_model(output_prefix, UNet2DConditionModel, None, "unet")
         encoder = load_model(
-            output_prefix, CLIPTextModel, CLIPTextConfig, "encoder"
+            output_prefix, CLIPTextModel, CLIPTextConfig, "encoder", device
         )
 
         pipeline = StableDiffusionPipeline(
@@ -900,11 +918,13 @@ def df_main(args: argparse.Namespace) -> None:
             ),
             safety_checker=None,
             feature_extractor=None,
-        ).to("cuda")
+        ).to(device)
 
         prompt = "a photo of an astronaut riding a horse on mars"
-        with torch.autocast("cuda"):
-            image = pipeline(prompt).images[0]
+        with torch.autocast(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        ):  # for some reason device_type needs to be a string instead of an actual device
+            pipeline(prompt).images[0]
 
 
 def hf_main(args):
@@ -919,46 +939,66 @@ def hf_main(args):
         args.input_directory, config=model_config, torch_dtype=torch.float16
     )
 
-    cudadev = torch.cuda.current_device()
-    gb_gpu = int(
-        torch.cuda.get_device_properties(0).total_memory / (1000 * 1000 * 1000)
-    )
-
-    logger.info("GPU: " + torch.cuda.get_device_name(cudadev))
-    logger.info("GPU RAM: " + str(gb_gpu) + "gb")
+    logger.info("Serializing model")
+    logger.info("GPU: " + get_gpu_name())
+    logger.info("GPU RAM: " + get_vram_usage_str())
     logger.info("PYTHON USED RAM: " + get_ram_usage_str())
 
     serialize_model(model, model_config, output_prefix)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.input_directory).save_pretrained(
-        output_prefix
-    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.input_directory
+    ).save_pretrained(output_prefix)
 
     if args.validate:
+        device = get_device()
         logger.info("Validating serialization")
         model = load_model(
-            output_prefix, AutoModelForCausalLM, AutoConfig, None, "float16"
+            output_prefix,
+            AutoModelForCausalLM,
+            AutoConfig,
+            None,
+            device,
+            "float16",
         ).eval()
-
         # test generation
         tokenizer = AutoTokenizer.from_pretrained(args.input_directory)
         input_ids = tokenizer.encode(
             "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
-        ).to("cuda")
+        ).to(device)
         with torch.no_grad():
-            output = model.generate(input_ids, max_new_tokens=50, do_sample=True)
+            output = model.generate(
+                input_ids, max_new_tokens=50, do_sample=True
+            )
         logger.info(
             f"Test Output: {tokenizer.decode(output[0], skip_special_tokens=True)}"
         )
+
 
 def main():
     # usage: tensorizer [input-directory] [output-prefix] [model-type]
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("input_directory", type=str, help="Path to model directory or HF model ID")
-    parser.add_argument("output_prefix", type=str, help="Path to output directory")
-    parser.add_argument("--model_type", type=str, choices=["transformers", "diffusers"], required=True, help="Framework used for the model")
-    parser.add_argument("--validate", action="store_true", help="Validate serialization by running a test inference")
+    parser.add_argument(
+        "input_directory",
+        type=str,
+        help="Path to model directory or HF model ID",
+    )
+    parser.add_argument(
+        "output_prefix", type=str, help="Path to output directory"
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["transformers", "diffusers"],
+        required=True,
+        help="Framework used for the model",
+    )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate serialization by running a test inference",
+    )
     args = parser.parse_args()
 
     if args.model_type == "transformers":
@@ -966,7 +1006,10 @@ def main():
     elif args.model_type == "diffusers":
         df_main(args)
     else:
-        raise ValueError(f"Unknown model type {args.model_type} (transformers or diffusers)")
+        raise ValueError(
+            f"Unknown model type {args.model_type} (transformers or diffusers)"
+        )
+
 
 if __name__ == "__main__":
     main()
