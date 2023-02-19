@@ -2,3 +2,4 @@ torch>=1.9.0
 protobuf>=3.19.5
 diffusers==0.11.1
 transformers==4.21.1
+numpy>=1.22.2 # not directly required, pinned by Snyk to avoid a vulnerability
