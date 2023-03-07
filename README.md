@@ -117,4 +117,8 @@ pipeline("a photo of an astronaut riding a horse on mars").images[0].save(
 )
 ```
 
-More practical examples for usage of the Tensorizer can be found inside of [tensorizer.py](tensorizer.py), where `df_main()` serializes models from [HuggingFace Diffusers](https://github.com/huggingface/diffusers) and `hf_main()` serializes [HuggingFace Transformers](https://github.com/huggingface/transformers) models.
+More practical examples for usage of the Tensorizer can be found inside of
+[tensorizer.py](tensorizer.py), where `df_main()` serializes models from
+[HuggingFace Diffusers](https://github.com/huggingface/diffusers) and `hf_main()`
+serializes [HuggingFace Transformers](https://github.com/huggingface/transformers)
+models.
