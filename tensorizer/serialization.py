@@ -13,6 +13,7 @@ except ImportError:
 
 from enum import Enum
 import io
+import os
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 import numpy
@@ -33,9 +34,9 @@ logger = logging.getLogger(__name__)
 
 # Whether the tensor is a parameter or a buffer on the model.
 class TensorType(Enum):
-    PARAM = int(0)
-    BUFFER = int(1)
-    STATEDICT = int(2)
+    PARAM = 0
+    BUFFER = 1
+    STATEDICT = 2
 
 
 class TensorDeserializer:
@@ -136,7 +137,7 @@ class TensorDeserializer:
     def state_dict(
             self,
             device=utils.get_device(),
-            dtype: [None, str] = None,
+            dtype: Optional[str] = None,
     ) -> OrderedDict:
         """
         Load the tensors in this Tensorizer object into a state_dict.
@@ -221,14 +222,11 @@ class TensorSerializer:
 
     def __init__(
             self,
-            file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO, str],
-            write: bool = False,
+            file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO,
+                            str, bytes, os.PathLike, int],
             compress_tensors: bool = False) -> None:
-        if isinstance(file_obj, str):
-            if write:
-                self._file = stream_io.open_stream(file_obj, "ab+")
-            else:
-                self._file = stream_io.open_stream(file_obj, "rb+")
+        if isinstance(file_obj, (str, bytes, os.PathLike, int)):
+            self._file = stream_io.open_stream(file_obj, "ab+")
         else:
             self._file = file_obj
         self._tensors = 0
@@ -277,7 +275,7 @@ class TensorSerializer:
             idx,
             name,
             tensor_type: TensorType,
-            tensor: [torch.Tensor, numpy.ndarray]) -> None:
+            tensor: Union[torch.Tensor, numpy.ndarray]) -> None:
         """
         Serializes a tensor, laying things out so that it can be read in three
         calls from the input -- once for the size, once for the header, and
