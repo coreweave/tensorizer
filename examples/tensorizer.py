@@ -5,7 +5,7 @@ from collections import OrderedDict
 from typing import Optional, Union
 
 import tensorizer.utils as utils
-import tensorizer.tensorizer as tensorizer
+from tensorizer.serialization import TensorSerializer, TensorDeserializer
 import tensorizer.stream_io as stream_io
 import logging
 import time
@@ -79,7 +79,7 @@ def serialize_model(
                 json.dumps(config, indent=2)
             )
 
-    ts = tensorizer.Tensorizer(open(f"{dir_prefix}.tensors", "wb"))
+    ts = TensorSerializer(open(f"{dir_prefix}.tensors", "wb"))
     ts.write_module(model)
     ts.close()
 
@@ -119,7 +119,7 @@ def load_model(
 
     logger.info(f"Loading {tensors_uri}, {ram_usage}")
 
-    tensor_deserializer = tensorizer.Tensorizer(tensor_stream)
+    tensor_deserializer = TensorDeserializer(tensor_stream)
 
     if configclass is not None:
         try:
@@ -130,7 +130,7 @@ def load_model(
                 config.gradient_checkpointing = True
         except ValueError:
             config = configclass.from_pretrained(config_uri)
-        model = tensorizer.no_init_or_tensor(
+        model = utils.no_init_or_tensor(
             lambda: modelclass.from_pretrained(
                 None, config=config, state_dict=OrderedDict()
             )
@@ -143,7 +143,7 @@ def load_model(
         except ValueError:
             with open(config_uri, "r") as f:
                 config = json.load(f)
-        model = tensorizer.no_init_or_tensor(lambda: modelclass(**config))
+        model = utils.no_init_or_tensor(lambda: modelclass(**config))
 
     tensor_deserializer.load_tensors(model, device=device, dtype=dtype)
 

@@ -1,6 +1,6 @@
 ##############################################################################
-# tensorizer.py                                                      Wes Brown
-# Fast LLM model serialization and deserialization          (c) 2022 Coreweave
+# serialization.py                                                   Wes Brown
+# Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
 
 # try to import UNIX only dependencies
@@ -14,13 +14,13 @@ except ImportError:
 from enum import Enum
 import io
 import tensorizer.stream_io as stream_io
+import tensorizer.utils as utils
 import numpy
 import struct
 import torch
 import typing
 import logging
 import tempfile
-import utils
 
 from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Iterator, Callable, Dict, Any
@@ -38,35 +38,185 @@ class TensorType(Enum):
     STATEDICT = int(2)
 
 
-def no_init_or_tensor(loading_code):
-    def dummy(self):
-        return
-
-    modules = [torch.nn.Linear, torch.nn.Embedding, torch.nn.LayerNorm]
-    original = {}
-    for mod in modules:
-        original[mod] = mod.reset_parameters
-        mod.reset_parameters = dummy
-    original_empty = torch.empty
-
-    # when torch.empty is called, make it map to meta device by replacing the device in
-    # kwargs.
-    torch.empty = lambda *args, **kwargs: original_empty(
-        *args, **{**kwargs, "device": "meta"}
-    )
-
-    result = loading_code()
-    for mod in modules:
-        mod.reset_parameters = original[mod]
-    torch.empty = original_empty
-
-    return result
-
-
-class Tensorizer:
+class TensorDeserializer:
     """
-    Given a file-like object, either for read or write, serialize tensors
-    to the file, or deserialize the tensors.
+    Given a file-like object for readng, deserialize tensors to a state_dict or a
+    torch.nn.Module.
+    """
+
+    def __init__(
+            self,
+            file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO, str]):
+        if isinstance(file_obj, str):
+            self._file = stream_io.open_stream(file_obj, "rb+")
+        else:
+            self._file = file_obj
+        self._tensors = 0
+        self.total_tensor_bytes = 0
+        self.total_compressed_tensor_bytes = 0
+        self.read_bytes = 0
+        self._buffer = bytearray(1024 * 1024)
+        self._state_dict = None
+        self._idx = 0
+
+    @staticmethod
+    def _read_shapes(obj, num_elems) -> List[int]:
+        """
+        Read the tensor shapes.
+        """
+        bstr = obj
+        shape = []
+        for i in range(num_elems):
+            shape.append(struct.unpack("<I", bstr[0:4])[0])
+            bstr = bstr[4:]
+        return shape
+
+    @property
+    def total_bytes_read(self) -> int:
+        if self._file.closed:
+            return self.total_tensor_bytes
+        else:
+            return self._file.tell()
+
+    def read_tensors(self) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
+        """
+        A generator that deserializes tensors and returns the `module_idx`,
+        `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
+        represents the tensor.
+        """
+        try:
+            while True:
+                header_sz = struct.unpack("<Q", self._file.read(8))[0]
+                if header_sz == 0:
+                    break
+                headers = self._file.read(header_sz - 8)
+                header_len = len(headers)
+                module_idx = struct.unpack("<H", headers[0:2])[0]
+                tensor_type = TensorType(struct.unpack("<B", headers[2:3])[0])
+                name_sz = struct.unpack("<H", headers[3:5])[0]
+                idx = name_sz + 5
+                name_bytes = headers[5:idx]
+                name: str = name_bytes.decode("utf-8")
+                dtype_len = struct.unpack("<B", headers[idx: idx + 1])[0]
+                dtype_end = idx + dtype_len + 1
+                dtype = headers[idx + 1: dtype_end]
+                # read the shape amount, according to the serialized format. the shape
+                # length is 1 byte after the dtype end.
+                shape_len = struct.unpack(
+                    "<B", headers[dtype_end: dtype_end + 1]
+                )[0]
+                # the shape elements are <I so we read 4 bytes. _read_shapes takes in
+                # the header object and the number of elements in the shape.
+                #
+                # the amount of bytes for the shape is 4 * the number of elements in
+                # the shape. so, we need to read 4 * shape_len bytes after the
+                # dtype end + 1 byte for the shape length. sort of convoluted, but it
+                # works.
+                shape_list = self._read_shapes(
+                    headers[dtype_end + 1: (dtype_end + 1) + (4 * shape_len)],
+                    shape_len,
+                )
+                data_length = struct.unpack("<q", headers[header_len - 8:])[0]
+                if data_length > len(self._buffer):
+                    self._buffer = bytearray(data_length)
+                with memoryview(self._buffer) as mem:
+                    self._file.readinto(mem[:data_length])
+                arr = numpy.ndarray.__new__(
+                    numpy.memmap,
+                    shape_list,
+                    dtype=dtype,
+                    buffer=self._buffer,
+                    offset=0,
+                )
+                # Get rid of the error on load.
+                yield module_idx, tensor_type, name, arr
+        except EOFError:
+            return
+
+    def state_dict(
+            self,
+            device=utils.get_device(),
+            dtype: [None, str] = None,
+    ) -> OrderedDict:
+        """
+        Load the tensors in this Tensorizer object into a state_dict.
+
+        :param device:
+        :param dtype:
+        :return:
+        """
+        if self._state_dict is not None:
+            return self._state_dict
+
+        if self._file.closed:
+            raise IOError("IO closed, instantiate if you want to load again.")
+
+        tensor_ct = 0
+        d = OrderedDict()
+        for idx, typ, name, arr in self.read_tensors():
+            gradient = True
+            if arr.dtype not in ["float", "complex"]:
+                gradient = False
+                if dtype is not None and arr.dtype != dtype:
+                    arr = arr.astype(dtype)
+            d[name] = torch.nn.Parameter(
+                torch.as_tensor(arr, device=device), requires_grad=gradient
+            )
+            tensor_ct += 1
+        self.total_tensor_bytes = self._file.tell()
+        self._file.close()
+        return d
+
+    def load_tensors(
+            self,
+            m: torch.nn.Module,
+            device=utils.get_device(),
+            dtype: [None, str] = None,
+    ) -> int:
+        """
+        Given `m`, a torch.nn.Module, load the associate tensors in this
+        Tensorizer object into the `torch.nn.Module`. Returns the number of tensors
+        loaded into the model.
+
+        """
+        if self._file.closed:
+            raise IOError("IO closed, instantiate if you want to load again.")
+
+        modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
+        for name, module in m.named_modules():
+            modules[name] = module
+
+        tensor_ct = 0
+        for idx, typ, name, arr in self.read_tensors():
+            gradient = True
+            if arr.dtype not in ["float", "complex"]:
+                gradient = False
+                if dtype is not None and arr.dtype != dtype:
+                    arr = arr.astype(dtype)
+            obj_path, attr = name.rsplit(".", 1)
+            module: torch.nn.Module = modules[obj_path]
+            param = torch.nn.Parameter(
+                torch.as_tensor(arr, device=device), requires_grad=gradient
+            )
+            if typ is TensorType.PARAM:
+                module.register_parameter(attr, param)
+            elif typ is TensorType.BUFFER:
+                module.register_buffer(attr, param)
+            elif typ is TensorType.STATEDICT:
+                raise NotImplementedError(
+                    "This was serialized using the write_state_dict() method, and"
+                    " cannot be loaded using the load_tensors() method. Use the"
+                    " state_dict() method instead.")
+            tensor_ct += 1
+        self.total_tensor_bytes = self._file.tell()
+        self._file.close()
+        return tensor_ct
+
+
+class TensorSerializer:
+    """
+    Given a file-like object or path, serialize tensors from a torch.nn.Module
+    to it.
     """
 
     def __init__(
@@ -96,7 +246,7 @@ class Tensorizer:
             self.lz4_frame = None
 
     @staticmethod
-    def _dump_shape(obj) -> Tuple[bytes, int]:
+    def _dump_shape(obj) -> bytes:
         """
         Returns shape of the tensor
         """
@@ -104,25 +254,6 @@ class Tensorizer:
         for i in obj:
             bstr += struct.pack("<I", i)
         return bstr
-
-    @staticmethod
-    def _read_shapes(obj, num_elems) -> List[int]:
-        """
-        Read the tensor shapes.
-        """
-        bstr = obj
-        shape = []
-        for i in range(num_elems):
-            shape.append(struct.unpack("<I", bstr[0:4])[0])
-            bstr = bstr[4:]
-        return shape
-
-    @property
-    def total_bytes_read(self) -> int:
-        if self._file.closed:
-            return self.total_tensor_bytes
-        else:
-            return self._file.tell()
 
     def close(self) -> None:
         """
@@ -278,95 +409,6 @@ class Tensorizer:
                 setattr(module, name, None)
             self._idx += 1
 
-    def read_tensors(self) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
-        """
-        A generator that deserializes tensors and returns the `module_idx`,
-        `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
-        represents the tensor.
-        """
-        try:
-            while True:
-                header_sz = struct.unpack("<Q", self._file.read(8))[0]
-                if header_sz == 0:
-                    break
-                headers = self._file.read(header_sz - 8)
-                header_len = len(headers)
-                module_idx = struct.unpack("<H", headers[0:2])[0]
-                tensor_type = TensorType(struct.unpack("<B", headers[2:3])[0])
-                name_sz = struct.unpack("<H", headers[3:5])[0]
-                idx = name_sz + 5
-                name_bytes = headers[5:idx]
-                name: str = name_bytes.decode("utf-8")
-                dtype_len = struct.unpack("<B", headers[idx: idx + 1])[0]
-                dtype_end = idx + dtype_len + 1
-                dtype = headers[idx + 1: dtype_end]
-                # read the shape amount, according to the serialized format. the shape
-                # length is 1 byte after the dtype end.
-                shape_len = struct.unpack(
-                    "<B", headers[dtype_end: dtype_end + 1]
-                )[0]
-                # the shape elements are <I so we read 4 bytes. _read_shapes takes in
-                # the header object and the number of elements in the shape.
-                #
-                # the amount of bytes for the shape is 4 * the number of elements in
-                # the shape. so, we need to read 4 * shape_len bytes after the
-                # dtype end + 1 byte for the shape length. sort of convoluted, but it
-                # works.
-                shape_list = self._read_shapes(
-                    headers[dtype_end + 1: (dtype_end + 1) + (4 * shape_len)],
-                    shape_len,
-                )
-                data_length = struct.unpack("<q", headers[header_len - 8:])[0]
-                if data_length > len(self._buffer):
-                    self._buffer = bytearray(data_length)
-                with memoryview(self._buffer) as mem:
-                    self._file.readinto(mem[:data_length])
-                arr = numpy.ndarray.__new__(
-                    numpy.memmap,
-                    shape_list,
-                    dtype=dtype,
-                    buffer=self._buffer,
-                    offset=0,
-                )
-                # Get rid of the error on load.
-                yield module_idx, tensor_type, name, arr
-        except EOFError:
-            return
-
-    def state_dict(
-            self,
-            device=utils.get_device(),
-            dtype: [None, str] = None,
-    ) -> OrderedDict:
-        """
-        Load the tensors in this Tensorizer object into a state_dict.
-
-        :param device:
-        :param dtype:
-        :return:
-        """
-        if self._state_dict is not None:
-            return self._state_dict
-
-        if self._file.closed:
-            raise IOError("IO closed, instantiate if you want to load again.")
-
-        tensor_ct = 0
-        d = OrderedDict()
-        for idx, typ, name, arr in self.read_tensors():
-            gradient = True
-            if arr.dtype not in ["float", "complex"]:
-                gradient = False
-                if dtype is not None and arr.dtype != dtype:
-                    arr = arr.astype(dtype)
-            d[name] = torch.nn.Parameter(
-                torch.as_tensor(arr, device=device), requires_grad=gradient
-            )
-            tensor_ct += 1
-        self.total_tensor_bytes = self._file.tell()
-        self._file.close()
-        return d
-
     def write_state_dict(self, state_dict: Dict):
         """
         Write the state_dict to the file in Tensorizer format.
@@ -375,48 +417,3 @@ class Tensorizer:
         for name, param in state_dict.items():
             self.write_tensor(idx, name, TensorType.STATEDICT, param)
         self.total_tensor_bytes = self._file.tell()
-
-    def load_tensors(
-            self,
-            m: torch.nn.Module,
-            device=utils.get_device(),
-            dtype: [None, str] = None,
-    ) -> int:
-        """
-        Given `m`, a torch.nn.Module, load the associate tensors in this
-        Tensorizer object into the `torch.nn.Module`. Returns the number of tensors
-        loaded into the model.
-
-        """
-        if self._file.closed:
-            raise IOError("IO closed, instantiate if you want to load again.")
-
-        modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
-        for name, module in m.named_modules():
-            modules[name] = module
-
-        tensor_ct = 0
-        for idx, typ, name, arr in self.read_tensors():
-            gradient = True
-            if arr.dtype not in ["float", "complex"]:
-                gradient = False
-                if dtype is not None and arr.dtype != dtype:
-                    arr = arr.astype(dtype)
-            obj_path, attr = name.rsplit(".", 1)
-            module: torch.nn.Module = modules[obj_path]
-            param = torch.nn.Parameter(
-                torch.as_tensor(arr, device=device), requires_grad=gradient
-            )
-            if typ is TensorType.PARAM:
-                module.register_parameter(attr, param)
-            elif typ is TensorType.BUFFER:
-                module.register_buffer(attr, param)
-            elif typ is TensorType.STATEDICT:
-                raise NotImplementedError(
-                    "This was serialized using the write_state_dict() method, and"
-                    " cannot be loaded using the load_tensors() method. Use the"
-                    " state_dict() method instead.")
-            tensor_ct += 1
-        self.total_tensor_bytes = self._file.tell()
-        self._file.close()
-        return tensor_ct

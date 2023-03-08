@@ -41,3 +41,27 @@ def get_gpu_name() -> str:
     if torch.cuda.is_available():
         return torch.cuda.get_device_name(0)
     return "N/A"
+
+def no_init_or_tensor(loading_code):
+    def dummy(self):
+        return
+
+    modules = [torch.nn.Linear, torch.nn.Embedding, torch.nn.LayerNorm]
+    original = {}
+    for mod in modules:
+        original[mod] = mod.reset_parameters
+        mod.reset_parameters = dummy
+    original_empty = torch.empty
+
+    # when torch.empty is called, make it map to meta device by replacing the
+    # device in kwargs.
+    torch.empty = lambda *args, **kwargs: original_empty(
+        *args, **{**kwargs, "device": "meta"}
+    )
+
+    result = loading_code()
+    for mod in modules:
+        mod.reset_parameters = original[mod]
+    torch.empty = original_empty
+
+    return result
