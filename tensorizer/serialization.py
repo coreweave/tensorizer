@@ -22,6 +22,7 @@ import torch
 import typing
 import logging
 import tempfile
+import regex
 
 from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Iterator, Callable, Dict, Any
@@ -79,12 +80,18 @@ class TensorDeserializer:
         else:
             return self._file.tell()
 
-    def read_tensors(self) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
+    def read_tensors(
+            self,
+            pattern: Union[regex.Pattern, str, None] = None,
+    ) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
         `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
         represents the tensor.
         """
+        if isinstance(pattern, str):
+            pattern = regex.compile(pattern)
+
         try:
             while True:
                 header_sz = struct.unpack("<Q", self._file.read(8))[0]
@@ -122,6 +129,10 @@ class TensorDeserializer:
                     self._buffer = bytearray(data_length)
                 with memoryview(self._buffer) as mem:
                     self._file.readinto(mem[:data_length])
+                # Check if the name matches the pattern, drop if it doesn't.
+                if pattern is not None and not pattern.match(name):
+                    continue
+
                 arr = numpy.ndarray.__new__(
                     numpy.memmap,
                     shape_list,
@@ -138,12 +149,17 @@ class TensorDeserializer:
             self,
             device=utils.get_device(),
             dtype: Optional[str] = None,
+            pattern: Union[regex.Pattern, str, None] = None,
     ) -> OrderedDict:
         """
         Load the tensors in this Tensorizer object into a state_dict.
 
-        :param device:
-        :param dtype:
+        :param device: The device to load the tensors onto.
+        :param dtype: The dtype to load the tensors as. Defaults to None, which
+            means the dtype is not changed from the serialized dtype.
+        :param pattern: A regex pattern to match against the tensor names, if
+            None, all tensors are loaded. If the pattern doesn't match, the
+            tensor is skipped.
         :return:
         """
         if self._state_dict is not None:
@@ -154,7 +170,7 @@ class TensorDeserializer:
 
         tensor_ct = 0
         d = OrderedDict()
-        for idx, typ, name, arr in self.read_tensors():
+        for idx, typ, name, arr in self.read_tensors(pattern=pattern):
             gradient = True
             if arr.dtype not in ["float", "complex"]:
                 gradient = False
@@ -173,12 +189,12 @@ class TensorDeserializer:
             m: torch.nn.Module,
             device=utils.get_device(),
             dtype: Optional[str] = None,
+            pattern: Union[regex.Pattern, str, None] = None,
     ) -> int:
         """
         Given `m`, a torch.nn.Module, load the associate tensors in this
         Tensorizer object into the `torch.nn.Module`. Returns the number of tensors
-        loaded into the model.
-
+        loaded into the module.
         """
         if self._file.closed:
             raise IOError("IO closed, instantiate if you want to load again.")
@@ -188,7 +204,7 @@ class TensorDeserializer:
             modules[name] = module
 
         tensor_ct = 0
-        for idx, typ, name, arr in self.read_tensors():
+        for idx, typ, name, arr in self.read_tensors(pattern=pattern):
             gradient = True
             if arr.dtype not in ["float", "complex"]:
                 gradient = False
