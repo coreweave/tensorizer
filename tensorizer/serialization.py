@@ -172,7 +172,7 @@ class TensorDeserializer:
             self,
             m: torch.nn.Module,
             device=utils.get_device(),
-            dtype: [None, str] = None,
+            dtype: Optional[str] = None,
     ) -> int:
         """
         Given `m`, a torch.nn.Module, load the associate tensors in this
