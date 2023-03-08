@@ -390,7 +390,7 @@ class TensorSerializer:
         else:
             comp_report = ""
         logger.info(
-            f"{idx}:{typ}:{name} - {str(dtype_bytes)} - "
+            f"{idx}:{typ}:{name} - {dtype_bytes.decode('utf-8')} - "
             f"{tensor.shape} -> {ds_bytes}{comp_report}"
         )
 
