@@ -549,7 +549,8 @@ class TensorSerializer:
             for name, buf in module.named_buffers(recurse=False):
                 label = module_name + "." + name
                 self.write_tensor(self._idx, label, TensorType.BUFFER, buf)
-                setattr(module, name, None)
+                if remove_tensors:
+                    setattr(module, name, None)
             self._idx += 1
 
     def write_state_dict(self, state_dict: Dict):
