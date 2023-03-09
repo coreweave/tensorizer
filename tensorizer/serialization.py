@@ -39,6 +39,15 @@ class TensorType(Enum):
     BUFFER = 1
     STATEDICT = 2
 
+TENSORIZER_VERSION = 1
+
+class TensorEntry(typing.TypedDict):
+    name: str
+    type: TensorType
+    offset: int
+    length: int
+    dtype: str
+    shape: List[int]
 
 class TensorDeserializer:
     """
@@ -53,13 +62,80 @@ class TensorDeserializer:
             self._file = stream_io.open_stream(file_obj, "rb+")
         else:
             self._file = file_obj
-        self._tensors = 0
-        self.total_tensor_bytes = 0
         self.total_compressed_tensor_bytes = 0
         self.read_bytes = 0
         self._buffer = bytearray(1024 * 1024)
         self._state_dict = None
         self._idx = 0
+        self._metadata: Dict[str, TensorEntry] = {}
+
+        # Read the version
+        version = struct.unpack("<I", self._file.read(4))[0]
+
+        # Check the version
+        if version > TENSORIZER_VERSION:
+            raise ValueError(
+                f"Cannot read version {version} with version {TENSORIZER_VERSION}"
+            )
+
+        # Skip 32-byte hash (unused)
+        self._file.read(32)
+
+        # Read total size of file
+        self.total_tensor_bytes = struct.unpack("<Q", self._file.read(8))[0]
+
+        # Read the number of tensors
+        self._tensors = struct.unpack("<Q", self._file.read(8))[0]
+
+        # Read the metadata index of tensors.
+        self._read_metadata()
+
+    def _read_string(self, io_obj=None):
+        """
+        Read a string from the file.
+        """
+        if io_obj is None:
+            io_obj = self._file
+
+        length = struct.unpack("<H", io_obj.read(2))[0]
+        return io_obj.read(length).decode("utf-8")
+
+    def _read_dtype(self, io_obj=None):
+        """
+        Read a dtype from the file.
+        """
+        if io_obj is None:
+            io_obj = self._file
+
+        length = struct.unpack("<B", io_obj.read(1))[0]
+        return io_obj.read(length).decode("utf-8")
+
+    def _read_metadata(self):
+        """
+        Read the metadata of tensors into self._metadata.
+        """
+        # Read metadata size.
+        self._metadata_size = struct.unpack("<Q", self._file.read(8))[0]
+        metadata_encoded = self._file.read(self._metadata_size)
+        # Turn the metadata into a stream.
+        metadata_stream = io.BytesIO(metadata_encoded)
+
+        for i in range(self._tensors):
+            name = self._read_string(metadata_stream)
+            tensor_type = TensorType(struct.unpack("<B", metadata_stream.read(1))[0])
+            dtype = self._read_dtype(metadata_stream)
+            shape_len = struct.unpack("<B", metadata_stream.read(1))[0]
+            shape = self._read_shapes(metadata_stream.read(shape_len * 4), shape_len)
+            offset = struct.unpack("<Q", metadata_stream.read(8))[0]
+            length = struct.unpack("<Q", metadata_stream.read(8))[0]
+            self._metadata[name + ":" + tensor_type.name] = TensorEntry(
+                name=name,
+                type=tensor_type,
+                offset=offset,
+                length=length,
+                dtype=dtype,
+                shape=shape,
+            )
 
     @staticmethod
     def _read_shapes(obj, num_elems) -> List[int]:
@@ -230,6 +306,7 @@ class TensorDeserializer:
         return tensor_ct
 
 
+
 class TensorSerializer:
     """
     Given a file-like object or path, serialize tensors from a torch.nn.Module
@@ -242,7 +319,7 @@ class TensorSerializer:
                             str, bytes, os.PathLike, int],
             compress_tensors: bool = False) -> None:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
-            self._file = stream_io.open_stream(file_obj, "ab+")
+            self._file = stream_io.open_stream(file_obj, "wb+")
         else:
             self._file = file_obj
         self._tensors = 0
@@ -258,6 +335,34 @@ class TensorSerializer:
             self.lz4_frame = lz4.frame
         else:
             self.lz4_frame = None
+
+        # Write the version number.
+        self._file.write(struct.pack("<I", TENSORIZER_VERSION))
+
+        # Reserve 32 bytes for the hash. (Unused for now)
+        self._hash_loc = self._file.tell()
+        self._file.write(struct.pack("<Q", 0) * 4)
+
+        # Reserve 8 bytes for the total size of the file.
+        self._size_loc = self._file.tell()
+        self._file.write(struct.pack("<Q", 0))
+
+        # Reserve the next 8 bytes for the total number of tensors.
+        self._tensor_ct_loc = self._file.tell()
+        self._file.write(struct.pack("<Q", 0))
+
+        # Reserve 256kb for metadata.
+        metadata_size = 256 * 1024
+        self._file.write(struct.pack("<Q", metadata_size))
+        self._metadata_loc = self._file.tell()
+        self._file.write(struct.pack("<Q", 0) * (metadata_size // 8))
+        self._metadata_cur = self._metadata_loc
+        self._metadata_end = self._metadata_loc + metadata_size
+
+        self._tensor_index: List[TensorEntry] = []
+
+    def __del__(self):
+        self._file.close()
 
     @staticmethod
     def _dump_shape(obj) -> bytes:
@@ -275,6 +380,13 @@ class TensorSerializer:
         the file.
         """
         self._file.write(struct.pack("<Q", 0))
+        # Write the total number of tensors.
+        self._file.seek(self._tensor_ct_loc)
+        self._file.write(struct.pack("<Q", self._tensors))
+        # Write the total size of the file.
+        self._file.seek(self._size_loc)
+        self._file.write(struct.pack("<Q", self._file.tell()))
+
         final_sz = self._file.tell()
         self._file.close()
         logger.info(f"Tensors completed serializing to {final_sz} bytes")
@@ -341,11 +453,12 @@ class TensorSerializer:
         self._file.write(dtype_bytes)
 
         # ... and shape
-        self._file.write(self._dump_shape(tensor.shape))
+        shape_bytes = self._dump_shape(tensor.shape)
+        self._file.write(shape_bytes)
 
         # Reserve room for our 64-bit tensor length
         tensor_size_loc = self._file.tell()
-        self._file.write(struct.pack("<q", 0))
+        self._file.write(struct.pack("<Q", 0))
 
         tensor_raw_sz = 0
         tensor_compressed_sz = 0
@@ -378,12 +491,28 @@ class TensorSerializer:
         self._file.seek(tensor_size_loc, io.SEEK_SET)
         # We write this signed, so that we can use the signedness as an
         # indicator of possible tensor compression in the future.
-        self._file.write(struct.pack("<q", tensor_endpos - tensor_startpos))
+        self._file.write(struct.pack("<Q", tensor_endpos - tensor_startpos))
 
         # Write our data structure header size.
         self._file.seek(ds_header_begin)
         ds_header_size = tensor_startpos - ds_header_begin
         self._file.write(struct.pack("<Q", ds_header_size))
+
+        # Add our tensor metadata to the index.
+        self._file.seek(self._metadata_cur)
+        self._file.write(struct.pack("<H", len(name_bytes)))
+        self._file.write(name_bytes)
+        self._file.write(struct.pack("<B", tensor_type.value))
+        self._file.write(struct.pack("<B", dtype_len))
+        self._file.write(dtype_bytes)
+        self._file.write(shape_bytes)
+        self._file.write(struct.pack("<Q", tensor_startpos))
+        self._file.write(struct.pack("<Q", tensor_endpos - tensor_startpos))
+        self._metadata_cur = self._file.tell()
+
+        # Check for overflow
+        if self._file.tell() > self._metadata_end:
+            raise RuntimeError("Metadata overflow")
 
         # Move to the end of our serialized tensor to prepare for the next one.
         self._file.seek(tensor_endpos)
