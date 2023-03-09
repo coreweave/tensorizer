@@ -43,6 +43,7 @@ fh_formatter = logging.Formatter(
 fh.setFormatter(fh_formatter)
 logger.addHandler(fh)
 
+
 def serialize_model(
     model: torch.nn.Module,
     config: Optional[Union[ConfigMixin, AutoConfig, dict]],
@@ -82,7 +83,6 @@ def serialize_model(
     ts = TensorSerializer(open(f"{dir_prefix}.tensors", "wb"))
     ts.write_module(model)
     ts.close()
-
 
 
 def load_model(
@@ -125,7 +125,8 @@ def load_model(
         try:
             with tempfile.TemporaryDirectory() as dir:
                 open(os.path.join(dir, "config.json"), "w").write(
-                    stream_io.open_stream(config_uri).read().decode("utf-8"))
+                    stream_io.open_stream(config_uri).read().decode("utf-8")
+                )
                 config = configclass.from_pretrained(dir)
                 config.gradient_checkpointing = True
         except ValueError:
@@ -158,7 +159,6 @@ def load_model(
     )
 
     return model
-
 
 
 def df_main(args: argparse.Namespace) -> None:
