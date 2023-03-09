@@ -40,6 +40,7 @@ class TensorType(Enum):
     STATEDICT = 2
 
 TENSORIZER_VERSION = 1
+TENSORIZER_MAGIC = b"|TZR|"
 
 class TensorEntry(typing.TypedDict):
     name: str
@@ -68,6 +69,11 @@ class TensorDeserializer:
         self._state_dict = None
         self._idx = 0
         self._metadata: Dict[str, TensorEntry] = {}
+
+        # Read the magic
+        magic = self._file.read(5)
+        if magic != TENSORIZER_MAGIC:
+            raise ValueError("Not a tensorizer file")
 
         # Read the version
         version = struct.unpack("<I", self._file.read(4))[0]
@@ -335,6 +341,9 @@ class TensorSerializer:
             self.lz4_frame = lz4.frame
         else:
             self.lz4_frame = None
+
+        # Write our magic bytes.
+        self._file.write(TENSORIZER_MAGIC)
 
         # Write the version number.
         self._file.write(struct.pack("<I", TENSORIZER_VERSION))
