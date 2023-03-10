@@ -204,6 +204,12 @@ class TensorDeserializer:
     def keys(self):
         return self._metadata.keys()
 
+    def values(self):
+        return [self[key] for key in self.keys()]
+
+    def items(self):
+        return [(key, self[key]) for key in self.keys()]
+
     def read_tensors(
             self,
             pattern: Union[regex.Pattern, str, None] = None,

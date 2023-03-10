@@ -6,6 +6,7 @@ import os
 from io import SEEK_SET, SEEK_END
 from typing import Union, Optional, Dict, Any
 import requests
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -78,24 +79,8 @@ except IOError as e:
         f"Could not read /proc/sys/fs/pipe-max-size: {e.strerror}"
     )
 
-
-def find_curl() -> str:
-    """
-    Find the path to the `curl` binary on the system using PATH.
-    """
-    try:
-        path_env = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + os.environ["PATH"]
-        for path in path_env.split(":"):
-            curl_path = os.path.join(path, "curl")
-            if os.path.isfile(curl_path):
-                return curl_path
-    except KeyError:
-        pass
-    raise (IOError("Could not find curl binary -- will fall back to requests"))
-
-
 try:
-    curl_path = find_curl()
+    curl_path = shutil.which("curl")
 except IOError as e:
     logger.warning(e.strerror)
     curl_path = None
@@ -165,7 +150,7 @@ class CURLStreamFile(object):
     ) -> Union[bytes, int]:
         if ba is None:
             rq_sz = goal_position - self._curr
-            if self._curr + rq_sz > self._end:
+            if self._end is not None and self._curr + rq_sz > self._end:
                 rq_sz = self._end - self._curr
                 if rq_sz <= 0:
                     return bytes()
@@ -173,7 +158,7 @@ class CURLStreamFile(object):
             ret_buff_sz = len(ret_buff)
         else:
             rq_sz = len(ba)
-            if self._curr + rq_sz > self._end:
+            if self._end is not None and self._curr + rq_sz > self._end:
                 rq_sz = self._end - self._curr
                 if rq_sz <= 0:
                     return 0
@@ -234,9 +219,8 @@ class CURLStreamFile(object):
         raise Exception("Unimplemented")
 
     """
-    This seek() implementation should be avoided, as it's not very efficient due to
-    the need to restart the curl process. It's here for specific use cases, but
-    should be avoided in general.
+    This seek() implementation should be avoided if you're seeking backwards,
+    as it's not very efficient due to the need to restart the curl process.
     """
 
     def seek(self, position, whence=SEEK_SET):
@@ -244,9 +228,12 @@ class CURLStreamFile(object):
             return
         if whence == SEEK_END:
             raise (Exception("Unsupported `whence`"))
+        elif position > self._curr:
+            # We're seeking forward, so we just read until we get there.
+            self._read_until(position)
         else:
-            # To seek, we need to close out our existing process and start a new
-            # one.
+            # To seek backwards, we need to close out our existing process and
+            # start a new one.
             self.close()
 
             # And we reinitialize ourself.
