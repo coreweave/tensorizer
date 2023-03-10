@@ -39,8 +39,10 @@ class TensorType(Enum):
     BUFFER = 1
     STATEDICT = 2
 
+
 TENSORIZER_VERSION = 1
 TENSORIZER_MAGIC = b"|TZR|"
+
 
 class TensorEntry(typing.TypedDict):
     name: str
@@ -51,6 +53,7 @@ class TensorEntry(typing.TypedDict):
     length: int
     dtype: str
     shape: List[int]
+
 
 class TensorDeserializer:
     """
@@ -284,11 +287,10 @@ class TensorDeserializer:
         """
         Convert a numpy array to a torch tensor on a device.
         """
-        gradient = True
-        if arr.dtype not in ["float", "complex"]:
-            gradient = False
-            if dtype is not None and arr.dtype != dtype:
-                arr = arr.astype(dtype)
+        gradient = arr.dtype.kind in ("f", "c")
+        if dtype is not None and arr.dtype != "bool" and arr.dtype != dtype:
+            arr = arr.astype(dtype)
+
         return torch.nn.Parameter(
             torch.as_tensor(arr, device=device), requires_grad=gradient
         )
@@ -357,7 +359,6 @@ class TensorDeserializer:
         self.total_tensor_bytes = self._file.tell()
         self._file.close()
         return tensor_ct
-
 
 
 class TensorSerializer:

@@ -1,8 +1,12 @@
 import fcntl
 import logging
-import subprocess
-import typing
 import os
+import subprocess
+import tempfile
+import typing
+from urllib.parse import urlparse
+
+import boto3
 from io import SEEK_SET, SEEK_END
 from typing import Union, Optional, Dict, Any
 import requests
@@ -84,6 +88,34 @@ try:
 except IOError as e:
     logger.warning(e.strerror)
     curl_path = None
+
+s3_endpoint = "object.ord1.coreweave.com"
+s3_access_key = None
+s3_secret_key = None
+
+def get_s3cfg_values():
+    """
+    Get the AWS credentials from the .s3cfg file.
+    """
+    import configparser
+    config = configparser.ConfigParser()
+    s3path = os.path.expanduser("~/.s3cfg")
+    if not os.path.exists(s3path):
+        return
+    config.read(s3path)
+    if "default" not in config:
+        raise ValueError("No default section in ~/.s3cfg")
+    if "access_key" not in config["default"]:
+        raise ValueError("No access_key in ~/.s3cfg")
+    else:
+        s3_access_key = config["default"]["access_key"]
+    if "secret_key" not in config["default"]:
+        raise ValueError("No secret_key in ~/.s3cfg")
+    else:
+        s3_secret_key = config["default"]["secret_key"]
+    if "host_base" in config["default"]:
+        s3_endpoint = config["default"]["host_base"]
+
 
 
 class CURLStreamFile(object):
@@ -317,10 +349,64 @@ class RequestsStreamFile(object):
         else:
             raise (Exception("Seeking is unsupported"))
 
+def s3_upload(path: str,
+              target_uri: str,
+              aws_access_key_id: str,
+              aws_secret_access_key: str,
+              s3_endpoint: str = "object.ord1.coreweave.com"):
+    if aws_secret_access_key is None:
+        raise Exception("No secret key provided")
+    if aws_access_key_id is None:
+        raise Exception("No access key provided")
+    if s3_endpoint is None:
+        raise Exception("No S3 endpoint provided")
+    client = boto3.session.Session.client(
+        boto3.session.Session(),
+        endpoint_url="https://" + s3_endpoint,
+        service_name="s3",
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key)
+    path_uri = urlparse(target_uri)
+    bucket = path_uri.netloc
+    key = path_uri.path.lstrip('/')
+
+    client.upload_file(path, bucket, key)
+
+def s3_download(path_uri: str,
+                aws_access_key_id: str,
+                aws_secret_access_key: str,
+                s3_endpoint: str = "object.ord1.coreweave.com") -> CURLStreamFile:
+    if aws_secret_access_key is None:
+        raise Exception("No secret key provided")
+    if aws_access_key_id is None:
+        raise Exception("No access key provided")
+    if s3_endpoint is None:
+        raise Exception("No S3 endpoint provided")
+
+    client = boto3.session.Session.client(
+        boto3.session.Session(),
+        endpoint_url="https://" + s3_endpoint,
+        service_name="s3",
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key)
+    path_uri = urlparse(path_uri)
+    bucket = path_uri.netloc
+    key = path_uri.path.lstrip('/')
+
+    url = client.generate_presigned_url(
+        ClientMethod='get_object',
+        Params={'Bucket': bucket,
+                'Key': key},
+        ExpiresIn=300)
+    print(url)
+    return CURLStreamFile(url)
 
 def open_stream(
         path_uri: str,
-        mode: str = "rb"
+        mode: str = "rb",
+        aws_access_key_id: Optional[str] = s3_access_key,
+        aws_secret_access_key: Optional[str] = s3_secret_key,
+        s3_endpoint: Optional[str] = s3_endpoint,
 ) -> Union[RequestsStreamFile, CURLStreamFile, typing.BinaryIO]:
     if path_uri.startswith("https://") or path_uri.startswith("http://"):
         if fcntl is not None and curl_path is not None:
@@ -331,6 +417,24 @@ def open_stream(
             # Fallback to slow requests-based loader.
             logger.debug(f"Using requests for tensor streaming {path_uri}")
             return RequestsStreamFile(path_uri)
+    elif path_uri.startswith("s3://"):
+        if 'w' in mode or 'a' in mode:
+            tmp_path = tempfile.mktemp()
+            handle = open(tmp_path, mode)
+            old_close = handle.close
+            handle.close = lambda: old_close() or s3_upload(tmp_path,
+                                                            path_uri,
+                                                            aws_access_key_id,
+                                                            aws_secret_access_key,
+                                                            s3_endpoint)
+            return handle
+        else:
+            tmp_path = tempfile.mktemp()
+            return s3_download(path_uri,
+                               aws_access_key_id,
+                               aws_secret_access_key,
+                               s3_endpoint)
+
     else:
         handle: typing.BinaryIO = open(path_uri, mode)
         handle.seek(0)
