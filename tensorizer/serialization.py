@@ -2,6 +2,7 @@
 # serialization.py                                                   Wes Brown
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
+import mmap
 
 # try to import UNIX only dependencies
 try:
@@ -106,6 +107,11 @@ class TensorDeserializer:
         self._read_metadata()
 
         self._device = device
+        self._mmap_file = tempfile.TemporaryFile("wb+")
+        self._mmap_file.write(b"\0" * self.total_tensor_bytes)
+        self._mmap_file.seek(0)
+        self._mmap = mmap.mmap(self._mmap_file.fileno(), self.total_tensor_bytes)
+
         if preload:
             self._cache = self._generate_state_dict(device=device,
                                                     pattern=pattern,
@@ -117,6 +123,7 @@ class TensorDeserializer:
                     filtered_keys.append(key)
             self._cache = OrderedDict(zip(filtered_keys,
                                           [None] * len(filtered_keys)))
+
 
     def _read_string(self, io_obj=None):
         """
@@ -260,19 +267,20 @@ class TensorDeserializer:
                     shape_len,
                 )
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
-                if data_length > len(self._buffer):
-                    self._buffer = bytearray(data_length)
-                with memoryview(self._buffer) as mem:
-                    self._file.readinto(mem[:data_length])
+                mmap_offset = self._mmap_file.tell()
+                buf = memoryview(self._mmap)[mmap_offset:data_length+mmap_offset]
+                self._file.readinto(buf)
                 # Check if the name matches the pattern, drop if it doesn't.
                 if pattern is not None and not pattern.match(name):
                     continue
+
+                print(name, shape_list, dtype, len(buf))
 
                 arr = numpy.ndarray.__new__(
                     numpy.memmap,
                     shape_list,
                     dtype=dtype,
-                    buffer=self._buffer,
+                    buffer=buf,
                     offset=0,
                 )
                 tensors_read += 1
@@ -442,7 +450,7 @@ class TensorSerializer:
         self._file.write(struct.pack("<Q", self._tensors))
         # Write the total size of the file.
         self._file.seek(self._size_loc)
-        self._file.write(struct.pack("<Q", self._file.tell()))
+        self._file.write(struct.pack("<Q", self.total_tensor_bytes))
 
         final_sz = self._file.tell()
         self._file.close()
@@ -548,7 +556,9 @@ class TensorSerializer:
         self._file.seek(tensor_size_loc, io.SEEK_SET)
         # We write this signed, so that we can use the signedness as an
         # indicator of possible tensor compression in the future.
-        self._file.write(struct.pack("<Q", tensor_endpos - tensor_startpos))
+        tensor_size = tensor_endpos - tensor_startpos
+        self._file.write(struct.pack("<Q", tensor_size))
+        self.total_tensor_bytes += tensor_size
 
         # Write our data structure header size.
         self._file.seek(ds_header_begin)
@@ -618,4 +628,3 @@ class TensorSerializer:
         idx = 0
         for name, param in state_dict.items():
             self.write_tensor(idx, name, TensorType.STATEDICT, param)
-        self.total_tensor_bytes = self._file.tell()
