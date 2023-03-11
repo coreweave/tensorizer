@@ -85,11 +85,7 @@ except IOError as e:
         f"Could not read /proc/sys/fs/pipe-max-size: {e.strerror}"
     )
 
-try:
-    curl_path = shutil.which("curl")
-except IOError as e:
-    logger.warning(e.strerror)
-    curl_path = None
+curl_path = shutil.which("curl")
 
 default_s3_endpoint = "object.ord1.coreweave.com"
 if sys.platform != "win32":
@@ -139,7 +135,7 @@ def _get_s3cfg_values(config_paths=_s3_config_paths) -> _ParsedCredentials:
     )
 
 
-class CURLStreamFile(object):
+class CURLStreamFile:
     """
     CURLStreamFile implements a file-like object around an HTTP download, the
     intention being to not buffer more than we have to. It is intended for
@@ -227,9 +223,9 @@ class CURLStreamFile(object):
             err = self._curl.stderr.read()
             self._curl.terminate()
             if self._curl.returncode != 0:
-                raise (IOError(f"curl error: {self._curl.returncode}, {err}"))
+                raise IOError(f"curl error: {self._curl.returncode}, {err}")
             else:
-                raise (IOError(f"Requested {rq_sz} != {ret_buff_sz}"))
+                raise IOError(f"Requested {rq_sz} != {ret_buff_sz}")
         self._curr += ret_buff_sz
         if ba is None:
             return ret_buff
@@ -245,7 +241,7 @@ class CURLStreamFile(object):
 
     def read(self, size=None) -> bytes:
         if self.closed:
-            raise (IOError("CURLStreamFile closed."))
+            raise IOError("CURLStreamFile closed.")
         if size is None:
             return self._curl.stdout.read()
         goal_position = self._curr + size
@@ -269,7 +265,7 @@ class CURLStreamFile(object):
             self._curl = None
 
     def readline(self):
-        raise Exception("Unimplemented")
+        raise NotImplementedError("Unimplemented")
 
     """
     This seek() implementation should be avoided if you're seeking backwards,
@@ -280,7 +276,7 @@ class CURLStreamFile(object):
         if position == self._curr:
             return
         if whence == SEEK_END:
-            raise (Exception("Unsupported `whence`"))
+            raise ValueError("Unsupported `whence`")
         elif position > self._curr:
             # We're seeking forward, so we just read until we get there.
             self._read_until(position)
@@ -293,7 +289,7 @@ class CURLStreamFile(object):
             self.__init__(self._uri, position, None)
 
 
-class RequestsStreamFile(object):
+class RequestsStreamFile:
     """
     RequestsStreamFile implements a file-like object around an HTTP download, the
     intention being to not buffer more than we have to. Not as fast or efficient
@@ -319,7 +315,7 @@ class RequestsStreamFile(object):
             ret_buff = ba
         if ret_buff_sz != rq_sz:
             self.closed = True
-            raise (IOError(f"Requested {rq_sz} != {ret_buff_sz}"))
+            raise IOError(f"Requested {rq_sz} != {ret_buff_sz}")
         self._curr += ret_buff_sz
         if ba is None:
             return ret_buff
@@ -335,7 +331,7 @@ class RequestsStreamFile(object):
 
     def read(self, size=None) -> bytes:
         if self.closed:
-            raise (IOError("RequestsStreamFile closed."))
+            raise IOError("RequestsStreamFile closed.")
         if size is None:
             return self._r.raw.read()
         goal_position = self._curr + size
@@ -355,7 +351,7 @@ class RequestsStreamFile(object):
         del self._r
 
     def readline(self):
-        raise Exception("Unimplemented")
+        raise NotImplementedError("Unimplemented")
 
     """
     This seek() implementation is effectively a no-op, and will throw an
@@ -366,9 +362,9 @@ class RequestsStreamFile(object):
         if position == self._curr:
             return
         if whence == SEEK_END:
-            raise (Exception("Unsupported `whence`"))
+            raise ValueError("Unsupported `whence`")
         else:
-            raise (Exception("Seeking is unsupported"))
+            raise ValueError("Seeking is unsupported")
 
 
 def s3_upload(path: str,
@@ -377,11 +373,11 @@ def s3_upload(path: str,
               s3_secret_access_key: str,
               s3_endpoint: str = default_s3_endpoint):
     if s3_secret_access_key is None:
-        raise Exception("No secret key provided")
+        raise TypeError("No secret key provided")
     if s3_access_key_id is None:
-        raise Exception("No access key provided")
+        raise TypeError("No access key provided")
     if s3_endpoint is None:
-        raise Exception("No S3 endpoint provided")
+        raise TypeError("No S3 endpoint provided")
     client = boto3.session.Session.client(
         boto3.session.Session(),
         endpoint_url="https://" + s3_endpoint,
@@ -400,11 +396,11 @@ def s3_download(path_uri: str,
                 s3_secret_access_key: str,
                 s3_endpoint: str = default_s3_endpoint) -> CURLStreamFile:
     if s3_secret_access_key is None:
-        raise Exception("No secret key provided")
+        raise TypeError("No secret key provided")
     if s3_access_key_id is None:
-        raise Exception("No access key provided")
+        raise TypeError("No access key provided")
     if s3_endpoint is None:
-        raise Exception("No S3 endpoint provided")
+        raise TypeError("No S3 endpoint provided")
 
     client = boto3.session.Session.client(
         boto3.session.Session(),
