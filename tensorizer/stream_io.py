@@ -454,7 +454,15 @@ def open_stream(
     if isinstance(path_uri, os.PathLike):
         path_uri = os.fspath(path_uri)
 
-    if path_uri.startswith("https://") or path_uri.startswith("http://"):
+    scheme, *location = path_uri.split("://", maxsplit=1)
+    scheme = scheme.lower() if location else None
+
+    normalized_mode = "".join(sorted(mode))
+
+    if scheme in ("http", "https"):
+        if normalized_mode != "br":
+            raise ValueError(
+                'Only the mode "rb" is valid when opening http(s):// streams.')
         if fcntl is not None and curl_path is not None:
             # We have fcntl and curl exists, so we can use the fast CURL-based loader.
             logger.debug(f"Using CURL for tensor streaming of {path_uri}")
@@ -464,7 +472,12 @@ def open_stream(
             logger.debug(f"Using requests for tensor streaming {path_uri}")
             return RequestsStreamFile(path_uri)
 
-    elif path_uri.startswith("s3://"):
+    elif scheme == "s3":
+        if normalized_mode not in ("br", "bw", "ab"):
+            raise ValueError(
+                'Only the modes "rb", "wb", and "ab" are valid'
+                ' when opening s3:// streams.'
+            )
         if not s3_access_key_id or not s3_secret_access_key:
             # Try to find default credentials if not specified
             try:
