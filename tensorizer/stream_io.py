@@ -370,6 +370,7 @@ class RequestsStreamFile(object):
         else:
             raise (Exception("Seeking is unsupported"))
 
+
 def s3_upload(path: str,
               target_uri: str,
               s3_access_key_id: str,
@@ -392,6 +393,7 @@ def s3_upload(path: str,
     key = path_uri.path.lstrip('/')
 
     client.upload_file(path, bucket, key)
+
 
 def s3_download(path_uri: str,
                 s3_access_key_id: str,
@@ -515,17 +517,42 @@ def open_stream(
         s3_endpoint = s3_endpoint or default_s3_endpoint
 
         if 'w' in mode or 'a' in mode:
-            tmp_path = tempfile.mktemp()
-            handle = open(tmp_path, mode)
-            old_close = handle.close
-            handle.close = lambda: old_close() or s3_upload(tmp_path,
-                                                            path_uri,
-                                                            s3_access_key_id,
-                                                            s3_secret_access_key,
-                                                            s3_endpoint)
-            return handle
+            class AutoUploadedTempFile(tempfile.NamedTemporaryFile):
+                def close(self):
+                    # Close, upload by name, and then delete the file.
+                    #
+                    # boto3's upload_fileobj could be used before closing the file,
+                    # instead of closing it and then uploading it by name,
+                    # but upload_fileobj is less performant than upload_file
+                    # as of boto3's s3 library s3transfer, version 0.6.0.
+                    # For details, see the implementation & comments:
+                    # https://github.com/boto/s3transfer/blob/0.6.0/s3transfer/upload.py#L351
+                    # TL;DR: s3transfer does multithreaded transfers
+                    # that require multiple file handles to work properly,
+                    # but Python cannot duplicate file handles such that
+                    # they can be accessed in a thread-safe way,
+                    # so they have to buffer it all in memory.
+                    if self.closed:
+                        # Makes close() idempotent.
+                        # If the resulting object is used as a context manager,
+                        # close() is called twice (once in the serializer code,
+                        # once after, when leaving the context).
+                        # Without this check, this would trigger two separate uploads.
+                        return
+                    try:
+                        super().close()
+                        s3_upload(self.name,
+                                  path_uri,
+                                  s3_access_key_id,
+                                  s3_secret_access_key,
+                                  s3_endpoint)
+                    finally:
+                        os.unlink(self.file)
+            # delete must be False or the file will be deleted by the OS
+            # as soon as it closes, before it can be uploaded
+            # on platforms with primitive temporary file support (e.g. Windows)
+            return AutoUploadedTempFile(mode="wb+", delete=False)
         else:
-            tmp_path = tempfile.mktemp()
             return s3_download(path_uri,
                                s3_access_key_id,
                                s3_secret_access_key,
