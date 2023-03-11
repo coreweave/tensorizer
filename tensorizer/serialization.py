@@ -39,26 +39,35 @@ class TensorType(Enum):
     BUFFER = 1
     STATEDICT = 2
 
+
 TENSORIZER_VERSION = 1
 TENSORIZER_MAGIC = b"|TZR|"
+
 
 class TensorEntry(typing.TypedDict):
     name: str
     type: TensorType
     offset: int
+    data_offset: int
+    data_length: int
     length: int
     dtype: str
     shape: List[int]
 
+
 class TensorDeserializer:
     """
-    Given a file-like object for readng, deserialize tensors to a state_dict or a
+    Given a file-like object for read, deserialize tensors to a state_dict or a
     torch.nn.Module.
     """
 
     def __init__(
             self,
-            file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO, str]):
+            file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO, str],
+            device: Union[torch.device, str, None] = None,
+            pattern: Union[regex.Pattern, str, None] = None,
+            dtype: Union[torch.dtype, str, None] = None,
+            preload: bool = False):
         if isinstance(file_obj, str):
             self._file = stream_io.open_stream(file_obj, "rb+")
         else:
@@ -95,6 +104,19 @@ class TensorDeserializer:
 
         # Read the metadata index of tensors.
         self._read_metadata()
+
+        self._device = device
+        if preload:
+            self._cache = self._generate_state_dict(device=device,
+                                                    pattern=pattern,
+                                                    dtype=dtype)
+        else:
+            filtered_keys = []
+            for key in self._metadata.keys():
+                if pattern is None or pattern.match(key):
+                    filtered_keys.append(key)
+            self._cache = OrderedDict(zip(filtered_keys,
+                                          [None] * len(filtered_keys)))
 
     def _read_string(self, io_obj=None):
         """
@@ -133,12 +155,14 @@ class TensorDeserializer:
             shape_len = struct.unpack("<B", metadata_stream.read(1))[0]
             shape = self._read_shapes(metadata_stream.read(shape_len * 4), shape_len)
             offset = struct.unpack("<Q", metadata_stream.read(8))[0]
-            length = struct.unpack("<Q", metadata_stream.read(8))[0]
-            self._metadata[name + ":" + tensor_type.name] = TensorEntry(
+            data_offset = struct.unpack("<Q", metadata_stream.read(8))[0]
+            data_length = struct.unpack("<Q", metadata_stream.read(8))[0]
+            self._metadata[name] = TensorEntry(
                 name=name,
                 type=tensor_type,
                 offset=offset,
-                length=length,
+                data_offset=data_offset,
+                data_length=data_length,
                 dtype=dtype,
                 shape=shape,
             )
@@ -162,9 +186,37 @@ class TensorDeserializer:
         else:
             return self._file.tell()
 
+    def __getitem__(self, name):
+        if name in self._cache and self._cache[name] is not None:
+            return self._cache[name]
+
+        if name in self._metadata:
+            self._file.seek(self._metadata[name]['offset'])
+            tensor_arr = next(self.read_tensors(num_tensors=1))[3]
+            self._cache[name] = self._to_torch_parameter(tensor_arr)
+            return self._cache[name]
+        else:
+            raise KeyError(f"Tensor {name} not found")
+
+    def get(self, name, default=None):
+        try:
+            return self[name]
+        except KeyError:
+            return default
+
+    def keys(self):
+        return self._metadata.keys()
+
+    def values(self):
+        return [self[key] for key in self.keys()]
+
+    def items(self):
+        return [(key, self[key]) for key in self.keys()]
+
     def read_tensors(
             self,
             pattern: Union[regex.Pattern, str, None] = None,
+            num_tensors: int = -1,
     ) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
@@ -175,7 +227,8 @@ class TensorDeserializer:
             pattern = regex.compile(pattern)
 
         try:
-            while True:
+            tensors_read = 0
+            while num_tensors == -1 or tensors_read < num_tensors:
                 header_sz = struct.unpack("<Q", self._file.read(8))[0]
                 if header_sz == 0:
                     break
@@ -222,12 +275,27 @@ class TensorDeserializer:
                     buffer=self._buffer,
                     offset=0,
                 )
-                # Get rid of the error on load.
+                tensors_read += 1
                 yield module_idx, tensor_type, name, arr
         except EOFError:
             return
 
-    def state_dict(
+    @staticmethod
+    def _to_torch_parameter(arr: numpy.ndarray,
+                            dtype: Optional[str] = None,
+                            device=utils.get_device()) -> torch.nn.Parameter:
+        """
+        Convert a numpy array to a torch tensor on a device.
+        """
+        gradient = arr.dtype.kind in ("f", "c")
+        if dtype is not None and arr.dtype != "bool" and arr.dtype != dtype:
+            arr = arr.astype(dtype)
+
+        return torch.nn.Parameter(
+            torch.as_tensor(arr, device=device), requires_grad=gradient
+        )
+
+    def _generate_state_dict(
             self,
             device=utils.get_device(),
             dtype: Optional[str] = None,
@@ -244,24 +312,12 @@ class TensorDeserializer:
             tensor is skipped.
         :return:
         """
-        if self._state_dict is not None:
-            return self._state_dict
-
         if self._file.closed:
             raise IOError("IO closed, instantiate if you want to load again.")
 
-        tensor_ct = 0
         d = OrderedDict()
         for idx, typ, name, arr in self.read_tensors(pattern=pattern):
-            gradient = True
-            if arr.dtype not in ["float", "complex"]:
-                gradient = False
-                if dtype is not None and arr.dtype != dtype:
-                    arr = arr.astype(dtype)
-            d[name] = torch.nn.Parameter(
-                torch.as_tensor(arr, device=device), requires_grad=gradient
-            )
-            tensor_ct += 1
+            d[name] = self._to_torch_parameter(arr, dtype, device)
         self.total_tensor_bytes = self._file.tell()
         self._file.close()
         return d
@@ -287,16 +343,9 @@ class TensorDeserializer:
 
         tensor_ct = 0
         for idx, typ, name, arr in self.read_tensors(pattern=pattern):
-            gradient = True
-            if arr.dtype not in ["float", "complex"]:
-                gradient = False
-                if dtype is not None and arr.dtype != dtype:
-                    arr = arr.astype(dtype)
+            param = self._to_torch_parameter(arr, dtype, device)
             obj_path, attr = name.rsplit(".", 1)
             module: torch.nn.Module = modules[obj_path]
-            param = torch.nn.Parameter(
-                torch.as_tensor(arr, device=device), requires_grad=gradient
-            )
             if typ is TensorType.PARAM:
                 module.register_parameter(attr, param)
             elif typ is TensorType.BUFFER:
@@ -310,7 +359,6 @@ class TensorDeserializer:
         self.total_tensor_bytes = self._file.tell()
         self._file.close()
         return tensor_ct
-
 
 
 class TensorSerializer:
@@ -515,6 +563,7 @@ class TensorSerializer:
         self._file.write(struct.pack("<B", dtype_len))
         self._file.write(dtype_bytes)
         self._file.write(shape_bytes)
+        self._file.write(struct.pack("<Q", ds_header_begin))
         self._file.write(struct.pack("<Q", tensor_startpos))
         self._file.write(struct.pack("<Q", tensor_endpos - tensor_startpos))
         self._metadata_cur = self._file.tell()

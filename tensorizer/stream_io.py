@@ -1,11 +1,16 @@
 import fcntl
 import logging
-import subprocess
-import typing
 import os
+import subprocess
+import tempfile
+import typing
+from urllib.parse import urlparse
+
+import boto3
 from io import SEEK_SET, SEEK_END
-from typing import Union
+from typing import Union, Optional, Dict, Any
 import requests
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -67,78 +72,135 @@ logger = logging.getLogger(__name__)
 #       non-Linux systems in a production sense.
 F_SETPIPE_SZ = 1031
 
-
-def find_curl() -> str:
-    """
-    Find the path to the `curl` binary on the system using PATH.
-    """
-    try:
-        path_env = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + os.environ["PATH"]
-        for path in path_env.split(":"):
-            curl_path = os.path.join(path, "curl")
-            if os.path.isfile(curl_path):
-                return curl_path
-    except KeyError:
-        pass
-    raise (IOError("Could not find curl binary -- will fall back to requests"))
-
+# Read our max-fd-size, fall back to 1mb if invalid.
+PIPE_BUF_SZ = 1024 * 1024
+try:
+    pipe_file = open("/proc/sys/fs/pipe-max-size", "r")
+    pipe_buf_sz = int(pipe_file.read())
+    logger.debug(f"pipe-max-size: {pipe_buf_sz}")
+except IOError as e:
+    logger.warning(
+        f"Could not read /proc/sys/fs/pipe-max-size: {e.strerror}"
+    )
 
 try:
-    curl_path = find_curl()
+    curl_path = shutil.which("curl")
 except IOError as e:
     logger.warning(e.strerror)
     curl_path = None
+
+s3_endpoint = "object.ord1.coreweave.com"
+s3_access_key = None
+s3_secret_key = None
+
+def get_s3cfg_values():
+    """
+    Get the AWS credentials from the .s3cfg file.
+    """
+    import configparser
+    config = configparser.ConfigParser()
+    s3path = os.path.expanduser("~/.s3cfg")
+    if not os.path.exists(s3path):
+        return
+    config.read(s3path)
+    if "default" not in config:
+        raise ValueError("No default section in ~/.s3cfg")
+    if "access_key" not in config["default"]:
+        raise ValueError("No access_key in ~/.s3cfg")
+    else:
+        s3_access_key = config["default"]["access_key"]
+    if "secret_key" not in config["default"]:
+        raise ValueError("No secret_key in ~/.s3cfg")
+    else:
+        s3_secret_key = config["default"]["secret_key"]
+    if "host_base" in config["default"]:
+        s3_endpoint = config["default"]["host_base"]
+
 
 
 class CURLStreamFile(object):
     """
     CURLStreamFile implements a file-like object around an HTTP download, the
-    intention being to not buffer more than we have to.
+    intention being to not buffer more than we have to. It is intended for
+    tar-like files, where we start at the begining and read until the end of
+    the file.
+
+    It does implement `seek` and `tell`, but only for the purpose of
+    implementing `read`, and only for the purpose of reading the entire file.
+    It does support seeking to an arbitrary position, but is very inefficient
+    in doing so as it requires re-opening the connection to the server.
     """
 
-    def __init__(self, uri: str) -> None:
+    def __init__(self,
+                 uri: str,
+                 begin: Optional[int] = None,
+                 end: Optional[int] = None,
+                 headers: Dict[str, Any] = None) -> None:
+        self._uri = uri
+
         # NOTE: `256mb` buffer on the python IO object.
+        cmd = [
+            curl_path,
+            "--header",
+            "Accept-Encoding: identity",
+            "-s",
+            uri,
+        ]
+
+        if begin is not None or end is not None:
+            if begin is None:
+                begin_pos = 0
+            if end is None:
+                end = ""
+            cmd.extend(["--range", f"{begin}-{end}"])
+
+        if headers is not None:
+            for k, v in headers.items():
+                cmd.extend(["--header", f"{k}: {v}"])
+
         self._curl = subprocess.Popen(
-            [
-                curl_path,
-                "--header",
-                "Accept-Encoding: identity",
-                "-s",
-                uri,
-            ],
+            cmd,
             stdout=subprocess.PIPE,
             bufsize=256 * 1024 * 1024,
         )
-        # Read our max-fd-size, fall back to 1mb if invalid.
-        pipe_buf_sz = 1024 * 1024
+
         try:
-            pipe_file = open("/proc/sys/fs/pipe-max-size", "r")
-            pipe_buf_sz = int(pipe_file.read())
-            logger.debug(f"pipe-max-size: {pipe_buf_sz}")
-        except IOError as e:
-            logger.warning(
-                f"Could not read /proc/sys/fs/pipe-max-size: {e.strerror}"
-            )
-        try:
-            fcntl.fcntl(self._curl.stdout.fileno(), F_SETPIPE_SZ, pipe_buf_sz)
+            fcntl.fcntl(self._curl.stdout.fileno(), F_SETPIPE_SZ, PIPE_BUF_SZ)
         except PermissionError as e:
             logger.warning(
                 f"Couldn't fcntl F_SETPIPE_SZ to {pipe_buf_sz}: {e.strerror}"
             )
-        self._curr = 0
+        self._curr = 0 if begin is None else begin
+        self._end = end
         self.closed = False
+
+    def __del__(self):
+        self.close()
 
     def _read_until(
             self, goal_position: int, ba: Union[bytearray, None] = None
     ) -> Union[bytes, int]:
         if ba is None:
             rq_sz = goal_position - self._curr
+            if self._end is not None and self._curr + rq_sz > self._end:
+                rq_sz = self._end - self._curr
+                if rq_sz <= 0:
+                    return bytes()
             ret_buff = self._curl.stdout.read(rq_sz)
             ret_buff_sz = len(ret_buff)
         else:
             rq_sz = len(ba)
-            ret_buff_sz = self._curl.stdout.readinto(ba)
-            ret_buff = ba
+            if self._end is not None and self._curr + rq_sz > self._end:
+                rq_sz = self._end - self._curr
+                if rq_sz <= 0:
+                    return 0
+                tmp_ba = bytearray(rq_sz)
+                ret_buff_sz = self._curl.stdout.readinto(tmp_ba)
+                ba[:ret_buff_sz] = tmp_ba[:ret_buff_sz]
+                ret_buff = ba
+            else:
+                ret_buff_sz = self._curl.stdout.readinto(ba)
+                ret_buff = ba
         if ret_buff_sz != rq_sz:
             self.closed = True
             err = self._curl.stderr.read()
@@ -178,14 +240,19 @@ class CURLStreamFile(object):
 
     def close(self):
         self.closed = True
-        self._curl.terminate()
+        if self._curl is not None:
+            if self._curl.poll() is None:
+                self._curl.stdout.close()
+                self._curl.terminate()
+                self._curl.wait()
+            self._curl = None
 
     def readline(self):
         raise Exception("Unimplemented")
 
     """
-    This seek() implementation is effectively a no-op, and will throw an
-    exception for anything other than a seek to the current position.
+    This seek() implementation should be avoided if you're seeking backwards,
+    as it's not very efficient due to the need to restart the curl process.
     """
 
     def seek(self, position, whence=SEEK_SET):
@@ -193,8 +260,16 @@ class CURLStreamFile(object):
             return
         if whence == SEEK_END:
             raise (Exception("Unsupported `whence`"))
+        elif position > self._curr:
+            # We're seeking forward, so we just read until we get there.
+            self._read_until(position)
         else:
-            raise (Exception("Seeking is unsupported"))
+            # To seek backwards, we need to close out our existing process and
+            # start a new one.
+            self.close()
+
+            # And we reinitialize ourself.
+            self.__init__(self._uri, position, None)
 
 
 class RequestsStreamFile(object):
@@ -274,10 +349,64 @@ class RequestsStreamFile(object):
         else:
             raise (Exception("Seeking is unsupported"))
 
+def s3_upload(path: str,
+              target_uri: str,
+              aws_access_key_id: str,
+              aws_secret_access_key: str,
+              s3_endpoint: str = "object.ord1.coreweave.com"):
+    if aws_secret_access_key is None:
+        raise Exception("No secret key provided")
+    if aws_access_key_id is None:
+        raise Exception("No access key provided")
+    if s3_endpoint is None:
+        raise Exception("No S3 endpoint provided")
+    client = boto3.session.Session.client(
+        boto3.session.Session(),
+        endpoint_url="https://" + s3_endpoint,
+        service_name="s3",
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key)
+    path_uri = urlparse(target_uri)
+    bucket = path_uri.netloc
+    key = path_uri.path.lstrip('/')
+
+    client.upload_file(path, bucket, key)
+
+def s3_download(path_uri: str,
+                aws_access_key_id: str,
+                aws_secret_access_key: str,
+                s3_endpoint: str = "object.ord1.coreweave.com") -> CURLStreamFile:
+    if aws_secret_access_key is None:
+        raise Exception("No secret key provided")
+    if aws_access_key_id is None:
+        raise Exception("No access key provided")
+    if s3_endpoint is None:
+        raise Exception("No S3 endpoint provided")
+
+    client = boto3.session.Session.client(
+        boto3.session.Session(),
+        endpoint_url="https://" + s3_endpoint,
+        service_name="s3",
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key)
+    path_uri = urlparse(path_uri)
+    bucket = path_uri.netloc
+    key = path_uri.path.lstrip('/')
+
+    url = client.generate_presigned_url(
+        ClientMethod='get_object',
+        Params={'Bucket': bucket,
+                'Key': key},
+        ExpiresIn=300)
+    print(url)
+    return CURLStreamFile(url)
 
 def open_stream(
         path_uri: str,
-        mode: str = "rb"
+        mode: str = "rb",
+        aws_access_key_id: Optional[str] = s3_access_key,
+        aws_secret_access_key: Optional[str] = s3_secret_key,
+        s3_endpoint: Optional[str] = s3_endpoint,
 ) -> Union[RequestsStreamFile, CURLStreamFile, typing.BinaryIO]:
     if path_uri.startswith("https://") or path_uri.startswith("http://"):
         if fcntl is not None and curl_path is not None:
@@ -288,6 +417,24 @@ def open_stream(
             # Fallback to slow requests-based loader.
             logger.debug(f"Using requests for tensor streaming {path_uri}")
             return RequestsStreamFile(path_uri)
+    elif path_uri.startswith("s3://"):
+        if 'w' in mode or 'a' in mode:
+            tmp_path = tempfile.mktemp()
+            handle = open(tmp_path, mode)
+            old_close = handle.close
+            handle.close = lambda: old_close() or s3_upload(tmp_path,
+                                                            path_uri,
+                                                            aws_access_key_id,
+                                                            aws_secret_access_key,
+                                                            s3_endpoint)
+            return handle
+        else:
+            tmp_path = tempfile.mktemp()
+            return s3_download(path_uri,
+                               aws_access_key_id,
+                               aws_secret_access_key,
+                               s3_endpoint)
+
     else:
         handle: typing.BinaryIO = open(path_uri, mode)
         handle.seek(0)
