@@ -1,5 +1,9 @@
-import resource
 import torch
+try:
+    import resource
+except ImportError:
+    resource = None
+
 
 # Silly function to convert to human bytes
 def convert_bytes(num):
@@ -13,8 +17,10 @@ def convert_bytes(num):
             return "%3.1f %s" % (num, x)
         num /= step_unit
 
+
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def get_ram_usage_str() -> str:
     if resource is not None:
@@ -41,6 +47,7 @@ def get_gpu_name() -> str:
     if torch.cuda.is_available():
         return torch.cuda.get_device_name(0)
     return "N/A"
+
 
 def no_init_or_tensor(loading_code):
     def dummy(self):

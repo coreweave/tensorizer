@@ -1,4 +1,3 @@
-import fcntl
 import functools
 import logging
 import os
@@ -14,76 +13,9 @@ from typing import Union, Optional, Dict, Any
 import requests
 import shutil
 
+import tensorizer._wide_pipes as _wide_pipes
+
 logger = logging.getLogger(__name__)
-
-# =============================================================================
-# From `pipe(7)` manpage:
-#
-# Pipe capacity
-# A pipe has a limited capacity. If the pipe is full, then a write(2) will
-# block or fail, depending on whether the O_NONBLOCK flag is set (see below).
-# Different implementations have different limits for the pipe capacity.
-#
-# Applications should not rely on a particular capacity: an application should
-# be designed so that a reading process consumes data as soon as it is
-# available, so that a writing process does not remain blocked.
-#
-# In Linux versions before 2.6.11, the capacity of a pipe was the same as the
-# system page size (e.g., 4096 bytes on i386). Since Linux 2.6.11, the pipe
-# capacity is 16 pages (i.e., 65,536 bytes in a system with a page size of
-# 4096 bytes). Since Linux 2.6.35, the default pipe capacity is 16 pages, but
-# the capacity can be queried and set using the fcntl(2) F_GETPIPE_SZ and
-# F_SETPIPE_SZ operations. See fcntl(2) for more information.
-#
-# =============================================================================
-# From `fcntl(2)` manpage:
-#
-# Changing the capacity of a pipe
-#
-# F_SETPIPE_SZ (int; since Linux 2.6.35)
-# Change the capacity of the pipe referred to by fd to be at least arg bytes.
-# An unprivileged process can adjust the pipe capacity to any value between the
-# system page size and the limit defined in /proc/sys/fs/pipe−max−size
-# (see proc(5)). Attempts to set the pipe capacity below the page size are
-# silently rounded up to the page size. Attempts by an unprivileged process to
-# set the pipe capacity above the limit in /proc/sys/fs/pipe−max−size yield the
-# error EPERM; a privileged process (CAP_SYS_RESOURCE) can override the limit.
-#
-# When allocating the buffer for the pipe, the kernel may use a capacity larger
-# than arg, if that is convenient for the implementation. (In the current
-# implementation, the allocation is the next higher power-of-two page-size
-# multiple of the requested size.) The actual capacity (in bytes) that is set
-# is returned as the function result.
-#
-# Attempting to set the pipe capacity smaller than the amount of buffer space
-# currently used to store data produces the error EBUSY.
-#
-# Note that because of the way the pages of the pipe buffer are employed when
-# data is written to the pipe, the number of bytes that can be written may be
-# less than the nominal size, depending on the size of the writes.
-#
-# F_GETPIPE_SZ (void; since Linux 2.6.35)
-# Return (as the function result) the capacity of the pipe referred to by fd.
-#
-# =============================================================================
-# Constant for `F_SETPIPE_SZ`, as python3's `fcntl` module doesn't have this
-# defined -- despite the documentation saying that they're there.
-#
-# TODO: Make this work or fail gracefully on non-Linux systems. Not sure if
-#       this is really relevant, as I don't even know if CUDA is available on
-#       non-Linux systems in a production sense.
-F_SETPIPE_SZ = 1031
-
-# Read our max-fd-size, fall back to 1mb if invalid.
-PIPE_BUF_SZ = 1024 * 1024
-try:
-    pipe_file = open("/proc/sys/fs/pipe-max-size", "r")
-    pipe_buf_sz = int(pipe_file.read())
-    logger.debug(f"pipe-max-size: {pipe_buf_sz}")
-except IOError as e:
-    logger.warning(
-        f"Could not read /proc/sys/fs/pipe-max-size: {e.strerror}"
-    )
 
 curl_path = shutil.which("curl")
 
@@ -165,28 +97,21 @@ class CURLStreamFile:
         ]
 
         if begin is not None or end is not None:
-            if begin is None:
-                begin = 0
-            if end is None:
-                end = ""
-            cmd.extend(["--range", f"{begin}-{end}"])
+            cmd.extend(["--range", f"{begin or 0}-{end or ''}"])
 
         if headers is not None:
             for k, v in headers.items():
                 cmd.extend(["--header", f"{k}: {v}"])
 
-        self._curl = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            bufsize=256 * 1024 * 1024,
-        )
-
-        try:
-            fcntl.fcntl(self._curl.stdout.fileno(), F_SETPIPE_SZ, PIPE_BUF_SZ)
-        except PermissionError as e:
-            logger.warning(
-                f"Couldn't fcntl F_SETPIPE_SZ to {pipe_buf_sz}: {e.strerror}"
+        self._curl = None
+        with _wide_pipes.widen_new_pipes():  # Widen on Windows
+            self._curl = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                bufsize=256 * 1024 * 1024,
             )
+
+        _wide_pipes.widen_pipe(self._curl.stdout.fileno())  # Widen on Linux
         self._curr = 0 if begin is None else begin
         self._end = end
         self.closed = False
@@ -461,8 +386,8 @@ def open_stream(
         if normalized_mode != "br":
             raise ValueError(
                 'Only the mode "rb" is valid when opening http(s):// streams.')
-        if fcntl is not None and curl_path is not None:
-            # We have fcntl and curl exists, so we can use the fast CURL-based loader.
+        if curl_path is not None:
+            # curl exists, so we can use the fast CURL-based loader.
             logger.debug(f"Using CURL for tensor streaming of {path_uri}")
             return CURLStreamFile(path_uri)
         else:
