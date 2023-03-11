@@ -170,7 +170,7 @@ class CURLStreamFile(object):
 
         if begin is not None or end is not None:
             if begin is None:
-                begin_pos = 0
+                begin = 0
             if end is None:
                 end = ""
             cmd.extend(["--range", f"{begin}-{end}"])
