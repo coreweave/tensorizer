@@ -1,7 +1,9 @@
 import fcntl
+import functools
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import typing
 from urllib.parse import urlparse
@@ -89,33 +91,52 @@ except IOError as e:
     logger.warning(e.strerror)
     curl_path = None
 
-s3_endpoint = "object.ord1.coreweave.com"
-s3_access_key = None
-s3_secret_key = None
+default_s3_endpoint = "object.ord1.coreweave.com"
+if sys.platform != "win32":
+    _s3_config_paths = (os.path.expanduser("~/.s3cfg"),)
+else:
+    # s3cmd generates its config at a different path on Windows by default,
+    # but it may have been manually placed at ~\.s3cfg instead, so check both.
+    _s3_config_paths = tuple(map(os.path.expanduser,
+                                 (r"~\.s3cfg",
+                                  r"~\AppData\Roaming\s3cmd.ini")))
 
-def get_s3cfg_values():
+
+class _ParsedCredentials(typing.NamedTuple):
+    config_file: Optional[str]
+    s3_endpoint: Optional[str]
+    s3_access_key: Optional[str]
+    s3_secret_key: Optional[str]
+
+
+@functools.lru_cache(maxsize=None)
+def _get_s3cfg_values(config_paths=_s3_config_paths) -> _ParsedCredentials:
     """
-    Get the AWS credentials from the .s3cfg file.
+    Gets S3 credentials from the .s3cfg file.
+
+    Returns the 4-tuple config_file, s3_endpoint, s3_access_key, s3_secret_key,
+    where each element may be None if not found.
+    config_file is the config file path used. If it is None, no config file was found.
     """
     import configparser
     config = configparser.ConfigParser()
-    s3path = os.path.expanduser("~/.s3cfg")
-    if not os.path.exists(s3path):
-        return
-    config.read(s3path)
-    if "default" not in config:
-        raise ValueError("No default section in ~/.s3cfg")
-    if "access_key" not in config["default"]:
-        raise ValueError("No access_key in ~/.s3cfg")
-    else:
-        s3_access_key = config["default"]["access_key"]
-    if "secret_key" not in config["default"]:
-        raise ValueError("No secret_key in ~/.s3cfg")
-    else:
-        s3_secret_key = config["default"]["secret_key"]
-    if "host_base" in config["default"]:
-        s3_endpoint = config["default"]["host_base"]
 
+    # Stop on the first path that can be successfully read
+    for config_path in config_paths:
+        if config.read((config_path,)):
+            break
+    else:
+        return _ParsedCredentials(None, None, None, None)
+
+    if "default" not in config:
+        raise ValueError(f"No default section in {config_path}")
+
+    return _ParsedCredentials(
+        config_file=config_path,
+        s3_endpoint=config["default"].get("host_base"),
+        s3_access_key=config["default"].get("access_key"),
+        s3_secret_key=config["default"].get("secret_key")
+    )
 
 
 class CURLStreamFile(object):
@@ -351,12 +372,12 @@ class RequestsStreamFile(object):
 
 def s3_upload(path: str,
               target_uri: str,
-              aws_access_key_id: str,
-              aws_secret_access_key: str,
-              s3_endpoint: str = "object.ord1.coreweave.com"):
-    if aws_secret_access_key is None:
+              s3_access_key_id: str,
+              s3_secret_access_key: str,
+              s3_endpoint: str = default_s3_endpoint):
+    if s3_secret_access_key is None:
         raise Exception("No secret key provided")
-    if aws_access_key_id is None:
+    if s3_access_key_id is None:
         raise Exception("No access key provided")
     if s3_endpoint is None:
         raise Exception("No S3 endpoint provided")
@@ -364,8 +385,8 @@ def s3_upload(path: str,
         boto3.session.Session(),
         endpoint_url="https://" + s3_endpoint,
         service_name="s3",
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key)
+        aws_access_key_id=s3_access_key_id,
+        aws_secret_access_key=s3_secret_access_key)
     path_uri = urlparse(target_uri)
     bucket = path_uri.netloc
     key = path_uri.path.lstrip('/')
@@ -373,12 +394,12 @@ def s3_upload(path: str,
     client.upload_file(path, bucket, key)
 
 def s3_download(path_uri: str,
-                aws_access_key_id: str,
-                aws_secret_access_key: str,
-                s3_endpoint: str = "object.ord1.coreweave.com") -> CURLStreamFile:
-    if aws_secret_access_key is None:
+                s3_access_key_id: str,
+                s3_secret_access_key: str,
+                s3_endpoint: str = default_s3_endpoint) -> CURLStreamFile:
+    if s3_secret_access_key is None:
         raise Exception("No secret key provided")
-    if aws_access_key_id is None:
+    if s3_access_key_id is None:
         raise Exception("No access key provided")
     if s3_endpoint is None:
         raise Exception("No S3 endpoint provided")
@@ -387,8 +408,8 @@ def s3_download(path_uri: str,
         boto3.session.Session(),
         endpoint_url="https://" + s3_endpoint,
         service_name="s3",
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key)
+        aws_access_key_id=s3_access_key_id,
+        aws_secret_access_key=s3_secret_access_key)
     path_uri = urlparse(path_uri)
     bucket = path_uri.netloc
     key = path_uri.path.lstrip('/')
@@ -401,13 +422,38 @@ def s3_download(path_uri: str,
     print(url)
     return CURLStreamFile(url)
 
+
 def open_stream(
-        path_uri: str,
+        path_uri: Union[str, os.PathLike],
         mode: str = "rb",
-        aws_access_key_id: Optional[str] = s3_access_key,
-        aws_secret_access_key: Optional[str] = s3_secret_key,
-        s3_endpoint: Optional[str] = s3_endpoint,
+        s3_access_key_id: Optional[str] = None,
+        s3_secret_access_key: Optional[str] = None,
+        s3_endpoint: Optional[str] = None,
 ) -> Union[RequestsStreamFile, CURLStreamFile, typing.BinaryIO]:
+    """Open a file path, http(s):// URL, or s3:// URI.
+    :param path_uri: File path, http(s):// URL, or s3:// URI to open.
+    :param mode: Mode with which to open the stream.
+        Supported values are:
+        * "rb" for http(s)://,
+        * "rb", "wb', and "ab" for s3://,
+        * All standard modes for file paths.
+    :param s3_access_key_id: S3 access key, corresponding to
+        "aws_access_key_id" in boto3.
+        If not specified, an s3:// URI is being opened, and ~/.s3cfg exists,
+        ~/.s3cfg's "access_key" will be parsed as this credential.
+    :param s3_secret_access_key: S3 secret key, corresponding to
+        "aws_secret_access_key" in boto3.
+        If not specified, an s3:// URI is being opened, and ~/.s3cfg exists,
+        ~/.s3cfg's "secret_key" will be parsed as this credential.
+    :param s3_endpoint: S3 endpoint.
+        If not specified and a host_base was found
+        alongside previously parsed credentials, that will be used.
+        Otherwise, object.ord1.coreweave.com is the default.
+    :return: An opened file-like object representing the target resource.
+    """
+    if isinstance(path_uri, os.PathLike):
+        path_uri = os.fspath(path_uri)
+
     if path_uri.startswith("https://") or path_uri.startswith("http://"):
         if fcntl is not None and curl_path is not None:
             # We have fcntl and curl exists, so we can use the fast CURL-based loader.
@@ -417,22 +463,59 @@ def open_stream(
             # Fallback to slow requests-based loader.
             logger.debug(f"Using requests for tensor streaming {path_uri}")
             return RequestsStreamFile(path_uri)
+
     elif path_uri.startswith("s3://"):
+        if not s3_access_key_id or not s3_secret_access_key:
+            # Try to find default credentials if not specified
+            try:
+                parsed: _ParsedCredentials = _get_s3cfg_values()
+            except ValueError as parse_error:
+                raise ValueError(
+                    "Attempted to access S3 bucket,"
+                    " but credentials were not provided,"
+                    " and the fallback .s3cfg file could not be parsed.") \
+                    from parse_error
+
+            if parsed.config_file is None:
+                raise ValueError("Attempted to access S3 bucket,"
+                                 " but credentials were not provided,"
+                                 " and no default .s3cfg file could be found.")
+
+            s3_access_key_id = s3_access_key_id or parsed.s3_access_key
+            s3_secret_access_key = s3_secret_access_key or parsed.s3_secret_key
+            s3_endpoint = s3_endpoint or parsed.s3_endpoint
+
+            for required_credential, credential_name in (
+                    (s3_access_key_id, "s3_access_key_id"),
+                    (s3_secret_access_key, "s3_secret_access_key")
+            ):
+                if not required_credential:
+                    raise ValueError(
+                        "Attempted to access S3 bucket,"
+                        f" but {credential_name} was not provided,"
+                        " and could not be found in the default"
+                        f" config file at {parsed.config_file}."
+                    )
+
+        # Regardless of whether the config needed to be parsed,
+        # the endpoint gets a default value.
+        s3_endpoint = s3_endpoint or default_s3_endpoint
+
         if 'w' in mode or 'a' in mode:
             tmp_path = tempfile.mktemp()
             handle = open(tmp_path, mode)
             old_close = handle.close
             handle.close = lambda: old_close() or s3_upload(tmp_path,
                                                             path_uri,
-                                                            aws_access_key_id,
-                                                            aws_secret_access_key,
+                                                            s3_access_key_id,
+                                                            s3_secret_access_key,
                                                             s3_endpoint)
             return handle
         else:
             tmp_path = tempfile.mktemp()
             return s3_download(path_uri,
-                               aws_access_key_id,
-                               aws_secret_access_key,
+                               s3_access_key_id,
+                               s3_secret_access_key,
                                s3_endpoint)
 
     else:
