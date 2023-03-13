@@ -107,7 +107,7 @@ class TensorDeserializer:
         self._tensors = struct.unpack("<Q", self._file.read(8))[0]
 
         # Read the metadata index of tensors.
-        self._read_metadata()
+        self._read_metadatas()
 
         self._device = device
 
@@ -174,7 +174,27 @@ class TensorDeserializer:
         length = struct.unpack("<B", io_obj.read(1))[0]
         return io_obj.read(length).decode("utf-8")
 
-    def _read_metadata(self):
+    def _read_metadata(self, metadata_stream: io.BytesIO) -> TensorEntry:
+        name = self._read_string(metadata_stream)
+        tensor_type = TensorType(struct.unpack("<B", metadata_stream.read(1))[0])
+        dtype = self._read_dtype(metadata_stream)
+        shape_len = struct.unpack("<B", metadata_stream.read(1))[0]
+        shape = self._read_shapes(metadata_stream.read(shape_len * 4), shape_len)
+        offset = struct.unpack("<Q", metadata_stream.read(8))[0]
+        data_offset = struct.unpack("<Q", metadata_stream.read(8))[0]
+        data_length = struct.unpack("<Q", metadata_stream.read(8))[0]
+        return TensorEntry(
+            name=name,
+            type=tensor_type,
+            offset=offset,
+            data_offset=data_offset,
+            data_length=data_length,
+            dtype=dtype,
+            shape=shape,
+        )
+
+
+    def _read_metadatas(self):
         """
         Read the metadata of tensors into self._metadata.
         """
@@ -185,23 +205,8 @@ class TensorDeserializer:
         metadata_stream = io.BytesIO(metadata_encoded)
 
         for i in range(self._tensors):
-            name = self._read_string(metadata_stream)
-            tensor_type = TensorType(struct.unpack("<B", metadata_stream.read(1))[0])
-            dtype = self._read_dtype(metadata_stream)
-            shape_len = struct.unpack("<B", metadata_stream.read(1))[0]
-            shape = self._read_shapes(metadata_stream.read(shape_len * 4), shape_len)
-            offset = struct.unpack("<Q", metadata_stream.read(8))[0]
-            data_offset = struct.unpack("<Q", metadata_stream.read(8))[0]
-            data_length = struct.unpack("<Q", metadata_stream.read(8))[0]
-            self._metadata[name] = TensorEntry(
-                name=name,
-                type=tensor_type,
-                offset=offset,
-                data_offset=data_offset,
-                data_length=data_length,
-                dtype=dtype,
-                shape=shape,
-            )
+            metadata = self._read_metadata(metadata_stream)
+            self._metadata[metadata["name"]] = metadata
 
     @staticmethod
     def _read_shapes(obj, num_elems) -> List[int]:
@@ -234,7 +239,6 @@ class TensorDeserializer:
             return self._cache[name]
 
         if name in self._metadata:
-            self._file.seek(self._metadata[name]['offset'])
             tensor_arr = next(self.read_tensors(num_tensors=1))[3]
             self._cache[name] = self._to_torch_parameter(tensor_arr,
                                                          self._dtype,
@@ -320,13 +324,11 @@ class TensorDeserializer:
                     if data_length > len(self._buffer):
                          self._buffer = bytearray(data_length)
                     mv = memoryview(self._buffer)
-                    self._file.readinto(mv)
+                    self._file.readinto(mv[:data_length])
                 else:
                     buffer = bytearray(data_length)
                     mv = memoryview(buffer)
                     self._file.readinto(mv)
-
-                print(name, shape_list, dtype, len(mv))
 
                 arr = numpy.ndarray.__new__(
                     numpy.memmap,

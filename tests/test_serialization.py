@@ -1,3 +1,4 @@
+import gc
 import tempfile
 import unittest
 from typing import Tuple
@@ -7,6 +8,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from tensorizer.serialization import TensorSerializer, TensorDeserializer
+from tensorizer import utils
 
 model_name = "EleutherAI/gpt-neo-125M"
 
@@ -40,20 +42,31 @@ class TestSerialization(unittest.TestCase):
         deserialized.close()
 
     def test_preload(self):
+        before_serialization = utils.get_ram_usage_str()
         serialized_model, orig_sd = serialize_model(model_name, device="cpu")
+        after_serialization = utils.get_ram_usage_str()
         in_file = open(serialized_model, "rb")
         deserialized = TensorDeserializer(in_file, preload=True, device="cpu")
-
         check_deserialized(deserialized, orig_sd)
+        after_deserialization = utils.get_ram_usage_str()
+        print(f"Before serialization: {before_serialization}")
+        print(f"After serialization: {after_serialization}")
+        print(f"After deserialization: {after_deserialization}")
+        del serialized_model, orig_sd, in_file
+        gc.collect()
+        after_del = utils.get_ram_usage_str()
+        print(f"After del: {after_del}")
         deserialized.close()
 
     def test_mmap(self):
+        before_serialization = utils.get_ram_usage_str()
         serialized_model, orig_sd = serialize_model(model_name, device="cpu")
+        after_serialization = utils.get_ram_usage_str()
         in_file = open(serialized_model, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cpu",
                                           use_mmap=True)
-
+        after_deserialization = utils.get_ram_usage_str()
         check_deserialized(deserialized, orig_sd)
         deserialized.close()
 
