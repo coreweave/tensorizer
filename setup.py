@@ -12,12 +12,6 @@ setup(
         'torch>=1.9.0',
         'protobuf>=3.19.5',
     ],
-    extras_require={
-        'examples': [
-            'transformers @ git+ssh://git@github.com/huggingface/transformers@d4ba6e1a0e8f662f3deadba25d982c6fb5fb772c',
-            'diffusers==0.11.1'
-        ],
-    },
     classifiers=[
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: MIT License',
