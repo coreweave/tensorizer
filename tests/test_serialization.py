@@ -72,21 +72,21 @@ class TestSerialization(unittest.TestCase):
         print(f"After deserialization: {after_deserialization}")
 
     def test_mmap_gpu(self):
-        before_serialization = utils.get_vram_ram_usage_str()
+        before_serialization = utils.get_mem_usage()
         serialized_model, orig_sd = serialize_model(model_name, device="cuda")
-        after_serialization = utils.get_vram_ram_usage_str()
+        after_serialization = utils.get_mem_usage()
         in_file = open(serialized_model, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cuda",
                                           use_mmap=True)
-        after_deserialization = utils.get_vram_ram_usage_str()
+        after_deserialization = utils.get_mem_usage()
         check_deserialized(deserialized, orig_sd)
         print(f"Before serialization: {before_serialization}")
         print(f"After serialization: {after_serialization}")
         print(f"After deserialization: {after_deserialization}")
         del serialized_model, orig_sd, in_file
         gc.collect()
-        after_del = utils.get_vram_ram_usage_str()
+        after_del = utils.get_mem_usage()
         print(f"After del: {after_del}")
 
     def test_mmap_preload(self):

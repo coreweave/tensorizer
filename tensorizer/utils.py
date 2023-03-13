@@ -4,13 +4,15 @@ try:
 except ImportError:
     resource = None
 
-import pynvml
 import psutil
 
 try:
-    pynvml.nvmlInit()
-    nvml_device = pynvml.nvmlDeviceGetHandleByIndex(0)
-except pynvml.nvml.NVMLError_LibraryNotFound:
+    import pynvml
+    try:
+        pynvml.nvmlInit()
+    except pynvml.nvml.NVMLError_LibraryNotFound:
+        pynvml = None
+except ImportError:
     pynvml = None
 
 
@@ -31,6 +33,24 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _get_gpu_mem_usage():
+    """
+    Returns a tuple of (total_vram, free_vram, used_vram) in bytes if possible.
+    Returns None if neither PyTorch >=1.10 nor pynvml is available.
+    """
+    mem_get_info = getattr(torch.cuda, "mem_get_info", None)
+    if mem_get_info is not None:
+        free, total = mem_get_info()
+        return total, free, total - free
+    elif pynvml is not None:
+        cudadev = torch.cuda.current_device()
+        nvml_device = pynvml.nvmlDeviceGetHandleByIndex(cudadev)
+        gpu_info = pynvml.nvmlDeviceGetMemoryInfo(nvml_device)
+        return gpu_info.total, gpu_info.free, gpu_info.used
+    else:
+        return None
+
+
 def get_mem_usage() -> str:
     """
     Returns memory usage statistics for the CPU, GPU, and Torch.
@@ -40,42 +60,44 @@ def get_mem_usage() -> str:
     gpu_str = ""
     torch_str = ""
     try:
-        cudadev = torch.cuda.current_device()
-        nvml_device = pynvml.nvmlDeviceGetHandleByIndex(cudadev)
-        gpu_info = pynvml.nvmlDeviceGetMemoryInfo(nvml_device)
-        gpu_total = int(gpu_info.total / 1e6)
-        gpu_free = int(gpu_info.free / 1e6)
-        gpu_used = int(gpu_info.used / 1e6)
-        gpu_str = (
-            f"GPU: (U: {gpu_used:,}mb F: {gpu_free:,}mb "
-            f"T: {gpu_total:,}mb) "
-        )
-        torch_reserved_gpu = int(torch.cuda.memory.memory_reserved() / 1e6)
-        torch_reserved_max = int(torch.cuda.memory.max_memory_reserved() / 1e6)
-        torch_used_gpu = int(torch.cuda.memory_allocated() / 1e6)
-        torch_max_used_gpu = int(torch.cuda.max_memory_allocated() / 1e6)
+        gpu_info = _get_gpu_mem_usage()
+        if gpu_info is not None:
+            gpu_total, gpu_free, gpu_used = gpu_info
+            gpu_total >>= 20
+            gpu_free >>= 20
+            gpu_used >>= 20
+            gpu_str = (
+                f"GPU: (U: {gpu_used:,}MiB F: {gpu_free:,}MiB T: {gpu_total:,}MiB) "
+            )
+        torch_reserved_gpu = torch.cuda.memory.memory_reserved() >> 20
+        torch_reserved_max = torch.cuda.memory.max_memory_reserved() >> 20
+        torch_used_gpu = torch.cuda.memory_allocated() >> 20
+        torch_max_used_gpu = torch.cuda.max_memory_allocated() >> 20
         torch_str = (
-            f"TORCH: (R: {torch_reserved_gpu:,}mb/"
-            f"{torch_reserved_max:,}mb, "
-            f"A: {torch_used_gpu:,}mb/{torch_max_used_gpu:,}mb)"
+            f"TORCH: (R: {torch_reserved_gpu:,}MiB/"
+            f"{torch_reserved_max:,}MiB, "
+            f"A: {torch_used_gpu:,}MiB/{torch_max_used_gpu:,}MiB)"
         )
     except AssertionError:
         pass
-    cpu_maxrss = int(
-        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e3
-        + resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1e3
-    )
-    cpu_shared = int(resource.getrusage(resource.RUSAGE_SELF).ru_ixrss / 1e3)
+    if resource is not None:
+        cpu_maxrss = (
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            + resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        ) >> 10
+    else:
+        process = psutil.Process()
+        cpu_maxrss = (
+            process.memory_info().rss
+            + sum(p.memory_info().rss for p in process.children(True))
+        ) >> 20
     cpu_vmem = psutil.virtual_memory()
-    cpu_free = int(cpu_vmem.free / 1e6)
+    cpu_free = cpu_vmem.free >> 20
     return (
-        f"CPU: (maxrss: {cpu_maxrss:,}mb idrss: {cpu_shared} F: {cpu_free:,}mb) "
-        f"{gpu_str}"
-        f"{torch_str}"
+        f"CPU: (maxrss: {cpu_maxrss:,}MiB F: {cpu_free:,}MiB) "
+        f"{gpu_str}{torch_str}"
     )
 
-def get_vram_ram_usage_str() -> str:
-    return f"{get_mem_usage()} {get_vram_usage_str()}"
 
 def get_gpu_name() -> str:
     if torch.cuda.is_available():
