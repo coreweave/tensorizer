@@ -111,7 +111,7 @@ def load_model(
         model_prefix = "model"
 
     begin_load = time.time()
-    ram_usage = utils.get_ram_usage_str()
+    ram_usage = utils.get_mem_usage()
 
     config_uri = f"{path_uri}/{model_prefix}-config.json"
     tensors_uri = f"{path_uri}/{model_prefix}.tensors"
@@ -154,7 +154,7 @@ def load_model(
     tensors_sz = utils.convert_bytes(tensor_deserializer.total_bytes_read)
     logger.info(
         f"Model tensors loaded in {tensor_load_s:0.2f}s, read "
-        + f"{tensors_sz} @ {rate_str}/s, {utils.get_ram_usage_str()}"
+        + f"{tensors_sz} @ {rate_str}/s, {utils.get_mem_usage()}"
     )
 
     return model
@@ -175,7 +175,7 @@ def df_main(args: argparse.Namespace) -> None:
     logger.info("Serializing model")
     logger.info("GPU: " + utils.get_gpu_name())
     logger.info("GPU RAM: " + utils.get_vram_usage_str())
-    logger.info("PYTHON USED RAM: " + utils.get_ram_usage_str())
+    logger.info("PYTHON USED RAM: " + utils.get_mem_usage())
 
     serialize_model(
         pipeline.text_encoder.eval(),
@@ -238,7 +238,7 @@ def hf_main(args):
     logger.info("Serializing model")
     logger.info("GPU: " + utils.get_gpu_name())
     logger.info("GPU RAM: " + utils.get_vram_usage_str())
-    logger.info("PYTHON USED RAM: " + utils.get_ram_usage_str())
+    logger.info("PYTHON USED RAM: " + utils.get_mem_usage())
 
     serialize_model(model, model_config, output_prefix)
 
