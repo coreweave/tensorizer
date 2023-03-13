@@ -2,6 +2,7 @@
 # serialization.py                                                   Wes Brown
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
+import mmap
 
 # try to import UNIX only dependencies
 try:
@@ -16,6 +17,7 @@ import io
 import os
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
+import mmap
 import numpy
 import struct
 import torch
@@ -67,7 +69,9 @@ class TensorDeserializer:
             device: Union[torch.device, str, None] = None,
             pattern: Union[regex.Pattern, str, None] = None,
             dtype: Union[torch.dtype, str, None] = None,
-            preload: bool = False):
+            preload: bool = False,
+            use_mmap: bool = False,
+            oneshot: bool = False):
         if isinstance(file_obj, str):
             self._file = stream_io.open_stream(file_obj, "rb+")
         else:
@@ -103,10 +107,33 @@ class TensorDeserializer:
         self._tensors = struct.unpack("<Q", self._file.read(8))[0]
 
         # Read the metadata index of tensors.
-        self._read_metadata()
+        self._read_metadatas()
 
         self._device = device
-        if preload:
+
+        self._dtype = dtype
+
+        if oneshot and use_mmap:
+            raise ValueError("Cannot use mmap with oneshot")
+        elif oneshot and preload:
+            raise ValueError("Cannot use preload with oneshot")
+        elif oneshot and device == "cpu":
+            raise ValueError("Cannot use cpu device with oneshot")
+        self._oneshot = oneshot
+        self._prior_key = None
+
+        self._mmap = None
+        if use_mmap:
+            self._mmap_file = tempfile.TemporaryFile("wb+")
+            self._mmap_file.write(b"\0" * self.total_tensor_bytes)
+            self._mmap_file.seek(0)
+            self._mmap = mmap.mmap(self._mmap_file.fileno(), self.total_tensor_bytes)
+
+        self._cache: Dict[str, torch.Tensor] = {}
+
+        if oneshot and preload:
+            raise ValueError("Cannot use preload with oneshot")
+        elif preload:
             self._cache = self._generate_state_dict(device=device,
                                                     pattern=pattern,
                                                     dtype=dtype)
@@ -117,6 +144,15 @@ class TensorDeserializer:
                     filtered_keys.append(key)
             self._cache = OrderedDict(zip(filtered_keys,
                                           [None] * len(filtered_keys)))
+
+    def __del__(self):
+        self.close()
+    def close(self):
+        if self._mmap is not None:
+            self._mmap.close()
+            self._mmap_file.close()
+        if self._file is not None:
+            self._file.close()
 
     def _read_string(self, io_obj=None):
         """
@@ -138,7 +174,27 @@ class TensorDeserializer:
         length = struct.unpack("<B", io_obj.read(1))[0]
         return io_obj.read(length).decode("utf-8")
 
-    def _read_metadata(self):
+    def _read_metadata(self, metadata_stream: io.BytesIO) -> TensorEntry:
+        name = self._read_string(metadata_stream)
+        tensor_type = TensorType(struct.unpack("<B", metadata_stream.read(1))[0])
+        dtype = self._read_dtype(metadata_stream)
+        shape_len = struct.unpack("<B", metadata_stream.read(1))[0]
+        shape = self._read_shapes(metadata_stream.read(shape_len * 4), shape_len)
+        offset = struct.unpack("<Q", metadata_stream.read(8))[0]
+        data_offset = struct.unpack("<Q", metadata_stream.read(8))[0]
+        data_length = struct.unpack("<Q", metadata_stream.read(8))[0]
+        return TensorEntry(
+            name=name,
+            type=tensor_type,
+            offset=offset,
+            data_offset=data_offset,
+            data_length=data_length,
+            dtype=dtype,
+            shape=shape,
+        )
+
+
+    def _read_metadatas(self):
         """
         Read the metadata of tensors into self._metadata.
         """
@@ -149,23 +205,8 @@ class TensorDeserializer:
         metadata_stream = io.BytesIO(metadata_encoded)
 
         for i in range(self._tensors):
-            name = self._read_string(metadata_stream)
-            tensor_type = TensorType(struct.unpack("<B", metadata_stream.read(1))[0])
-            dtype = self._read_dtype(metadata_stream)
-            shape_len = struct.unpack("<B", metadata_stream.read(1))[0]
-            shape = self._read_shapes(metadata_stream.read(shape_len * 4), shape_len)
-            offset = struct.unpack("<Q", metadata_stream.read(8))[0]
-            data_offset = struct.unpack("<Q", metadata_stream.read(8))[0]
-            data_length = struct.unpack("<Q", metadata_stream.read(8))[0]
-            self._metadata[name] = TensorEntry(
-                name=name,
-                type=tensor_type,
-                offset=offset,
-                data_offset=data_offset,
-                data_length=data_length,
-                dtype=dtype,
-                shape=shape,
-            )
+            metadata = self._read_metadata(metadata_stream)
+            self._metadata[metadata["name"]] = metadata
 
     @staticmethod
     def _read_shapes(obj, num_elems) -> List[int]:
@@ -187,13 +228,21 @@ class TensorDeserializer:
             return self._file.tell()
 
     def __getitem__(self, name):
+        if self._oneshot:
+            if self._prior_key is not None and self._prior_key != name:
+                self._cache[self._prior_key] = False
+            if self._cache[name] is False:
+                raise RuntimeError(f"Tensor {name} already overwritten in oneshot mode")
+            self._prior_key = name
+
         if name in self._cache and self._cache[name] is not None:
             return self._cache[name]
 
         if name in self._metadata:
-            self._file.seek(self._metadata[name]['offset'])
             tensor_arr = next(self.read_tensors(num_tensors=1))[3]
-            self._cache[name] = self._to_torch_parameter(tensor_arr)
+            self._cache[name] = self._to_torch_parameter(tensor_arr,
+                                                         self._dtype,
+                                                         self._device)
             return self._cache[name]
         else:
             raise KeyError(f"Tensor {name} not found")
@@ -260,19 +309,32 @@ class TensorDeserializer:
                     shape_len,
                 )
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
-                if data_length > len(self._buffer):
-                    self._buffer = bytearray(data_length)
-                with memoryview(self._buffer) as mem:
-                    self._file.readinto(mem[:data_length])
                 # Check if the name matches the pattern, drop if it doesn't.
                 if pattern is not None and not pattern.match(name):
+                    self._file.seek(mmap_offset + data_length)
                     continue
+
+                mv: Union[memoryview, None] = None
+                if self._mmap is not None:
+                    mmap_offset = self._mmap_file.tell()
+                    mv = memoryview(self._mmap)[mmap_offset:data_length+mmap_offset]
+                    self._file.readinto(mv)
+                    self._mmap_file.seek(data_length, 1)
+                elif self._oneshot:
+                    if data_length > len(self._buffer):
+                         self._buffer = bytearray(data_length)
+                    mv = memoryview(self._buffer)
+                    self._file.readinto(mv[:data_length])
+                else:
+                    buffer = bytearray(data_length)
+                    mv = memoryview(buffer)
+                    self._file.readinto(mv)
 
                 arr = numpy.ndarray.__new__(
                     numpy.memmap,
                     shape_list,
                     dtype=dtype,
-                    buffer=self._buffer,
+                    buffer=mv,
                     offset=0,
                 )
                 tensors_read += 1
@@ -442,7 +504,7 @@ class TensorSerializer:
         self._file.write(struct.pack("<Q", self._tensors))
         # Write the total size of the file.
         self._file.seek(self._size_loc)
-        self._file.write(struct.pack("<Q", self._file.tell()))
+        self._file.write(struct.pack("<Q", self.total_tensor_bytes))
 
         final_sz = self._file.tell()
         self._file.close()
@@ -504,7 +566,7 @@ class TensorSerializer:
         self._file.write(name_bytes)
 
         # Write out our tensor dtype
-        dtype_bytes = bytes(str(tensor.dtype), "utf-8")
+        dtype_bytes = bytes(tensor.dtype.str, "utf-8")
         dtype_len = len(dtype_bytes)
         self._file.write(struct.pack("<B", dtype_len))
         self._file.write(dtype_bytes)
@@ -548,7 +610,9 @@ class TensorSerializer:
         self._file.seek(tensor_size_loc, io.SEEK_SET)
         # We write this signed, so that we can use the signedness as an
         # indicator of possible tensor compression in the future.
-        self._file.write(struct.pack("<Q", tensor_endpos - tensor_startpos))
+        tensor_size = tensor_endpos - tensor_startpos
+        self._file.write(struct.pack("<Q", tensor_size))
+        self.total_tensor_bytes += tensor_size
 
         # Write our data structure header size.
         self._file.seek(ds_header_begin)
@@ -618,4 +682,3 @@ class TensorSerializer:
         idx = 0
         for name, param in state_dict.items():
             self.write_tensor(idx, name, TensorType.STATEDICT, param)
-        self.total_tensor_bytes = self._file.tell()
