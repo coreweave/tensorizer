@@ -2,7 +2,6 @@
 # serialization.py                                                   Wes Brown
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
-import mmap
 
 # try to import UNIX only dependencies
 try:
@@ -27,7 +26,7 @@ import tempfile
 import regex
 
 from collections import OrderedDict
-from typing import Optional, Tuple, Union, List, Iterator, Callable, Dict, Any
+from typing import Optional, Tuple, Union, List, Iterator, Dict
 
 lz4 = None
 
@@ -147,6 +146,7 @@ class TensorDeserializer:
 
     def __del__(self):
         self.close()
+
     def close(self):
         if self._mmap is not None:
             self._mmap.close()
@@ -192,7 +192,6 @@ class TensorDeserializer:
             dtype=dtype,
             shape=shape,
         )
-
 
     def _read_metadatas(self):
         """
@@ -314,7 +313,7 @@ class TensorDeserializer:
                     self._file.seek(mmap_offset + data_length)
                     continue
 
-                mv: Union[memoryview, None] = None
+                mv: memoryview
                 if self._mmap is not None:
                     mmap_offset = self._mmap_file.tell()
                     mv = memoryview(self._mmap)[mmap_offset:data_length+mmap_offset]
@@ -322,7 +321,7 @@ class TensorDeserializer:
                     self._mmap_file.seek(data_length, 1)
                 elif self._oneshot:
                     if data_length > len(self._buffer):
-                         self._buffer = bytearray(data_length)
+                        self._buffer = bytearray(data_length)
                     mv = memoryview(self._buffer)
                     self._file.readinto(mv[:data_length])
                 else:
