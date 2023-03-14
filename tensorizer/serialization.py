@@ -148,10 +148,12 @@ class TensorDeserializer:
         self.close()
 
     def close(self):
-        if self._mmap is not None:
+        # Don't throw an attribute error if these aren't defined yet,
+        # e.g. if __init__ threw an error before defining both
+        if getattr(self, "_mmap", None) is not None:
             self._mmap.close()
             self._mmap_file.close()
-        if self._file is not None:
+        if getattr(self, "_file", None) is not None:
             self._file.close()
 
     def _read_string(self, io_obj=None):
