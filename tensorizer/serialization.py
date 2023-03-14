@@ -2,7 +2,6 @@
 # serialization.py                                                   Wes Brown
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
-import mmap
 
 # try to import UNIX only dependencies
 try:
@@ -27,7 +26,7 @@ import tempfile
 import regex
 
 from collections import OrderedDict
-from typing import Optional, Tuple, Union, List, Iterator, Callable, Dict, Any
+from typing import Optional, Tuple, Union, List, Iterator, Dict
 
 lz4 = None
 
@@ -125,11 +124,10 @@ class TensorDeserializer:
         self._mmap = None
         if use_mmap:
             self._mmap_file = tempfile.TemporaryFile("wb+")
-            self._mmap_file.write(b"\0" * self.total_tensor_bytes)
-            self._mmap_file.seek(0)
+            self._mmap_file.truncate(self.total_tensor_bytes)
             self._mmap = mmap.mmap(self._mmap_file.fileno(), self.total_tensor_bytes)
 
-        self._cache: Dict[str, torch.Tensor] = {}
+        self._cache: typing.OrderedDict[str, Union[torch.Tensor, None, bool]]
 
         if oneshot and preload:
             raise ValueError("Cannot use preload with oneshot")
@@ -138,20 +136,21 @@ class TensorDeserializer:
                                                     pattern=pattern,
                                                     dtype=dtype)
         else:
-            filtered_keys = []
-            for key in self._metadata.keys():
-                if pattern is None or pattern.match(key):
-                    filtered_keys.append(key)
-            self._cache = OrderedDict(zip(filtered_keys,
-                                          [None] * len(filtered_keys)))
+            filtered_keys = self._metadata.keys()
+            if pattern is not None:
+                filtered_keys = filter(pattern.match, filtered_keys)
+            self._cache = OrderedDict.fromkeys(filtered_keys)
 
     def __del__(self):
         self.close()
+
     def close(self):
-        if self._mmap is not None:
+        # Don't throw an attribute error if these aren't defined yet,
+        # e.g. if __init__ threw an error before defining both
+        if getattr(self, "_mmap", None) is not None:
             self._mmap.close()
             self._mmap_file.close()
-        if self._file is not None:
+        if getattr(self, "_file", None) is not None:
             self._file.close()
 
     def _read_string(self, io_obj=None):
@@ -193,7 +192,6 @@ class TensorDeserializer:
             shape=shape,
         )
 
-
     def _read_metadatas(self):
         """
         Read the metadata of tensors into self._metadata.
@@ -227,7 +225,7 @@ class TensorDeserializer:
         else:
             return self._file.tell()
 
-    def __getitem__(self, name):
+    def __getitem__(self, name) -> torch.nn.Parameter:
         if self._oneshot:
             if self._prior_key is not None and self._prior_key != name:
                 self._cache[self._prior_key] = False
@@ -311,18 +309,18 @@ class TensorDeserializer:
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
                 # Check if the name matches the pattern, drop if it doesn't.
                 if pattern is not None and not pattern.match(name):
-                    self._file.seek(mmap_offset + data_length)
+                    self._file.seek(data_length, io.SEEK_CUR)
                     continue
 
-                mv: Union[memoryview, None] = None
+                mv: memoryview
                 if self._mmap is not None:
-                    mmap_offset = self._mmap_file.tell()
+                    mmap_offset = self._mmap.tell()
                     mv = memoryview(self._mmap)[mmap_offset:data_length+mmap_offset]
                     self._file.readinto(mv)
-                    self._mmap_file.seek(data_length, 1)
+                    self._mmap.seek(data_length, io.SEEK_CUR)
                 elif self._oneshot:
                     if data_length > len(self._buffer):
-                         self._buffer = bytearray(data_length)
+                        self._buffer = bytearray(data_length)
                     mv = memoryview(self._buffer)
                     self._file.readinto(mv[:data_length])
                 else:
@@ -349,9 +347,9 @@ class TensorDeserializer:
         """
         Convert a numpy array to a torch tensor on a device.
         """
-        gradient = arr.dtype.kind in ("f", "c")
         if dtype is not None and arr.dtype != "bool" and arr.dtype != dtype:
             arr = arr.astype(dtype)
+        gradient = arr.dtype.kind in ("f", "c")
 
         return torch.nn.Parameter(
             torch.as_tensor(arr, device=device), requires_grad=gradient
