@@ -8,7 +8,7 @@ import typing
 from urllib.parse import urlparse
 
 import boto3
-from io import SEEK_SET, SEEK_END
+from io import SEEK_SET, SEEK_CUR, SEEK_END
 from typing import Union, Optional, Dict, Any
 import requests
 import shutil
@@ -71,7 +71,7 @@ class CURLStreamFile:
     """
     CURLStreamFile implements a file-like object around an HTTP download, the
     intention being to not buffer more than we have to. It is intended for
-    tar-like files, where we start at the begining and read until the end of
+    tar-like files, where we start at the beginning and read until the end of
     the file.
 
     It does implement `seek` and `tell`, but only for the purpose of
@@ -197,6 +197,8 @@ class CURLStreamFile:
     """
 
     def seek(self, position, whence=SEEK_SET):
+        if whence == SEEK_CUR:
+            position += self._curr
         if position == self._curr:
             return
         if whence == SEEK_END:
@@ -283,6 +285,8 @@ class RequestsStreamFile:
     """
 
     def seek(self, position, whence=SEEK_SET):
+        if whence == SEEK_CUR:
+            position += self._curr
         if position == self._curr:
             return
         if whence == SEEK_END:
