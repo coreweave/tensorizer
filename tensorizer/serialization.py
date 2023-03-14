@@ -349,9 +349,9 @@ class TensorDeserializer:
         """
         Convert a numpy array to a torch tensor on a device.
         """
-        gradient = arr.dtype.kind in ("f", "c")
         if dtype is not None and arr.dtype != "bool" and arr.dtype != dtype:
             arr = arr.astype(dtype)
+        gradient = arr.dtype.kind in ("f", "c")
 
         return torch.nn.Parameter(
             torch.as_tensor(arr, device=device), requires_grad=gradient
