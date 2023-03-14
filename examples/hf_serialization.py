@@ -173,6 +173,7 @@ def df_main(args: argparse.Namespace) -> None:
     )
 
     logger.info("Serializing model")
+    logger.info("GPU: " + utils.get_gpu_name())
     logger.info("PYTHON USED RAM: " + utils.get_mem_usage())
 
     serialize_model(
