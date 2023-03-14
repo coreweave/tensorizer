@@ -3,6 +3,7 @@ from tensorizer import stream_io
 
 NEO_URL = "https://raw.githubusercontent.com/EleutherAI/gpt-neo/master/README.md"
 
+
 class TestCurlStream(unittest.TestCase):
     def test_curl_stream(self):
         stream = stream_io.CURLStreamFile(NEO_URL)

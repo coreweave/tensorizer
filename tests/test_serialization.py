@@ -1,4 +1,5 @@
 import gc
+import os
 import tempfile
 import unittest
 from typing import Tuple
@@ -17,9 +18,13 @@ def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     sd = model.state_dict()
     out_file = tempfile.NamedTemporaryFile("wb+", delete=False)
-    serializer = TensorSerializer(out_file)
-    serializer.write_state_dict(sd)
-    serializer.close()
+    try:
+        serializer = TensorSerializer(out_file)
+        serializer.write_state_dict(sd)
+        serializer.close()
+    except Exception:
+        os.unlink(out_file)
+        raise
     return out_file.name, sd
 
 
@@ -29,23 +34,43 @@ def check_deserialized(deserialized, model_name: str):
         assert k in orig_sd
         assert v.size() == orig_sd[k].size()
         assert v.dtype == orig_sd[k].dtype
-        assert torch.all(orig_sd[k] == v)
+        assert torch.all(orig_sd[k].to(v.device) == v)
 
 
 class TestSerialization(unittest.TestCase):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def test_serialization(self):
+        for device in "cuda", "cpu":
+            with self.subTest(msg=f"Serializing with device {device}"):
+                gc.collect()
+                before_serialization = utils.get_mem_usage()
+                serialized_model, orig_sd = serialize_model(model_name, device)
+                after_serialization = utils.get_mem_usage()
+                print(f"Before serialization: {before_serialization}")
+                print(f"After serialization:  {after_serialization}")
+                del orig_sd
+                try:
+                    with open(serialized_model, "rb") as in_file:
+                        deserialized = TensorDeserializer(
+                            in_file, preload=False, device="cpu"
+                        )
+                        check_deserialized(deserialized, model_name)
+                        deserialized.close()
+                        del deserialized
+                finally:
+                    os.unlink(serialized_model)
+
+
+class TestDeserialization(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
         serialized_model_path, sd = serialize_model(model_name, "cpu")
         del sd
-        self._serialized_model_path = serialized_model_path
+        cls._serialized_model_path = serialized_model_path
         gc.collect()
 
-    def test_serialization(self):
-        serialized_model, orig_sd = serialize_model(model_name, "cpu")
-        in_file = open(serialized_model, "rb")
-        deserialized = TensorDeserializer(in_file, preload=False, device="cpu")
-        check_deserialized(deserialized, model_name)
-        deserialized.close()
+    @classmethod
+    def tearDownClass(cls):
+        os.unlink(cls._serialized_model_path)
 
     def test_preload(self):
         in_file = open(self._serialized_model_path, "rb")
@@ -56,7 +81,7 @@ class TestSerialization(unittest.TestCase):
         check_deserialized(deserialized, model_name)
         deserialized.close()
         print(f"Before deserialization: {before_deserialization}")
-        print(f"After deserialization: {after_deserialization}")
+        print(f"After deserialization:  {after_deserialization}")
 
     def test_mmap(self):
         in_file = open(self._serialized_model_path, "rb")
@@ -69,29 +94,27 @@ class TestSerialization(unittest.TestCase):
         check_deserialized(deserialized, model_name)
         deserialized.close()
         print(f"Before deserialization: {before_deserialization}")
-        print(f"After deserialization: {after_deserialization}")
+        print(f"After deserialization:  {after_deserialization}")
 
     def test_mmap_gpu(self):
-        before_serialization = utils.get_mem_usage()
-        serialized_model, orig_sd = serialize_model(model_name, device="cuda")
-        after_serialization = utils.get_mem_usage()
-        in_file = open(serialized_model, "rb")
+        in_file = open(self._serialized_model_path, "rb")
+        gc.collect()
+        before_deserialization = utils.get_mem_usage()
         deserialized = TensorDeserializer(in_file,
                                           device="cuda",
                                           use_mmap=True)
         after_deserialization = utils.get_mem_usage()
-        check_deserialized(deserialized, orig_sd)
-        print(f"Before serialization: {before_serialization}")
-        print(f"After serialization: {after_serialization}")
-        print(f"After deserialization: {after_deserialization}")
-        del serialized_model, orig_sd, in_file
+        check_deserialized(deserialized, model_name)
+        deserialized.close()
+        print(f"Before deserialization: {before_deserialization}")
+        print(f"After deserialization:  {after_deserialization}")
+        del in_file
         gc.collect()
         after_del = utils.get_mem_usage()
         print(f"After del: {after_del}")
 
     def test_mmap_preload(self):
-        serialized_model, orig_sd = serialize_model(model_name, device="cpu")
-        in_file = open(serialized_model, "rb")
+        in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cpu",
                                           use_mmap=True,
@@ -101,8 +124,7 @@ class TestSerialization(unittest.TestCase):
         deserialized.close()
 
     def test_oneshot(self):
-        serialized_model, orig_sd = serialize_model(model_name, device="cuda")
-        in_file = open(serialized_model, "rb")
+        in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cuda",
                                           oneshot=True)
@@ -111,8 +133,7 @@ class TestSerialization(unittest.TestCase):
         deserialized.close()
 
     def test_oneshot_guards(self):
-        serialized_model, orig_sd = serialize_model(model_name, device="cuda")
-        in_file = open(serialized_model, "rb")
+        in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cuda",
                                           oneshot=True)
