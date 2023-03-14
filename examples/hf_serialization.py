@@ -80,7 +80,7 @@ def serialize_model(
                 json.dumps(config, indent=2)
             )
 
-    ts = TensorSerializer(open(f"{dir_prefix}.tensors", "wb"))
+    ts = TensorSerializer(f"{dir_prefix}.tensors")
     ts.write_module(model)
     ts.close()
 
