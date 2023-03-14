@@ -145,10 +145,9 @@ class CURLStreamFile:
                 ret_buff = ba
         if ret_buff_sz != rq_sz:
             self.closed = True
-            err = self._curl.stderr.read()
             self._curl.terminate()
             if self._curl.returncode != 0:
-                raise IOError(f"curl error: {self._curl.returncode}, {err}")
+                raise IOError(f"curl error: {self._curl.returncode}")
             else:
                 raise IOError(f"Requested {rq_sz} != {ret_buff_sz}")
         self._curr += ret_buff_sz
