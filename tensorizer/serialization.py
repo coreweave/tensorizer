@@ -309,7 +309,7 @@ class TensorDeserializer:
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
                 # Check if the name matches the pattern, drop if it doesn't.
                 if pattern is not None and not pattern.match(name):
-                    self._file.seek(mmap_offset + data_length)
+                    self._file.seek(data_length, io.SEEK_CUR)
                     continue
 
                 mv: memoryview
