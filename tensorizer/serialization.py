@@ -124,8 +124,7 @@ class TensorDeserializer:
         self._mmap = None
         if use_mmap:
             self._mmap_file = tempfile.TemporaryFile("wb+")
-            self._mmap_file.write(b"\0" * self.total_tensor_bytes)
-            self._mmap_file.seek(0)
+            self._mmap_file.truncate(self.total_tensor_bytes)
             self._mmap = mmap.mmap(self._mmap_file.fileno(), self.total_tensor_bytes)
 
         self._cache: Dict[str, torch.Tensor] = {}
