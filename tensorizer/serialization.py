@@ -177,7 +177,7 @@ class TensorDeserializer:
             self._buffer = mmap.mmap(-1,
                                      self.total_tensor_bytes,
                                      prot=mmap.PROT_READ | mmap.PROT_WRITE,
-                                     flags=mmap.MAP_PRIVATE)
+                                     flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
 
             tb = ctypes.c_char * self.total_tensor_bytes
             ctb = tb.from_buffer(self._buffer)
@@ -187,7 +187,7 @@ class TensorDeserializer:
                                         self.total_tensor_bytes,
                                         0)
             end_allocate = time.time()
-            print(f"Memory allocate time: {end_allocate - start_allocate}")
+            logger.info(f"Memory allocate time: {end_allocate - start_allocate:0.4f}")
         else:
             self._buffer = bytearray(self._largest_tensor_bytes)
 
