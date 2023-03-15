@@ -43,6 +43,7 @@ fh_formatter = logging.Formatter(
 fh.setFormatter(fh_formatter)
 logger.addHandler(fh)
 
+
 def serialize_model(
     model: torch.nn.Module,
     config: Optional[Union[ConfigMixin, AutoConfig, dict]],
@@ -79,10 +80,9 @@ def serialize_model(
                 json.dumps(config, indent=2)
             )
 
-    ts = TensorSerializer(open(f"{dir_prefix}.tensors", "wb"))
+    ts = TensorSerializer(f"{dir_prefix}.tensors")
     ts.write_module(model)
     ts.close()
-
 
 
 def load_model(
@@ -125,7 +125,8 @@ def load_model(
         try:
             with tempfile.TemporaryDirectory() as dir:
                 open(os.path.join(dir, "config.json"), "w").write(
-                    stream_io.open_stream(config_uri).read().decode("utf-8"))
+                    stream_io.open_stream(config_uri).read().decode("utf-8")
+                )
                 config = configclass.from_pretrained(dir)
                 config.gradient_checkpointing = True
         except ValueError:
@@ -160,7 +161,6 @@ def load_model(
     return model
 
 
-
 def df_main(args: argparse.Namespace) -> None:
     output_prefix = args.output_prefix
     print("MODEL PATH:", args.input_directory)
@@ -174,7 +174,6 @@ def df_main(args: argparse.Namespace) -> None:
 
     logger.info("Serializing model")
     logger.info("GPU: " + utils.get_gpu_name())
-    logger.info("GPU RAM: " + utils.get_vram_usage_str())
     logger.info("PYTHON USED RAM: " + utils.get_mem_usage())
 
     serialize_model(
@@ -237,7 +236,6 @@ def hf_main(args):
 
     logger.info("Serializing model")
     logger.info("GPU: " + utils.get_gpu_name())
-    logger.info("GPU RAM: " + utils.get_vram_usage_str())
     logger.info("PYTHON USED RAM: " + utils.get_mem_usage())
 
     serialize_model(model, model_config, output_prefix)

@@ -11,8 +11,6 @@ setup(
     install_requires=[
         'torch>=1.9.0',
         'protobuf>=3.19.5',
-        'diffusers==0.11.1',
-        'transformers==4.21.1',
     ],
     classifiers=[
         'Programming Language :: Python :: 3',
@@ -20,9 +18,4 @@ setup(
         'Operating System :: OS Independent',
     ],
     python_requires='>=3.6',
-    entry_points={
-        'console_scripts': [
-            'tensorizer = tensorizer.tensorizer:main',
-        ],
-    },
 )
