@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 class TensorType(Enum):
     PARAM = 0
     BUFFER = 1
-    STATEDICT = 2
+    STATE_DICT = 2
 
 
 TENSORIZER_VERSION = 1
@@ -581,7 +581,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 module.register_parameter(attr, param)
             elif entry["type"] is TensorType.BUFFER:
                 module.register_buffer(attr, param)
-            elif entry["type"] is TensorType.STATEDICT:
+            elif entry["type"] is TensorType.STATE_DICT:
                 raise NotImplementedError(
                     "This was serialized using the write_state_dict() method, and"
                     " cannot be loaded using the load_tensors() method. Use the"
@@ -601,7 +601,7 @@ class TensorSerializer:
     def __init__(
             self,
             file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO,
-            str, bytes, os.PathLike, int],
+                            str, bytes, os.PathLike, int],
             compress_tensors: bool = False) -> None:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "wb+")
@@ -904,7 +904,7 @@ class TensorSerializer:
 
         typ = {TensorType.PARAM: "p",
                TensorType.BUFFER: "b",
-               TensorType.STATEDICT: "sd"}[tensor_type]
+               TensorType.STATE_DICT: "sd"}[tensor_type]
 
         if self.compress_tensors:
             comp_report = (
@@ -941,4 +941,4 @@ class TensorSerializer:
         """
         idx = 0
         for name, param in state_dict.items():
-            self.write_tensor(idx, name, TensorType.STATEDICT, param)
+            self.write_tensor(idx, name, TensorType.STATE_DICT, param)
