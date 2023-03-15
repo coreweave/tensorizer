@@ -367,12 +367,12 @@ class TensorDeserializer:
             # Read the hash.
             hash_begin = hash_idx + 2
             hash_end = hash_begin + hash_size
-            hash_bytes = b[hash_begin:hash_end]
+            hash_bytes: bytes = b[hash_begin:hash_end]
             # Add the hash to the list.
-            hash_entry: TensorHash = {
-                "type": hash_type,
-                "hash": hash_bytes,
-            }
+            hash_entry = TensorHash(
+                type=HashType(hash_type),
+                hash=hash_bytes,
+            )
             hash_idx = hash_end
             hashes.append(hash_entry)
 
