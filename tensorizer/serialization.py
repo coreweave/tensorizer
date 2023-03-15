@@ -468,7 +468,10 @@ class TensorDeserializer:
         if dtype is not None and arr.dtype != "bool" and arr.dtype != dtype:
             arr = arr.astype(dtype)
         if isinstance(arr, torch.nn.Parameter):
-            return arr.to(device)
+            arr.data = arr.data.to(device)
+            if arr.grad is not None:
+                arr.grad = arr.grad.to(device)
+            return arr
         gradient = arr.dtype.kind in ("f", "c")
 
         return torch.nn.Parameter(
