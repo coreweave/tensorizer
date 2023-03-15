@@ -25,14 +25,13 @@ import torch
 import typing
 import logging
 import tempfile
-import regex
 import hashlib
 import zlib
 import ctypes
 cudart = torch.cuda.cudart()
 
 from collections import OrderedDict
-from typing import Optional, Tuple, Union, List, Iterator, Dict
+from typing import Optional, Tuple, Union, List, Iterator, Dict, Callable, Any
 
 lz4 = None
 
@@ -81,8 +80,9 @@ class TensorDeserializer(collections.abc.Mapping):
         file_obj: A file-like object to read from. It can also be a string
             representing a path to a file or an HTTP/HTTPS/S3 URI.
         device: The device to load the tensors to.
-        pattern: A regex pattern to match tensor names against. If None, all
-            tensors will be loaded.
+        filter_func: A function (tensor_name: str) -> bool that returns True
+            if a tensor should be loaded, or False if it should be skipped.
+            If None, all tensors are loaded.
         dtype: The dtype to load the tensors as. If None, the dtype will be
             inferred from the file.
         on_demand: If True, tensors will be loaded on demand. If False, all
@@ -98,7 +98,7 @@ class TensorDeserializer(collections.abc.Mapping):
             self,
             file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO, str],
             device: Union[torch.device, str, None] = None,
-            pattern: Union[regex.Pattern, str, None] = None,
+            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
             dtype: Union[torch.dtype, str, None] = None,
             on_demand: bool = False,
             plaid_mode: bool = False):
@@ -140,16 +140,11 @@ class TensorDeserializer(collections.abc.Mapping):
         # Read the number of tensors
         self._tensors = struct.unpack("<Q", self._file.read(8))[0]
 
-        # The pattern is a regex that matches the tensor names to read and expose.
-        if isinstance(pattern, str):
-            pattern = regex.compile(pattern)
-        self._pattern = pattern
-
         # Read the metadata index of tensors. This is a list of offsets into the
-        # file where the per-tensor data is stored. pattern is a regex that
-        # matches the tensor names to read. If pattern is None, all tensors are
-        # read.
-        self._read_metadatas(pattern)
+        # file where the per-tensor data is stored. filter_func is a test that
+        # determines the tensor names to read. If filter_func is None,
+        # all tensors are read.
+        self._read_metadatas(filter_func)
 
         # If device is None, use the current device, otherwise use the given
         # device.
@@ -163,7 +158,7 @@ class TensorDeserializer(collections.abc.Mapping):
 
         # We calculate the total tensor bytes here so that we can use mmap, based
         # on the total size of the tensors that we're going to read, filtered by
-        # the pattern.
+        # the filter_func.
         self.total_tensor_bytes = 0
         self._largest_tensor_bytes = 0
         for name, metadata in self._metadata.items():
@@ -204,7 +199,7 @@ class TensorDeserializer(collections.abc.Mapping):
 
         if not on_demand:
             self._cache = self._generate_state_dict(device=device,
-                                                    pattern=pattern,
+                                                    filter_func=filter_func,
                                                     dtype=dtype)
         else:
             self._cache = OrderedDict.fromkeys(self._metadata.keys())
@@ -277,12 +272,10 @@ class TensorDeserializer(collections.abc.Mapping):
             shape=shape,
         )
 
-    def _read_metadatas(self, pattern: Union[regex.Pattern, str, None]):
+    def _read_metadatas(self, filter_func: Optional[Callable[[str], Union[bool, Any]]]):
         """
         Read the metadata of tensors into self._metadata.
         """
-        if isinstance(pattern, str):
-            pattern = regex.compile(pattern)
 
         # Read metadata size.
         self._metadata_size = struct.unpack("<Q", self._file.read(8))[0]
@@ -292,7 +285,7 @@ class TensorDeserializer(collections.abc.Mapping):
 
         for i in range(self._tensors):
             metadata = self._read_metadata(metadata_stream)
-            if pattern is None or pattern.match(metadata["name"]):
+            if filter_func is None or filter_func(metadata["name"]):
                 self._metadata[metadata["name"]] = metadata
 
     @staticmethod
@@ -410,7 +403,7 @@ class TensorDeserializer(collections.abc.Mapping):
 
     def read_tensors(
             self,
-            pattern: Union[regex.Pattern, str, None] = None,
+            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
             num_tensors: int = -1,
     ) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
         """
@@ -422,8 +415,6 @@ class TensorDeserializer(collections.abc.Mapping):
         data. It assumes that the file pointer is already at the beginning
         of the tensor data that it should read.
         """
-        if isinstance(pattern, str):
-            pattern = regex.compile(pattern)
 
         try:
             tensors_read = 0
@@ -472,8 +463,8 @@ class TensorDeserializer(collections.abc.Mapping):
                 hashes = self._decode_hashes(headers[hashes_begin + 2: hashes_end])
 
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
-                # Check if the name matches the pattern, drop if it doesn't.
-                if pattern is not None and not pattern.match(name):
+                # Check if the name passes the filter_func, drop if it doesn't.
+                if filter_func is not None and not filter_func(name):
                     self._file.seek(data_length, io.SEEK_CUR)
                     continue
 
@@ -524,7 +515,7 @@ class TensorDeserializer(collections.abc.Mapping):
             self,
             device=utils.get_device(),
             dtype: Optional[str] = None,
-            pattern: Union[regex.Pattern, str, None] = None,
+            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
     ) -> OrderedDict:
         """
         Load the tensors in this Tensorizer object into a state_dict.
@@ -532,16 +523,16 @@ class TensorDeserializer(collections.abc.Mapping):
         :param device: The device to load the tensors onto.
         :param dtype: The dtype to load the tensors as. Defaults to None, which
             means the dtype is not changed from the serialized dtype.
-        :param pattern: A regex pattern to match against the tensor names, if
-            None, all tensors are loaded. If the pattern doesn't match, the
-            tensor is skipped.
+        :param filter_func: A function (tensor_name: str) -> bool that returns True
+            if a tensor should be loaded, or False if it should be skipped.
+            If None, all tensors are loaded.
         :return:
         """
         if self._file.closed:
             raise IOError("IO closed, instantiate if you want to load again.")
 
         d = OrderedDict()
-        for idx, typ, name, arr in self.read_tensors(pattern=pattern):
+        for idx, typ, name, arr in self.read_tensors(filter_func=filter_func):
             d[name] = self._to_torch_parameter(arr, dtype, device)
         self.total_tensor_bytes = self._file.tell()
         self._file.close()
@@ -552,7 +543,7 @@ class TensorDeserializer(collections.abc.Mapping):
             m: torch.nn.Module,
             device=utils.get_device(),
             dtype: Optional[str] = None,
-            pattern: Union[regex.Pattern, str, None] = None,
+            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
     ) -> int:
         """
         Given `m`, a torch.nn.Module, load the associate tensors in this
@@ -566,7 +557,7 @@ class TensorDeserializer(collections.abc.Mapping):
         tensor_ct = 0
 
         for name in self.keys():
-            if pattern is not None and not pattern.match(name):
+            if filter_func is not None and not filter_func(name):
                 continue
             obj_path, attr = name.rsplit(".", 1)
             module: torch.nn.Module = modules[obj_path]

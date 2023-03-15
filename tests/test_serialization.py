@@ -2,6 +2,7 @@ import gc
 import os
 import tempfile
 import unittest
+import re
 from typing import Tuple
 
 import torch
@@ -133,3 +134,60 @@ class TestDeserialization(unittest.TestCase):
             _ = deserialized[keys[0]]
 
         deserialized.close()
+
+    def test_filter_func(self):
+        # These two filters should produce identical results
+        pattern = re.compile(r"transformer\.h\.0.*")
+
+        def custom_check(tensor_name: str) -> bool:
+            return tensor_name.startswith("transformer.h.0")
+
+        with self.subTest(msg="Testing no filter_func"):
+            in_file = open(self._serialized_model_path, "rb")
+            deserialized = TensorDeserializer(in_file,
+                                              device="cuda",
+                                              filter_func=None)
+            all_keys = set(deserialized.keys())
+            assert all_keys, "Deserializing the model with no filter_func" \
+                             " loaded an empty set of tensors"
+            check_deserialized(deserialized, model_name)
+            deserialized.close()
+
+        assert (
+            any(map(custom_check, all_keys))
+            and not all(map(custom_check, all_keys))
+        ), "The filter_func test cannot continue" \
+           " because the filter_func used in the test" \
+           " does not appear in the test model," \
+           " or matches all tensor names." \
+           " Update the pattern and custom_check" \
+           " to use more informative filtering criteria." \
+           "\n\nTensors present in the model: " + " ".join(all_keys)
+
+        with self.subTest(msg="Testing regex filter_func"):
+            in_file = open(self._serialized_model_path, "rb")
+            deserialized = TensorDeserializer(in_file,
+                                              device="cuda",
+                                              filter_func=pattern.match)
+            regex_keys = set(deserialized.keys())
+            # Test that the deserialized tensors form a proper,
+            # non-empty subset of the original list of tensors.
+            assert regex_keys and regex_keys < all_keys
+            assert all(pattern.match(name) for name in regex_keys)
+            check_deserialized(deserialized, model_name)
+            deserialized.close()
+
+        with self.subTest(msg="Testing custom filter_func"):
+            in_file = open(self._serialized_model_path, "rb")
+            deserialized = TensorDeserializer(in_file,
+                                              device="cuda",
+                                              filter_func=custom_check)
+            custom_keys = set(deserialized.keys())
+            assert custom_keys and custom_keys < all_keys
+            assert all(custom_check(name) for name in custom_keys)
+            check_deserialized(deserialized, model_name)
+            deserialized.close()
+
+        with self.subTest(msg="Testing that equivalent filters"
+                              " produce equivalent results"):
+            assert regex_keys == custom_keys != all_keys
