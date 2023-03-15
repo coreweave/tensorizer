@@ -2,6 +2,8 @@
 # serialization.py                                                   Wes Brown
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
+import hashlib
+import zlib
 
 # try to import UNIX only dependencies
 try:
@@ -17,6 +19,8 @@ import os
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 import mmap
+# Python doesn't know about this.
+MADV_PAGEOUT = 21
 import numpy
 import struct
 import torch
@@ -54,6 +58,15 @@ class TensorEntry(typing.TypedDict):
     length: int
     dtype: str
     shape: List[int]
+
+
+class HashType(Enum):
+    CRC32 = 0
+    SHA256 = 1
+
+class TensorHash(typing.TypedDict):
+    type: HashType
+    hash: bytes
 
 
 class TensorDeserializer:
@@ -99,17 +112,31 @@ class TensorDeserializer:
         # Skip 32-byte hash (unused)
         self._file.read(32)
 
-        # Read total size of file
+        # Read the total size of the file
+        self.total_file_bytes = struct.unpack("<Q", self._file.read(8))[0]
+
+        # Read total size of tensor data
         self.total_tensor_bytes = struct.unpack("<Q", self._file.read(8))[0]
 
         # Read the number of tensors
         self._tensors = struct.unpack("<Q", self._file.read(8))[0]
 
-        # Read the metadata index of tensors.
-        self._read_metadatas()
+        # The pattern is a regex that matches the tensor names to read and expose.
+        if isinstance(pattern, str):
+            pattern = regex.compile(pattern)
+        self._pattern = pattern
 
+        # Read the metadata index of tensors. This is a list of offsets into the
+        # file where the per-tensor data is stored. pattern is a regex that
+        # matches the tensor names to read. If pattern is None, all tensors are
+        # read.
+        self._read_metadatas(pattern)
+
+        # If device is None, use the current device, otherwise use the given
+        # device.
         self._device = device
 
+        # If dtype is not None, convert all tensors to this dtype if possible.
         self._dtype = dtype
 
         if oneshot and use_mmap:
@@ -118,16 +145,33 @@ class TensorDeserializer:
             raise ValueError("Cannot use preload with oneshot")
         elif oneshot and device == "cpu":
             raise ValueError("Cannot use cpu device with oneshot")
-        self._oneshot = oneshot
-        self._prior_key = None
+        self._oneshot: bool = oneshot
+        self._prior_key: Optional[str] = None
+
+        # We calculate the total tensor bytes here so that we can use mmap, based
+        # on the total size of the tensors that we're going to read, filtered by
+        # the pattern.
+        self.total_tensor_bytes = 0
+        for name, metadata in self._metadata.items():
+            self.total_tensor_bytes += metadata["data_length"]
 
         self._mmap = None
+        self._mmap_allocated = 0
         if use_mmap:
             self._mmap_file = tempfile.TemporaryFile("wb+")
-            self._mmap_file.truncate(self.total_tensor_bytes)
-            self._mmap = mmap.mmap(self._mmap_file.fileno(), self.total_tensor_bytes)
+            #self._mmap_file.truncate(self.total_tensor_bytes)
+            self._mmap_file.write(b'\0' * self.total_tensor_bytes)
+            self._mmap_file.seek(0)
+            self._mmap = mmap.mmap(self._mmap_file.fileno(),
+                                   self.total_tensor_bytes)
 
+        # Our cache of tensors. This is a dict of name -> tensor. If preload is
+        # True, we load all filtered tensors into memory. Otherwise, we load tensors
+        # on demand.
         self._cache: typing.OrderedDict[str, Union[torch.Tensor, None, bool]]
+
+        # The offset in the file where the tensor data begins.
+        self._tensors_begin = self._file.tell()
 
         if oneshot and preload:
             raise ValueError("Cannot use preload with oneshot")
@@ -136,10 +180,7 @@ class TensorDeserializer:
                                                     pattern=pattern,
                                                     dtype=dtype)
         else:
-            filtered_keys = self._metadata.keys()
-            if pattern is not None:
-                filtered_keys = filter(pattern.match, filtered_keys)
-            self._cache = OrderedDict.fromkeys(filtered_keys)
+            self._cache = OrderedDict.fromkeys(self._metadata.keys())
 
     def __del__(self):
         self.close()
@@ -192,10 +233,13 @@ class TensorDeserializer:
             shape=shape,
         )
 
-    def _read_metadatas(self):
+    def _read_metadatas(self, pattern: Union[regex.Pattern, str, None]):
         """
         Read the metadata of tensors into self._metadata.
         """
+        if isinstance(pattern, str):
+            pattern = regex.compile(pattern)
+
         # Read metadata size.
         self._metadata_size = struct.unpack("<Q", self._file.read(8))[0]
         metadata_encoded = self._file.read(self._metadata_size)
@@ -204,7 +248,8 @@ class TensorDeserializer:
 
         for i in range(self._tensors):
             metadata = self._read_metadata(metadata_stream)
-            self._metadata[metadata["name"]] = metadata
+            if pattern is None or pattern.match(metadata["name"]):
+                self._metadata[metadata["name"]] = metadata
 
     @staticmethod
     def _read_shapes(obj, num_elems) -> List[int]:
@@ -260,6 +305,37 @@ class TensorDeserializer:
     def items(self):
         return [(key, self[key]) for key in self.keys()]
 
+    def _decode_hashes(self, b: bytes) -> List[TensorHash]:
+        """
+        Decode the hashes from given bytes.
+        """
+        hashes: List[TensorHash] = []
+
+        # Read the number of hashes.
+        num_hashes = struct.unpack("<B", b[0:1])[0]
+
+        hash_idx = 1
+        # Read the hashes.
+        for i in range(num_hashes):
+            # Read the hash type.
+            hash_type = struct.unpack("<B", b[hash_idx:hash_idx+1])[0]
+            # Read the size of the hash.
+            hash_size = struct.unpack("<B", b[hash_idx+1:hash_idx+2])[0]
+            # Read the hash.
+            hash_begin = hash_idx + 2
+            hash_end = hash_begin + hash_size
+            hash_bytes = b[hash_begin:hash_end]
+            # Add the hash to the list.
+            hash_entry: TensorHash = {
+                "type": hash_type,
+                "hash": hash_bytes,
+            }
+            hash_idx = hash_end
+            hashes.append(hash_entry)
+
+        return hashes
+
+
     def read_tensors(
             self,
             pattern: Union[regex.Pattern, str, None] = None,
@@ -269,6 +345,10 @@ class TensorDeserializer:
         A generator that deserializes tensors and returns the `module_idx`,
         `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
         represents the tensor.
+
+        Note that this function does not seek to the beginning of the tensor
+        data. It assumes that the file pointer is already at the beginning
+        of the tensor data that it should read.
         """
         if isinstance(pattern, str):
             pattern = regex.compile(pattern)
@@ -295,17 +375,30 @@ class TensorDeserializer:
                 shape_len = struct.unpack(
                     "<B", headers[dtype_end: dtype_end + 1]
                 )[0]
-                # the shape elements are <I so we read 4 bytes. _read_shapes takes in
+                # the shape elements are <I, so we read 4 bytes. _read_shapes takes in
                 # the header object and the number of elements in the shape.
                 #
                 # the amount of bytes for the shape is 4 * the number of elements in
                 # the shape. so, we need to read 4 * shape_len bytes after the
                 # dtype end + 1 byte for the shape length. sort of convoluted, but it
                 # works.
+                shape_begin = dtype_end + 1
+                shape_end = shape_begin + (4 * shape_len)
                 shape_list = self._read_shapes(
-                    headers[dtype_end + 1: (dtype_end + 1) + (4 * shape_len)],
+                    headers[shape_begin:shape_end],
                     shape_len,
                 )
+
+                # Read our hashes in. We need to read the hashes size, then read the
+                # hash bytes.
+                #
+                # TODO: Actually verify the hashes on request.
+                hashes_begin = shape_end
+                hashes_sz = struct.unpack("<H",
+                                          headers[hashes_begin: hashes_begin + 2])[0]
+                hashes_end = hashes_begin + hashes_sz
+                hashes = self._decode_hashes(headers[hashes_begin + 2: hashes_end])
+
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
                 # Check if the name matches the pattern, drop if it doesn't.
                 if pattern is not None and not pattern.match(name):
@@ -314,10 +407,10 @@ class TensorDeserializer:
 
                 mv: memoryview
                 if self._mmap is not None:
-                    mmap_offset = self._mmap.tell()
-                    mv = memoryview(self._mmap)[mmap_offset:data_length+mmap_offset]
+                    mmap_offset = self._mmap_allocated
+                    mv = memoryview(self._mmap)[mmap_offset:data_length + mmap_offset]
                     self._file.readinto(mv)
-                    self._mmap.seek(data_length, io.SEEK_CUR)
+                    self._mmap_allocated += data_length
                 elif self._oneshot:
                     if data_length > len(self._buffer):
                         self._buffer = bytearray(data_length)
@@ -382,7 +475,7 @@ class TensorDeserializer:
         self._file.close()
         return d
 
-    def load_tensors(
+    def load_into_module(
             self,
             m: torch.nn.Module,
             device=utils.get_device(),
@@ -430,7 +523,7 @@ class TensorSerializer:
     def __init__(
             self,
             file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO,
-                            str, bytes, os.PathLike, int],
+            str, bytes, os.PathLike, int],
             compress_tensors: bool = False) -> None:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "wb+")
@@ -464,6 +557,10 @@ class TensorSerializer:
         self._size_loc = self._file.tell()
         self._file.write(struct.pack("<Q", 0))
 
+        # Reserve 8 bytes for the total size of tensor data.
+        self._tensor_size_loc = self._file.tell()
+        self._file.write(struct.pack("<Q", 0))
+
         # Reserve the next 8 bytes for the total number of tensors.
         self._tensor_ct_loc = self._file.tell()
         self._file.write(struct.pack("<Q", 0))
@@ -484,7 +581,7 @@ class TensorSerializer:
     @staticmethod
     def _dump_shape(obj) -> bytes:
         """
-        Returns shape of the tensor
+        Returns shape of the tensor as an encoded byte string.
         """
         bstr = struct.pack("<B", len(obj))
         for i in obj:
@@ -493,16 +590,9 @@ class TensorSerializer:
 
     def close(self) -> None:
         """
-        Finalizes the serialization with a zero-length field, and closes out
-        the file.
+        Finalizes the serialization and closes the file.
         """
-        self._file.write(struct.pack("<Q", 0))
-        # Write the total number of tensors.
-        self._file.seek(self._tensor_ct_loc)
-        self._file.write(struct.pack("<Q", self._tensors))
-        # Write the total size of the file.
-        self._file.seek(self._size_loc)
-        self._file.write(struct.pack("<Q", self.total_tensor_bytes))
+        self._sync_prologue_state()
 
         final_sz = self._file.tell()
         self._file.close()
@@ -514,6 +604,31 @@ class TensorSerializer:
             logger.info(f"Uncomp'd bytes: {self.total_tensor_bytes}")
             logger.info(f"Comp'd bytes: {self.total_compressed_tensor_bytes}")
             logger.info(f"Ratio: {compression_ratio:.2f}")
+
+    def _sync_prologue_state(self):
+        """
+        This is called after the tensor has been written to the file, and
+        ensures that the file is in a consistent state.
+        :return:
+        """
+        curr = self._file.tell()
+
+        # Write our zero-length field, that indicates that this is the last
+        # tensor. This will be overwritten if another tensor is written.
+        self._file.write(struct.pack("<Q", 0))
+        # Write the total number of tensors.
+        self._file.seek(self._tensor_ct_loc)
+        self._file.write(struct.pack("<Q", self._tensors))
+        # Write our total file size.
+        self._file.seek(self._size_loc)
+        self._file.write(struct.pack("<Q", curr))
+        # Write the total bytes of tensor data written.
+        self._file.seek(self._size_loc)
+        self._file.write(struct.pack("<Q", self.total_tensor_bytes))
+
+        # Reset our file pointer to the end of the file, minus the zero-length
+        # field.
+        self._file.seek(curr)
 
     def write_tensor(
             self,
@@ -538,6 +653,12 @@ class TensorSerializer:
            []{uint8                         shape_elem_type,
               union{uint8, uint16, uint32}  shape_elem_sz,
              }                              shape_elements,
+           uint16                           hashes_sz,
+           uint8                            num_hashes,
+           []{uint8                         hash_type,
+              uint8                         hash_sz,
+              []char                        hash_str,
+             }                              hashes,
            uint64                           tensor_sz,
            []byte                           tensor }
         """
@@ -573,9 +694,39 @@ class TensorSerializer:
         shape_bytes = self._dump_shape(tensor.shape)
         self._file.write(shape_bytes)
 
+        # Reserve room for our tensor hashes.
+        hash_loc = self._file.tell()
+        # Reserve the length of the hash data structures.
+        self._file.write(struct.pack("<H", 0))
+        # Write the number of hashes we're going to write.
+        self._file.write(struct.pack("<B", 2))
+        # Reserve room for the hashes.
+        # .. first, CRC32.
+        self._file.write(struct.pack("<B", HashType.CRC32.value))
+        # ... length of CRC32.
+        self._file.write(struct.pack("<B", 4))
+        # ... and reserve for the actual CRC32.
+        crc32_loc = self._file.tell()
+        self._file.write(struct.pack("<I", 0))
+        # .. second, SHA256.
+        self._file.write(struct.pack("<B", HashType.SHA256.value))
+        # ... length of SHA256.
+        self._file.write(struct.pack("<B", 32))
+        # ... and reserve for the actual SHA256.
+        sha256_loc = self._file.tell()
+        self._file.write(struct.pack("<32B", *[0] * 32))
+        hash_end = self._file.tell()
+        hashes_sz = hash_end - hash_loc - 2
+
         # Reserve room for our 64-bit tensor length
         tensor_size_loc = self._file.tell()
         self._file.write(struct.pack("<Q", 0))
+        tensor_startpos = self._file.tell()
+
+        # Write the total number of bytes for our hash data structures.
+        self._file.seek(hash_loc)
+        self._file.write(struct.pack("<H", hashes_sz))
+        self._file.seek(tensor_startpos)
 
         tensor_raw_sz = 0
         tensor_compressed_sz = 0
@@ -600,7 +751,6 @@ class TensorSerializer:
                 self.total_compressed_tensor_bytes += tensor_raw_sz
 
         # Serialize our tensors
-        tensor_startpos = self._file.tell()
         tensor.tofile(self._file)
         tensor_endpos = self._file.tell()
 
@@ -609,7 +759,7 @@ class TensorSerializer:
         # We write this signed, so that we can use the signedness as an
         # indicator of possible tensor compression in the future.
         tensor_size = tensor_endpos - tensor_startpos
-        self._file.write(struct.pack("<Q", tensor_size))
+        self._file.write(struct.pack("<q", tensor_size))
         self.total_tensor_bytes += tensor_size
 
         # Write our data structure header size.
@@ -634,9 +784,27 @@ class TensorSerializer:
         if self._file.tell() > self._metadata_end:
             raise RuntimeError("Metadata overflow")
 
+        # Read our header and tensor back in to calculate the hashes.
+        self._file.seek(ds_header_begin)
+        ds_header_bytes = self._file.read(ds_header_size)
+        tensor_bytes = self._file.read(tensor_endpos - tensor_startpos)
+
+        # Write our hashes out.
+        crc32 = zlib.crc32(ds_header_bytes + tensor_bytes)
+        self._file.seek(crc32_loc)
+        self._file.write(struct.pack("<I", crc32))
+
+        sha256 = hashlib.sha256(ds_header_bytes + tensor_bytes).digest()
+        self._file.seek(sha256_loc)
+        self._file.write(sha256)
+
         # Move to the end of our serialized tensor to prepare for the next one.
         self._file.seek(tensor_endpos)
         self._tensors += 1
+
+        # Update our prolog and epilog.
+        self._sync_prologue_state()
+
         ds_size = self._file.tell() - ds_header_begin
         ds_bytes = f"{ds_size:,} bytes"
 

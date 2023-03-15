@@ -103,8 +103,8 @@ class TestDeserialization(unittest.TestCase):
         deserialized = TensorDeserializer(in_file,
                                           device="cuda",
                                           use_mmap=True)
-        after_deserialization = utils.get_mem_usage()
         check_deserialized(deserialized, model_name)
+        after_deserialization = utils.get_mem_usage()
         deserialized.close()
         print(f"Before deserialization: {before_deserialization}")
         print(f"After deserialization:  {after_deserialization}")
