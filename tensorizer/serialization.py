@@ -300,12 +300,7 @@ class TensorDeserializer(collections.abc.Mapping):
         """
         Read the tensor shapes.
         """
-        bstr = obj
-        shape = []
-        for i in range(num_elems):
-            shape.append(struct.unpack("<I", bstr[0:4])[0])
-            bstr = bstr[4:]
-        return shape
+        return list(struct.unpack(f"<{num_elems}I", obj))
 
     @property
     def total_bytes_read(self) -> int:
