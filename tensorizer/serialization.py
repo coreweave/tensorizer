@@ -65,6 +65,7 @@ class HashType(Enum):
     CRC32 = 0
     SHA256 = 1
 
+
 class TensorHash(typing.TypedDict):
     type: HashType
     hash: bytes
@@ -101,8 +102,9 @@ class TensorDeserializer:
             on_demand: bool = False,
             plaid_mode: bool = False):
         if isinstance(file_obj, str):
-            self._file = stream_io.open_stream(file_obj, "rb+")
+            self._file = stream_io.open_stream(file_obj, "rb")
         else:
+            self._mode_check(file_obj)
             self._file = file_obj
         self.total_compressed_tensor_bytes = 0
         self.read_bytes = 0
@@ -205,6 +207,21 @@ class TensorDeserializer:
                                                     dtype=dtype)
         else:
             self._cache = OrderedDict.fromkeys(self._metadata.keys())
+
+    @staticmethod
+    def _mode_check(file_obj: io.IOBase) -> None:
+        try:
+            readable = file_obj.readable()
+        except AttributeError:
+            # If file_obj doesn't implement the full io.IOBase interface
+            # and checking is not possible, assume it's fine
+            readable = True
+        if isinstance(file_obj, io.TextIOBase) or not readable:
+            mode = getattr(file_obj, "mode", "")
+            raise ValueError(
+                'TensorSerializer\'s file_obj must be readable '
+                'and in binary mode (mode="rb"{})'
+                .format(mode and f', current mode="{mode}"'))
 
     def __del__(self):
         self.close()
@@ -360,7 +377,6 @@ class TensorDeserializer:
             hashes.append(hash_entry)
 
         return hashes
-
 
     def read_tensors(
             self,
@@ -552,6 +568,7 @@ class TensorSerializer:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "wb+")
         else:
+            self._mode_check(file_obj)
             self._file = file_obj
         self._tensors = 0
         self.total_tensor_bytes = 0
@@ -598,6 +615,21 @@ class TensorSerializer:
         self._metadata_end = self._metadata_loc + metadata_size
 
         self._tensor_index: List[TensorEntry] = []
+
+    @staticmethod
+    def _mode_check(file_obj: io.IOBase) -> None:
+        try:
+            read_write = file_obj.writable() and file_obj.readable()
+        except AttributeError:
+            # If file_obj doesn't implement the full io.IOBase interface
+            # and checking is not possible, assume it's fine
+            read_write = True
+        if isinstance(file_obj, io.TextIOBase) or not read_write:
+            mode = getattr(file_obj, "mode", "")
+            raise ValueError(
+                'TensorSerializer\'s file_obj must be readable, writable, '
+                'and in binary mode (mode="wb+"{})'
+                .format(mode and f', current mode="{mode}"'))
 
     def __del__(self):
         self._file.close()
