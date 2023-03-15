@@ -514,9 +514,6 @@ class TensorDeserializer:
         Tensorizer object into the `torch.nn.Module`. Returns the number of tensors
         loaded into the module.
         """
-        if self._file.closed:
-            raise IOError("IO closed, instantiate if you want to load again.")
-
         modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
         for name, module in m.named_modules():
             modules[name] = module
