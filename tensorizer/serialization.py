@@ -525,7 +525,7 @@ class TensorDeserializer:
                 continue
             obj_path, attr = name.rsplit(".", 1)
             module: torch.nn.Module = modules[obj_path]
-            entry = self._tensors[name]
+            entry = self._metadata[name]
             param = self._to_torch_parameter(self.get(name), dtype, device)
             if entry["type"] is TensorType.PARAM:
                 module.register_parameter(attr, param)
