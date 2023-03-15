@@ -308,6 +308,7 @@ class TensorDeserializer:
             return self._cache[name]
 
         if name in self._metadata:
+            self._file.seek(self._metadata[name]["offset"])
             tensor_arr = next(self.read_tensors(num_tensors=1))[3]
             self._cache[name] = self._to_torch_parameter(tensor_arr,
                                                          self._dtype,
@@ -458,7 +459,7 @@ class TensorDeserializer:
             return
 
     def _to_torch_parameter(self,
-                            arr: numpy.ndarray,
+                            arr: Union[numpy.ndarray, torch.nn.Parameter],
                             dtype: Optional[str] = None,
                             device=utils.get_device()) -> torch.nn.Parameter:
         """
@@ -466,6 +467,8 @@ class TensorDeserializer:
         """
         if dtype is not None and arr.dtype != "bool" and arr.dtype != dtype:
             arr = arr.astype(dtype)
+        if isinstance(arr, torch.nn.Parameter):
+            return arr.to(device)
         gradient = arr.dtype.kind in ("f", "c")
 
         return torch.nn.Parameter(
@@ -519,21 +522,25 @@ class TensorDeserializer:
             modules[name] = module
 
         tensor_ct = 0
-        for idx, typ, name, arr in self.read_tensors(pattern=pattern):
-            param = self._to_torch_parameter(arr, dtype, device)
+
+        for name in self.keys():
+            if pattern is not None and not pattern.match(name):
+                continue
             obj_path, attr = name.rsplit(".", 1)
             module: torch.nn.Module = modules[obj_path]
-            if typ is TensorType.PARAM:
+            entry = self._tensors[name]
+            param = self._to_torch_parameter(self.get(name), dtype, device)
+            if entry["type"] is TensorType.PARAM:
                 module.register_parameter(attr, param)
-            elif typ is TensorType.BUFFER:
+            elif entry["type"] is TensorType.BUFFER:
                 module.register_buffer(attr, param)
-            elif typ is TensorType.STATEDICT:
+            elif entry["type"] is TensorType.STATEDICT:
                 raise NotImplementedError(
                     "This was serialized using the write_state_dict() method, and"
                     " cannot be loaded using the load_tensors() method. Use the"
                     " state_dict() method instead.")
             tensor_ct += 1
-        self.total_tensor_bytes = self._file.tell()
+
         self._file.close()
         return tensor_ct
 
