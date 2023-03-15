@@ -2,9 +2,6 @@
 # serialization.py                                                   Wes Brown
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
-import hashlib
-import zlib
-import ctypes
 
 # try to import UNIX only dependencies
 try:
@@ -15,6 +12,7 @@ except ImportError:
     resource = None
 
 from enum import Enum
+import collections.abc
 import io
 import os
 import tensorizer.stream_io as stream_io
@@ -28,6 +26,9 @@ import typing
 import logging
 import tempfile
 import regex
+import hashlib
+import zlib
+import ctypes
 cudart = torch.cuda.cudart()
 
 from collections import OrderedDict
@@ -71,14 +72,14 @@ class TensorHash(typing.TypedDict):
     hash: bytes
 
 
-class TensorDeserializer:
+class TensorDeserializer(collections.abc.Mapping):
     """
     Given a file-like object for read, deserialize tensors to a state_dict or a
     torch.nn.Module.
 
     Args:
         file_obj: A file-like object to read from. It can also be a string
-            representing a path to a file or a HTTP/HTTPS/S3 URI.
+            representing a path to a file or an HTTP/HTTPS/S3 URI.
         device: The device to load the tensors to.
         pattern: A regex pattern to match tensor names against. If None, all
             tensors will be loaded.
@@ -333,22 +334,55 @@ class TensorDeserializer:
         else:
             raise KeyError(f"Tensor {name} not found")
 
-    def get(self, name, default=None):
-        try:
-            return self[name]
-        except KeyError:
-            return default
+    # To implement collections.abc.Mapping, this class needs to define:
+    # 1. __getitem__(key)
+    # 2. __iter__()
+    # 3. __len__()
+    #
+    # It then inherits efficient default implementations for:
+    # 1. get(key)
+    # 2. keys()
+    # 3. items()
+    # 4. values()
+    # It also inherits __contains__(key), but it isn't efficient.
+    # The default __contains__ implementation uses __getitem__,
+    # so it loads tensor data unnecessarily. Instead, we can
+    # check self._metadata with a simple dict lookup.
+    #
+    # Significant features of the defaults:
+    # - values() -> collections.abc.ValuesView:
+    #   - Doesn't need to load all the data up front
+    #   - Returns a collection with a lazy __iter__
+    #     - Only defers to our __getitem__ exactly when required
+    #   - Implements __contains__ by iterating over itself with linear search
+    # - items() -> collections.abc.ItemsView:
+    #   - Also doesn't need to load data up front
+    #   - Implements __iter__ as basically zip(keys(), values())
+    #   - Implements __contains__ with __getitem__ since it knows where to look
+    #     and needs the data anyway
+    # In summary, ignoring the (still efficient) __contains__, these are simply
+    # lazy iterables over the respective elements from this parent mapping.
+
+    def __iter__(self):
+        # iter() on a mapping returns an iterator of only keys
+        yield from self._metadata
+
+    def __len__(self):
+        return len(self._metadata)
+
+    def __contains__(self, key: str):
+        return key in self._metadata
 
     def keys(self):
+        # We override keys() because dict_keys can be slightly more efficient
+        # than an extra collections.abc.KeysView wrapper.
+        # Technically this makes mapping.keys().mapping invalid on Python 3.10+
+        # but it is not intended to be supported anyway,
+        # so treat it as not implemented.
         return self._metadata.keys()
 
-    def values(self):
-        return [self[key] for key in self.keys()]
-
-    def items(self):
-        return [(key, self[key]) for key in self.keys()]
-
-    def _decode_hashes(self, b: bytes) -> List[TensorHash]:
+    @staticmethod
+    def _decode_hashes(b: bytes) -> List[TensorHash]:
         """
         Decode the hashes from given bytes.
         """
@@ -473,8 +507,8 @@ class TensorDeserializer:
         except EOFError:
             return
 
-    def _to_torch_parameter(self,
-                            arr: numpy.ndarray,
+    @staticmethod
+    def _to_torch_parameter(arr: numpy.ndarray,
                             dtype: Optional[str] = None,
                             device=utils.get_device()) -> torch.nn.Parameter:
         """
