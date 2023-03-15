@@ -4,6 +4,7 @@
 ##############################################################################
 import hashlib
 import zlib
+import ctypes
 
 # try to import UNIX only dependencies
 try:
@@ -19,15 +20,15 @@ import os
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 import mmap
-# Python doesn't know about this.
-MADV_PAGEOUT = 21
 import numpy
 import struct
+import time
 import torch
 import typing
 import logging
 import tempfile
 import regex
+cudart = torch.cuda.cudart()
 
 from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Iterator, Dict
@@ -73,6 +74,22 @@ class TensorDeserializer:
     """
     Given a file-like object for read, deserialize tensors to a state_dict or a
     torch.nn.Module.
+
+    Args:
+        file_obj: A file-like object to read from. It can also be a string
+            representing a path to a file or a HTTP/HTTPS/S3 URI.
+        device: The device to load the tensors to.
+        pattern: A regex pattern to match tensor names against. If None, all
+            tensors will be loaded.
+        dtype: The dtype to load the tensors as. If None, the dtype will be
+            inferred from the file.
+        on_demand: If True, tensors will be loaded on demand. If False, all
+            tensors will be loaded into memory up front.
+        plaid_mode: If True, tensors will be loaded extremely fast into the
+            target device. This is only supported on CUDA devices, and the
+            buffers are going to be inconsistent due to the extreme
+            naughtiness of reusing a backing buffer. This is only recommended
+            for use with inference, and not training.
     """
 
     def __init__(
@@ -81,19 +98,18 @@ class TensorDeserializer:
             device: Union[torch.device, str, None] = None,
             pattern: Union[regex.Pattern, str, None] = None,
             dtype: Union[torch.dtype, str, None] = None,
-            preload: bool = False,
-            use_mmap: bool = False,
-            oneshot: bool = False):
+            on_demand: bool = False,
+            plaid_mode: bool = False):
         if isinstance(file_obj, str):
             self._file = stream_io.open_stream(file_obj, "rb+")
         else:
             self._file = file_obj
         self.total_compressed_tensor_bytes = 0
         self.read_bytes = 0
-        self._buffer = bytearray(1024 * 1024)
         self._state_dict = None
         self._idx = 0
         self._metadata: Dict[str, TensorEntry] = {}
+        self._on_demand = on_demand
 
         # Read the magic
         magic = self._file.read(5)
@@ -139,43 +155,51 @@ class TensorDeserializer:
         # If dtype is not None, convert all tensors to this dtype if possible.
         self._dtype = dtype
 
-        if oneshot and use_mmap:
-            raise ValueError("Cannot use mmap with oneshot")
-        elif oneshot and preload:
-            raise ValueError("Cannot use preload with oneshot")
-        elif oneshot and device == "cpu":
-            raise ValueError("Cannot use cpu device with oneshot")
-        self._oneshot: bool = oneshot
+        self._plaid_mode: bool = plaid_mode
         self._prior_key: Optional[str] = None
 
         # We calculate the total tensor bytes here so that we can use mmap, based
         # on the total size of the tensors that we're going to read, filtered by
         # the pattern.
         self.total_tensor_bytes = 0
+        self._largest_tensor_bytes = 0
         for name, metadata in self._metadata.items():
             self.total_tensor_bytes += metadata["data_length"]
+            if metadata["data_length"] > self._largest_tensor_bytes:
+                self._largest_tensor_bytes = metadata["data_length"]
 
-        self._mmap = None
-        self._mmap_allocated = 0
-        if use_mmap:
-            self._mmap_file = tempfile.TemporaryFile("wb+")
-            #self._mmap_file.truncate(self.total_tensor_bytes)
-            self._mmap_file.write(b'\0' * self.total_tensor_bytes)
-            self._mmap_file.seek(0)
-            self._mmap = mmap.mmap(self._mmap_file.fileno(),
-                                   self.total_tensor_bytes)
+        # Allocate the buffer for the tensors. If we're not in on_demand mode,
+        # we'll allocate a buffer for all of the tensors. Otherwise, we'll
+        # allocate a buffer for the largest tensor.
+        self._buffer_addr = None
+        if not on_demand and not plaid_mode:
+            start_allocate = time.time()
+            self._buffer = mmap.mmap(-1,
+                                     self.total_tensor_bytes,
+                                     prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                                     flags=mmap.MAP_PRIVATE)
 
-        # Our cache of tensors. This is a dict of name -> tensor. If preload is
-        # True, we load all filtered tensors into memory. Otherwise, we load tensors
-        # on demand.
+            tb = ctypes.c_char * self.total_tensor_bytes
+            ctb = tb.from_buffer(self._buffer)
+            if self._device == "cuda":
+                self._buffer_addr = ctypes.addressof(ctb)
+                cudart.cudaHostRegister(self._buffer_addr,
+                                        self.total_tensor_bytes,
+                                        0)
+            end_allocate = time.time()
+            print(f"Memory allocate time: {end_allocate - start_allocate}")
+        else:
+            self._buffer = bytearray(self._largest_tensor_bytes)
+
+        self._allocated = 0
+
+        # Our cache of tensors. This is a dict of name -> tensor.
         self._cache: typing.OrderedDict[str, Union[torch.Tensor, None, bool]]
 
         # The offset in the file where the tensor data begins.
         self._tensors_begin = self._file.tell()
 
-        if oneshot and preload:
-            raise ValueError("Cannot use preload with oneshot")
-        elif preload:
+        if not on_demand:
             self._cache = self._generate_state_dict(device=device,
                                                     pattern=pattern,
                                                     dtype=dtype)
@@ -188,9 +212,11 @@ class TensorDeserializer:
     def close(self):
         # Don't throw an attribute error if these aren't defined yet,
         # e.g. if __init__ threw an error before defining both
-        if getattr(self, "_mmap", None) is not None:
-            self._mmap.close()
-            self._mmap_file.close()
+        if getattr(self, "_buffer", None) is not None:
+            if hasattr(self._buffer, "close"):
+                if self._device == "cuda" and self._buffer_addr:
+                    cudart.cudaHostUnregister(self._buffer_addr)
+                self._buffer.close()
         if getattr(self, "_file", None) is not None:
             self._file.close()
 
@@ -271,11 +297,11 @@ class TensorDeserializer:
             return self._file.tell()
 
     def __getitem__(self, name) -> torch.nn.Parameter:
-        if self._oneshot:
+        if self._plaid_mode:
             if self._prior_key is not None and self._prior_key != name:
                 self._cache[self._prior_key] = False
             if self._cache[name] is False:
-                raise RuntimeError(f"Tensor {name} already overwritten in oneshot mode")
+                raise RuntimeError(f"Tensor {name} already overwritten in plaid_mode")
             self._prior_key = name
 
         if name in self._cache and self._cache[name] is not None:
@@ -406,14 +432,12 @@ class TensorDeserializer:
                     continue
 
                 mv: memoryview
-                if self._mmap is not None:
-                    mmap_offset = self._mmap_allocated
-                    mv = memoryview(self._mmap)[mmap_offset:data_length + mmap_offset]
+                if not self._plaid_mode and not self._on_demand:
+                    mv = memoryview(self._buffer)[self._allocated:
+                                                  self._allocated + data_length]
                     self._file.readinto(mv)
-                    self._mmap_allocated += data_length
-                elif self._oneshot:
-                    if data_length > len(self._buffer):
-                        self._buffer = bytearray(data_length)
+                    self._allocated += data_length
+                elif self._plaid_mode:
                     mv = memoryview(self._buffer)
                     self._file.readinto(mv[:data_length])
                 else:
@@ -433,8 +457,8 @@ class TensorDeserializer:
         except EOFError:
             return
 
-    @staticmethod
-    def _to_torch_parameter(arr: numpy.ndarray,
+    def _to_torch_parameter(self,
+                            arr: numpy.ndarray,
                             dtype: Optional[str] = None,
                             device=utils.get_device()) -> torch.nn.Parameter:
         """
@@ -445,7 +469,7 @@ class TensorDeserializer:
         gradient = arr.dtype.kind in ("f", "c")
 
         return torch.nn.Parameter(
-            torch.as_tensor(arr, device=device), requires_grad=gradient
+            torch.from_numpy(arr).to(device), requires_grad=gradient
         )
 
     def _generate_state_dict(
@@ -786,15 +810,15 @@ class TensorSerializer:
 
         # Read our header and tensor back in to calculate the hashes.
         self._file.seek(ds_header_begin)
-        ds_header_bytes = self._file.read(ds_header_size)
-        tensor_bytes = self._file.read(tensor_endpos - tensor_startpos)
+        bytes_to_hash = self._file.read(ds_header_size)
+        bytes_to_hash += self._file.read(tensor_endpos - tensor_startpos)
 
         # Write our hashes out.
-        crc32 = zlib.crc32(ds_header_bytes + tensor_bytes)
+        crc32 = zlib.crc32(bytes_to_hash)
         self._file.seek(crc32_loc)
         self._file.write(struct.pack("<I", crc32))
 
-        sha256 = hashlib.sha256(ds_header_bytes + tensor_bytes).digest()
+        sha256 = hashlib.sha256(bytes_to_hash).digest()
         self._file.seek(sha256_loc)
         self._file.write(sha256)
 

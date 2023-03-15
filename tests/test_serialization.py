@@ -35,6 +35,8 @@ def check_deserialized(deserialized, model_name: str):
         assert v.size() == orig_sd[k].size()
         assert v.dtype == orig_sd[k].dtype
         assert torch.all(orig_sd[k].to(v.device) == v)
+    del orig_sd
+    gc.collect()
 
 
 class TestSerialization(unittest.TestCase):
@@ -51,7 +53,7 @@ class TestSerialization(unittest.TestCase):
                 try:
                     with open(serialized_model, "rb") as in_file:
                         deserialized = TensorDeserializer(
-                            in_file, preload=False, device="cpu"
+                            in_file, device="cpu"
                         )
                         check_deserialized(deserialized, model_name)
                         deserialized.close()
@@ -72,37 +74,24 @@ class TestDeserialization(unittest.TestCase):
     def tearDownClass(cls):
         os.unlink(cls._serialized_model_path)
 
-    def test_preload(self):
+    def test_default_cpu(self):
         in_file = open(self._serialized_model_path, "rb")
         gc.collect()
         before_deserialization = utils.get_mem_usage()
-        deserialized = TensorDeserializer(in_file, preload=True, device="cpu")
+        deserialized = TensorDeserializer(in_file,
+                                          device="cpu")
         after_deserialization = utils.get_mem_usage()
         check_deserialized(deserialized, model_name)
         deserialized.close()
         print(f"Before deserialization: {before_deserialization}")
         print(f"After deserialization:  {after_deserialization}")
 
-    def test_mmap(self):
+    def test_default_gpu(self):
         in_file = open(self._serialized_model_path, "rb")
         gc.collect()
         before_deserialization = utils.get_mem_usage()
         deserialized = TensorDeserializer(in_file,
-                                          device="cpu",
-                                          use_mmap=True)
-        after_deserialization = utils.get_mem_usage()
-        check_deserialized(deserialized, model_name)
-        deserialized.close()
-        print(f"Before deserialization: {before_deserialization}")
-        print(f"After deserialization:  {after_deserialization}")
-
-    def test_mmap_gpu(self):
-        in_file = open(self._serialized_model_path, "rb")
-        gc.collect()
-        before_deserialization = utils.get_mem_usage()
-        deserialized = TensorDeserializer(in_file,
-                                          device="cuda",
-                                          use_mmap=True)
+                                          device="cuda")
         check_deserialized(deserialized, model_name)
         after_deserialization = utils.get_mem_usage()
         deserialized.close()
@@ -113,30 +102,29 @@ class TestDeserialization(unittest.TestCase):
         after_del = utils.get_mem_usage()
         print(f"After del: {after_del}")
 
-    def test_mmap_preload(self):
+    def test_on_demand(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cpu",
-                                          use_mmap=True,
-                                          preload=True)
+                                          on_demand=True)
 
         check_deserialized(deserialized, model_name)
         deserialized.close()
 
-    def test_oneshot(self):
+    def test_plaid_mode(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cuda",
-                                          oneshot=True)
+                                          plaid_mode=True)
 
         check_deserialized(deserialized, model_name)
         deserialized.close()
 
-    def test_oneshot_guards(self):
+    def test_plaid_mode_guards(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cuda",
-                                          oneshot=True)
+                                          plaid_mode=True)
         keys = list(deserialized.keys())
         _ = deserialized[keys[0]]
         _ = deserialized[keys[1]]
