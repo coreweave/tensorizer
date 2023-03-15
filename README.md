@@ -11,13 +11,13 @@ CoreWeave and our customers use KNative to deploy models as serverless
 functions. How long a model takes to load is a major factor in the latency
 of KNative scale-up. `tensorizer` is a tool to serialize models and their
 associated tensors into a single file that can be loaded quickly and
-efficiently off a HTTP/HTTPS or S3 endpoint.
+efficiently off an HTTP/HTTPS or S3 endpoint.
 
 By not embedding the model in the container image, we can reduce the
 container image size and the time it takes to load the model. This is
 especially important for models that are large in size, such as
 [EleutherAI/gpt-neox-20B](https://huggingface.co/EleutherAI/gpt-neox-20B)
-that weight in at `~40GB`.
+that weighs in at `~40GB`.
 
 This decoupling of the model from the container image also allows us to
 update the model without having to rebuild the container image. This allows
@@ -249,8 +249,9 @@ pipeline("a photo of an astronaut riding a horse on mars").images[0].save(
 )
 ```
 
-More practical examples for usage of the Tensorizer can be found inside of
-[tensorizer.py](tensorizer.py), where `df_main()` serializes models from
-[HuggingFace Diffusers](https://github.com/huggingface/diffusers) and `hf_main()`
-serializes [HuggingFace Transformers](https://github.com/huggingface/transformers)
-models.
+More practical examples for usage of the Tensorizer can be found in
+[examples/hf_serialization.py](examples/hf_serialization.py),
+where `df_main()` serializes models from
+[HuggingFace Diffusers](https://github.com/huggingface/diffusers)
+and `hf_main()` serializes
+[HuggingFace Transformers](https://github.com/huggingface/transformers) models.
