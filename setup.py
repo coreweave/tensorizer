@@ -11,6 +11,7 @@ setup(
     install_requires=[
         'torch>=1.9.0',
         'protobuf>=3.19.5',
+        'psutil>=5.9.4'
     ],
     classifiers=[
         'Programming Language :: Python :: 3',
