@@ -85,16 +85,18 @@ from collections import OrderedDict
 # disable missing keys and unexpected key warnings
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 model_ref = "EleutherAI/gpt-j-6B"
 model_name = model_ref.split("/")[-1]
 s3_uri = f"s3://bucket/{model_name}.tensors"
 
+config = AutoConfig.from_pretrained(model_ref)
+
 # This ensures that the model is not initialized.
 model = no_init_or_tensor(
     lambda: AutoModelForCausalLM.from_pretrained(
-        model_ref, state_dict=OrderedDict()
+        None, config=config, state_dict=OrderedDict()
     )
 )
 
