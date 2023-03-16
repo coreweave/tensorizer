@@ -1,3 +1,4 @@
+import contextlib
 import gc
 import os
 import tempfile
@@ -9,6 +10,9 @@ import torch
 os.environ[
     "TRANSFORMERS_VERBOSITY"
 ] = "error"  # disable missing keys and unexpected key warnings
+os.environ[
+    "TOKENIZERS_PARALLELISM"
+] = "false"  # avoids excessive warnings about forking after using a tokenizer
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -49,6 +53,15 @@ def check_deserialized(deserialized, model_name: str, allow_subset=False):
     gc.collect()
 
 
+@contextlib.contextmanager
+def enable_tokenizers_parallelism():
+    os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    try:
+        yield
+    finally:
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
 def check_inference(deserializer: TensorDeserializer,
                     model_ref: str,
                     device: str):
@@ -62,19 +75,20 @@ def check_inference(deserializer: TensorDeserializer,
     deserializer.load_into_module(model, device=device)
 
     # Tokenize and generate
-    tokenizer = AutoTokenizer.from_pretrained(model_ref)
-    input_ids = tokenizer.encode(
-        " hello" * num_hellos,
-        return_tensors="pt"
-    ).to(device)
+    with enable_tokenizers_parallelism():
+        tokenizer = AutoTokenizer.from_pretrained(model_ref)
+        input_ids = tokenizer.encode(
+            " hello" * num_hellos,
+            return_tensors="pt"
+        ).to(device)
 
-    with torch.no_grad():
-        output = model.generate(
-            input_ids, max_new_tokens=50, do_sample=True
-        )
+        with torch.no_grad():
+            output = model.generate(
+                input_ids, max_new_tokens=50, do_sample=True
+            )
 
-    decoded = tokenizer.decode(output[0], skip_special_tokens=True)
-    assert decoded.count("hello") > num_hellos
+        decoded = tokenizer.decode(output[0], skip_special_tokens=True)
+        assert decoded.count("hello") > num_hellos
 
 
 class TestSerialization(unittest.TestCase):
