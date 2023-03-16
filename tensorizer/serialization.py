@@ -2,9 +2,6 @@
 # serialization.py                                                   Wes Brown
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
-import hashlib
-import zlib
-import ctypes
 
 # try to import UNIX only dependencies
 try:
@@ -15,6 +12,7 @@ except ImportError:
     resource = None
 
 from enum import Enum
+import collections.abc
 import io
 import os
 import tensorizer.stream_io as stream_io
@@ -27,13 +25,17 @@ import torch
 import typing
 import logging
 import tempfile
-import regex
+import hashlib
+import zlib
+import ctypes
 cudart = torch.cuda.cudart()
 
 from collections import OrderedDict
-from typing import Optional, Tuple, Union, List, Iterator, Dict
+from typing import Optional, Tuple, Union, List, Iterator, Dict, Callable, Any
 
 lz4 = None
+
+__all__ = ["TensorSerializer", "TensorDeserializer"]
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 class TensorType(Enum):
     PARAM = 0
     BUFFER = 1
-    STATEDICT = 2
+    STATE_DICT = 2
 
 
 TENSORIZER_VERSION = 1
@@ -65,22 +67,24 @@ class HashType(Enum):
     CRC32 = 0
     SHA256 = 1
 
+
 class TensorHash(typing.TypedDict):
     type: HashType
     hash: bytes
 
 
-class TensorDeserializer:
+class TensorDeserializer(collections.abc.Mapping):
     """
     Given a file-like object for read, deserialize tensors to a state_dict or a
     torch.nn.Module.
 
     Args:
         file_obj: A file-like object to read from. It can also be a string
-            representing a path to a file or a HTTP/HTTPS/S3 URI.
+            representing a path to a file or an HTTP/HTTPS/S3 URI.
         device: The device to load the tensors to.
-        pattern: A regex pattern to match tensor names against. If None, all
-            tensors will be loaded.
+        filter_func: A function (tensor_name: str) -> bool that returns True
+            if a tensor should be loaded, or False if it should be skipped.
+            If None, all tensors are loaded.
         dtype: The dtype to load the tensors as. If None, the dtype will be
             inferred from the file.
         on_demand: If True, tensors will be loaded on demand. If False, all
@@ -96,13 +100,14 @@ class TensorDeserializer:
             self,
             file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO, str],
             device: Union[torch.device, str, None] = None,
-            pattern: Union[regex.Pattern, str, None] = None,
+            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
             dtype: Union[torch.dtype, str, None] = None,
             on_demand: bool = False,
             plaid_mode: bool = False):
         if isinstance(file_obj, str):
-            self._file = stream_io.open_stream(file_obj, "rb+")
+            self._file = stream_io.open_stream(file_obj, "rb")
         else:
+            self._mode_check(file_obj)
             self._file = file_obj
         self.total_compressed_tensor_bytes = 0
         self.read_bytes = 0
@@ -137,16 +142,11 @@ class TensorDeserializer:
         # Read the number of tensors
         self._tensors = struct.unpack("<Q", self._file.read(8))[0]
 
-        # The pattern is a regex that matches the tensor names to read and expose.
-        if isinstance(pattern, str):
-            pattern = regex.compile(pattern)
-        self._pattern = pattern
-
         # Read the metadata index of tensors. This is a list of offsets into the
-        # file where the per-tensor data is stored. pattern is a regex that
-        # matches the tensor names to read. If pattern is None, all tensors are
-        # read.
-        self._read_metadatas(pattern)
+        # file where the per-tensor data is stored. filter_func is a test that
+        # determines the tensor names to read. If filter_func is None,
+        # all tensors are read.
+        self._read_metadatas(filter_func)
 
         # If device is None, use the current device, otherwise use the given
         # device.
@@ -160,7 +160,7 @@ class TensorDeserializer:
 
         # We calculate the total tensor bytes here so that we can use mmap, based
         # on the total size of the tensors that we're going to read, filtered by
-        # the pattern.
+        # the filter_func.
         self.total_tensor_bytes = 0
         self._largest_tensor_bytes = 0
         for name, metadata in self._metadata.items():
@@ -174,10 +174,12 @@ class TensorDeserializer:
         self._buffer_addr = None
         if not on_demand and not plaid_mode:
             start_allocate = time.time()
-            self._buffer = mmap.mmap(-1,
-                                     self.total_tensor_bytes,
-                                     prot=mmap.PROT_READ | mmap.PROT_WRITE,
-                                     flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+
+            mmap_flags = 0
+            mmap_flags |= getattr(mmap, "MAP_PRIVATE", 0)
+            mmap_flags |= getattr(mmap, "MAP_ANONYMOUS", 0)
+            mmap_flags = {"flags": mmap_flags} if mmap_flags else {}
+            self._buffer = mmap.mmap(-1, self.total_tensor_bytes, **mmap_flags)
 
             tb = ctypes.c_char * self.total_tensor_bytes
             ctb = tb.from_buffer(self._buffer)
@@ -201,10 +203,25 @@ class TensorDeserializer:
 
         if not on_demand:
             self._cache = self._generate_state_dict(device=device,
-                                                    pattern=pattern,
+                                                    filter_func=filter_func,
                                                     dtype=dtype)
         else:
             self._cache = OrderedDict.fromkeys(self._metadata.keys())
+
+    @staticmethod
+    def _mode_check(file_obj: io.IOBase) -> None:
+        try:
+            readable = file_obj.readable()
+        except AttributeError:
+            # If file_obj doesn't implement the full io.IOBase interface
+            # and checking is not possible, assume it's fine
+            readable = True
+        if isinstance(file_obj, io.TextIOBase) or not readable:
+            mode = getattr(file_obj, "mode", "")
+            raise ValueError(
+                'TensorSerializer\'s file_obj must be readable '
+                'and in binary mode (mode="rb"{})'
+                .format(mode and f', current mode="{mode}"'))
 
     def __del__(self):
         self.close()
@@ -259,12 +276,10 @@ class TensorDeserializer:
             shape=shape,
         )
 
-    def _read_metadatas(self, pattern: Union[regex.Pattern, str, None]):
+    def _read_metadatas(self, filter_func: Optional[Callable[[str], Union[bool, Any]]]):
         """
         Read the metadata of tensors into self._metadata.
         """
-        if isinstance(pattern, str):
-            pattern = regex.compile(pattern)
 
         # Read metadata size.
         self._metadata_size = struct.unpack("<Q", self._file.read(8))[0]
@@ -274,7 +289,7 @@ class TensorDeserializer:
 
         for i in range(self._tensors):
             metadata = self._read_metadata(metadata_stream)
-            if pattern is None or pattern.match(metadata["name"]):
+            if filter_func is None or filter_func(metadata["name"]):
                 self._metadata[metadata["name"]] = metadata
 
     @staticmethod
@@ -282,12 +297,7 @@ class TensorDeserializer:
         """
         Read the tensor shapes.
         """
-        bstr = obj
-        shape = []
-        for i in range(num_elems):
-            shape.append(struct.unpack("<I", bstr[0:4])[0])
-            bstr = bstr[4:]
-        return shape
+        return list(struct.unpack(f"<{num_elems}I", obj))
 
     @property
     def total_bytes_read(self) -> int:
@@ -317,22 +327,55 @@ class TensorDeserializer:
         else:
             raise KeyError(f"Tensor {name} not found")
 
-    def get(self, name, default=None):
-        try:
-            return self[name]
-        except KeyError:
-            return default
+    # To implement collections.abc.Mapping, this class needs to define:
+    # 1. __getitem__(key)
+    # 2. __iter__()
+    # 3. __len__()
+    #
+    # It then inherits efficient default implementations for:
+    # 1. get(key)
+    # 2. keys()
+    # 3. items()
+    # 4. values()
+    # It also inherits __contains__(key), but it isn't efficient.
+    # The default __contains__ implementation uses __getitem__,
+    # so it loads tensor data unnecessarily. Instead, we can
+    # check self._metadata with a simple dict lookup.
+    #
+    # Significant features of the defaults:
+    # - values() -> collections.abc.ValuesView:
+    #   - Doesn't need to load all the data up front
+    #   - Returns a collection with a lazy __iter__
+    #     - Only defers to our __getitem__ exactly when required
+    #   - Implements __contains__ by iterating over itself with linear search
+    # - items() -> collections.abc.ItemsView:
+    #   - Also doesn't need to load data up front
+    #   - Implements __iter__ as basically zip(keys(), values())
+    #   - Implements __contains__ with __getitem__ since it knows where to look
+    #     and needs the data anyway
+    # In summary, ignoring the (still efficient) __contains__, these are simply
+    # lazy iterables over the respective elements from this parent mapping.
+
+    def __iter__(self):
+        # iter() on a mapping returns an iterator of only keys
+        yield from self._metadata
+
+    def __len__(self):
+        return len(self._metadata)
+
+    def __contains__(self, key: str):
+        return key in self._metadata
 
     def keys(self):
+        # We override keys() because dict_keys can be slightly more efficient
+        # than an extra collections.abc.KeysView wrapper.
+        # Technically this makes mapping.keys().mapping invalid on Python 3.10+
+        # but it is not intended to be supported anyway,
+        # so treat it as not implemented.
         return self._metadata.keys()
 
-    def values(self):
-        return [self[key] for key in self.keys()]
-
-    def items(self):
-        return [(key, self[key]) for key in self.keys()]
-
-    def _decode_hashes(self, b: bytes) -> List[TensorHash]:
+    @staticmethod
+    def _decode_hashes(b: bytes) -> List[TensorHash]:
         """
         Decode the hashes from given bytes.
         """
@@ -351,21 +394,20 @@ class TensorDeserializer:
             # Read the hash.
             hash_begin = hash_idx + 2
             hash_end = hash_begin + hash_size
-            hash_bytes = b[hash_begin:hash_end]
+            hash_bytes: bytes = b[hash_begin:hash_end]
             # Add the hash to the list.
-            hash_entry: TensorHash = {
-                "type": hash_type,
-                "hash": hash_bytes,
-            }
+            hash_entry = TensorHash(
+                type=HashType(hash_type),
+                hash=hash_bytes,
+            )
             hash_idx = hash_end
             hashes.append(hash_entry)
 
         return hashes
 
-
     def read_tensors(
             self,
-            pattern: Union[regex.Pattern, str, None] = None,
+            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
             num_tensors: int = -1,
     ) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
         """
@@ -377,8 +419,6 @@ class TensorDeserializer:
         data. It assumes that the file pointer is already at the beginning
         of the tensor data that it should read.
         """
-        if isinstance(pattern, str):
-            pattern = regex.compile(pattern)
 
         try:
             tensors_read = 0
@@ -427,8 +467,8 @@ class TensorDeserializer:
                 hashes = self._decode_hashes(headers[hashes_begin + 2: hashes_end])
 
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
-                # Check if the name matches the pattern, drop if it doesn't.
-                if pattern is not None and not pattern.match(name):
+                # Check if the name passes the filter_func, drop if it doesn't.
+                if filter_func is not None and not filter_func(name):
                     self._file.seek(data_length, io.SEEK_CUR)
                     continue
 
@@ -458,8 +498,8 @@ class TensorDeserializer:
         except EOFError:
             return
 
-    def _to_torch_parameter(self,
-                            arr: Union[numpy.ndarray, torch.nn.Parameter],
+    @staticmethod
+    def _to_torch_parameter(arr: Union[numpy.ndarray, torch.nn.Parameter],
                             dtype: Optional[str] = None,
                             device=utils.get_device()) -> torch.nn.Parameter:
         """
@@ -482,7 +522,7 @@ class TensorDeserializer:
             self,
             device=utils.get_device(),
             dtype: Optional[str] = None,
-            pattern: Union[regex.Pattern, str, None] = None,
+            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
     ) -> OrderedDict:
         """
         Load the tensors in this Tensorizer object into a state_dict.
@@ -490,16 +530,16 @@ class TensorDeserializer:
         :param device: The device to load the tensors onto.
         :param dtype: The dtype to load the tensors as. Defaults to None, which
             means the dtype is not changed from the serialized dtype.
-        :param pattern: A regex pattern to match against the tensor names, if
-            None, all tensors are loaded. If the pattern doesn't match, the
-            tensor is skipped.
+        :param filter_func: A function (tensor_name: str) -> bool that returns True
+            if a tensor should be loaded, or False if it should be skipped.
+            If None, all tensors are loaded.
         :return:
         """
         if self._file.closed:
             raise IOError("IO closed, instantiate if you want to load again.")
 
         d = OrderedDict()
-        for idx, typ, name, arr in self.read_tensors(pattern=pattern):
+        for idx, typ, name, arr in self.read_tensors(filter_func=filter_func):
             d[name] = self._to_torch_parameter(arr, dtype, device)
         self.total_tensor_bytes = self._file.tell()
         self._file.close()
@@ -510,7 +550,7 @@ class TensorDeserializer:
             m: torch.nn.Module,
             device=utils.get_device(),
             dtype: Optional[str] = None,
-            pattern: Union[regex.Pattern, str, None] = None,
+            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
     ) -> int:
         """
         Given `m`, a torch.nn.Module, load the associate tensors in this
@@ -524,7 +564,7 @@ class TensorDeserializer:
         tensor_ct = 0
 
         for name in self.keys():
-            if pattern is not None and not pattern.match(name):
+            if filter_func is not None and not filter_func(name):
                 continue
             obj_path, attr = name.rsplit(".", 1)
             module: torch.nn.Module = modules[obj_path]
@@ -534,7 +574,7 @@ class TensorDeserializer:
                 module.register_parameter(attr, param)
             elif entry["type"] is TensorType.BUFFER:
                 module.register_buffer(attr, param)
-            elif entry["type"] is TensorType.STATEDICT:
+            elif entry["type"] is TensorType.STATE_DICT:
                 raise NotImplementedError(
                     "This was serialized using the write_state_dict() method, and"
                     " cannot be loaded using the load_tensors() method. Use the"
@@ -554,11 +594,12 @@ class TensorSerializer:
     def __init__(
             self,
             file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO,
-            str, bytes, os.PathLike, int],
+                            str, bytes, os.PathLike, int],
             compress_tensors: bool = False) -> None:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "wb+")
         else:
+            self._mode_check(file_obj)
             self._file = file_obj
         self._tensors = 0
         self.total_tensor_bytes = 0
@@ -605,6 +646,21 @@ class TensorSerializer:
         self._metadata_end = self._metadata_loc + metadata_size
 
         self._tensor_index: List[TensorEntry] = []
+
+    @staticmethod
+    def _mode_check(file_obj: io.IOBase) -> None:
+        try:
+            read_write = file_obj.writable() and file_obj.readable()
+        except AttributeError:
+            # If file_obj doesn't implement the full io.IOBase interface
+            # and checking is not possible, assume it's fine
+            read_write = True
+        if isinstance(file_obj, io.TextIOBase) or not read_write:
+            mode = getattr(file_obj, "mode", "")
+            raise ValueError(
+                'TensorSerializer\'s file_obj must be readable, writable, '
+                'and in binary mode (mode="wb+"{})'
+                .format(mode and f', current mode="{mode}"'))
 
     def __del__(self):
         self._file.close()
@@ -841,7 +897,7 @@ class TensorSerializer:
 
         typ = {TensorType.PARAM: "p",
                TensorType.BUFFER: "b",
-               TensorType.STATEDICT: "sd"}[tensor_type]
+               TensorType.STATE_DICT: "sd"}[tensor_type]
 
         if self.compress_tensors:
             comp_report = (
@@ -878,4 +934,4 @@ class TensorSerializer:
         """
         idx = 0
         for name, param in state_dict.items():
-            self.write_tensor(idx, name, TensorType.STATEDICT, param)
+            self.write_tensor(idx, name, TensorType.STATE_DICT, param)

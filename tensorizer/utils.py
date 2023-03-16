@@ -15,6 +15,8 @@ try:
 except ImportError:
     pynvml = None
 
+__all__ = ["convert_bytes", "get_device", "get_mem_usage", "get_gpu_name", "no_init_or_tensor"]
+
 
 # Silly function to convert to human bytes
 def convert_bytes(num):
