@@ -11,7 +11,7 @@ setup(
     install_requires=[
         'torch>=1.9.0',
         'protobuf>=3.19.5',
-        'psutil>=5.9.4'
+        'psutil>=5.9.4',
         'boto3>=1.26.92'
     ],
     classifiers=[
