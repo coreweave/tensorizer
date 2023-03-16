@@ -77,8 +77,8 @@ def get_max_pipe_size():
     if sys.platform != "win32":
         # Read our max-fd-size, fall back to 1mb if invalid.
         try:
-            pipe_file = open("/proc/sys/fs/pipe-max-size", "r")
-            pipe_buf_sz = int(pipe_file.read())
+            with open("/proc/sys/fs/pipe-max-size", "r") as pipe_file:
+                pipe_buf_sz = int(pipe_file.read())
         except IOError as e:
             _logger.warning(
                 f"Could not read /proc/sys/fs/pipe-max-size: {e.strerror}"
