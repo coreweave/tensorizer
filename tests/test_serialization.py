@@ -18,6 +18,8 @@ from collections import OrderedDict
 
 model_name = "EleutherAI/gpt-neo-125M"
 num_hellos = 400
+is_cuda_available = torch.cuda.is_available()
+default_device = "cuda" if is_cuda_available else "cpu"
 
 
 def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
@@ -34,8 +36,10 @@ def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
     return out_file.name, sd
 
 
-def check_deserialized(deserialized, model_name: str):
+def check_deserialized(deserialized, model_name: str, allow_subset=False):
     orig_sd = AutoModelForCausalLM.from_pretrained(model_name).state_dict()
+    if not allow_subset:
+        assert orig_sd.keys() == deserialized.keys()
     for k, v in deserialized.items():
         assert k in orig_sd
         assert v.size() == orig_sd[k].size()
@@ -55,7 +59,7 @@ def check_inference(deserializer: TensorDeserializer,
         )
     )
 
-    deserializer.load_into_module(model)
+    deserializer.load_into_module(model, device=device)
 
     # Tokenize and generate
     tokenizer = AutoTokenizer.from_pretrained(model_ref)
@@ -76,6 +80,8 @@ def check_inference(deserializer: TensorDeserializer,
 class TestSerialization(unittest.TestCase):
     def test_serialization(self):
         for device in "cuda", "cpu":
+            if device == "cuda" and not is_cuda_available:
+                continue
             with self.subTest(msg=f"Serializing with device {device}"):
                 gc.collect()
                 before_serialization = utils.get_mem_usage()
@@ -120,6 +126,7 @@ class TestDeserialization(unittest.TestCase):
         print(f"Before deserialization: {before_deserialization}")
         print(f"After deserialization:  {after_deserialization}")
 
+    @unittest.skipIf(not is_cuda_available, "Requires CUDA")
     def test_default_gpu(self):
         in_file = open(self._serialized_model_path, "rb")
         gc.collect()
@@ -139,13 +146,14 @@ class TestDeserialization(unittest.TestCase):
     def test_lazy_load(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
-                                          device="cpu",
+                                          device=default_device,
                                           lazy_load=True)
 
         check_deserialized(deserialized, model_name)
         check_inference(deserialized, model_name, "cpu")
         deserialized.close()
 
+    @unittest.skipIf(not is_cuda_available, "plaid_mode requires CUDA")
     def test_plaid_mode(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
@@ -155,6 +163,7 @@ class TestDeserialization(unittest.TestCase):
         check_deserialized(deserialized, model_name)
         deserialized.close()
 
+    @unittest.skipIf(not is_cuda_available, "plaid_mode requires CUDA")
     def test_plaid_mode_inference(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
@@ -164,6 +173,7 @@ class TestDeserialization(unittest.TestCase):
         check_inference(deserialized, model_name, "cuda")
         deserialized.close()
 
+    @unittest.skipIf(not is_cuda_available, "plaid_mode requires CUDA")
     def test_plaid_mode_guards(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
@@ -188,7 +198,7 @@ class TestDeserialization(unittest.TestCase):
         with self.subTest(msg="Testing no filter_func"):
             in_file = open(self._serialized_model_path, "rb")
             deserialized = TensorDeserializer(in_file,
-                                              device="cuda",
+                                              device=default_device,
                                               filter_func=None)
             all_keys = set(deserialized.keys())
             assert all_keys, "Deserializing the model with no filter_func" \
@@ -213,21 +223,21 @@ class TestDeserialization(unittest.TestCase):
         with self.subTest(msg="Testing regex filter_func"):
             in_file = open(self._serialized_model_path, "rb")
             deserialized = TensorDeserializer(in_file,
-                                              device="cuda",
+                                              device=default_device,
                                               filter_func=pattern.match)
             regex_keys = set(deserialized.keys())
             # Test that the deserialized tensors form a proper,
             # non-empty subset of the original list of tensors.
             assert regex_keys == expected_regex_keys
-            check_deserialized(deserialized, model_name)
+            check_deserialized(deserialized, model_name, allow_subset=True)
             deserialized.close()
 
         with self.subTest(msg="Testing custom filter_func"):
             in_file = open(self._serialized_model_path, "rb")
             deserialized = TensorDeserializer(in_file,
-                                              device="cuda",
+                                              device=default_device,
                                               filter_func=custom_check)
             custom_keys = set(deserialized.keys())
             assert custom_keys == expected_custom_keys
-            check_deserialized(deserialized, model_name)
+            check_deserialized(deserialized, model_name, allow_subset=True)
             deserialized.close()
