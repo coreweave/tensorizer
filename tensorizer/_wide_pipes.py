@@ -61,7 +61,7 @@ F_SETPIPE_SZ = 1031
 
 _logger = logging.getLogger(__name__)
 
-__all__ = "get_max_pipe_size", "widen_pipe", "widen_new_pipes"
+__all__ = ["get_max_pipe_size", "widen_pipe", "widen_new_pipes"]
 
 # No-op default implementations
 widen_new_pipes = contextlib.ExitStack

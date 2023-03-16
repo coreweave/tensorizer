@@ -2,16 +2,22 @@ import gc
 import os
 import tempfile
 import unittest
+import re
 from typing import Tuple
-
 import torch
 
-from transformers import AutoModelForCausalLM
+os.environ[
+    "TRANSFORMERS_VERBOSITY"
+] = "error"  # disable missing keys and unexpected key warnings
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tensorizer.serialization import TensorSerializer, TensorDeserializer
 from tensorizer import utils
+from collections import OrderedDict
 
 model_name = "EleutherAI/gpt-neo-125M"
+num_hellos = 400
 
 
 def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
@@ -20,7 +26,7 @@ def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
     out_file = tempfile.NamedTemporaryFile("wb+", delete=False)
     try:
         serializer = TensorSerializer(out_file)
-        serializer.write_state_dict(sd)
+        serializer.write_module(model)
         serializer.close()
     except Exception:
         os.unlink(out_file)
@@ -35,6 +41,36 @@ def check_deserialized(deserialized, model_name: str):
         assert v.size() == orig_sd[k].size()
         assert v.dtype == orig_sd[k].dtype
         assert torch.all(orig_sd[k].to(v.device) == v)
+    del orig_sd
+    gc.collect()
+
+
+def check_inference(deserializer: TensorDeserializer,
+                    model_ref: str,
+                    device: str):
+    # This ensures that the model is not initialized.
+    model = utils.no_init_or_tensor(
+        lambda: AutoModelForCausalLM.from_pretrained(
+            model_ref, state_dict=OrderedDict()
+        )
+    )
+
+    deserializer.load_into_module(model)
+
+    # Tokenize and generate
+    tokenizer = AutoTokenizer.from_pretrained(model_ref)
+    input_ids = tokenizer.encode(
+        " hello" * num_hellos,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        output = model.generate(
+            input_ids, max_new_tokens=50, do_sample=True
+        )
+
+    decoded = tokenizer.decode(output[0], skip_special_tokens=True)
+    assert decoded.count("hello") > num_hellos
 
 
 class TestSerialization(unittest.TestCase):
@@ -51,7 +87,7 @@ class TestSerialization(unittest.TestCase):
                 try:
                     with open(serialized_model, "rb") as in_file:
                         deserialized = TensorDeserializer(
-                            in_file, preload=False, device="cpu"
+                            in_file, device="cpu"
                         )
                         check_deserialized(deserialized, model_name)
                         deserialized.close()
@@ -72,37 +108,24 @@ class TestDeserialization(unittest.TestCase):
     def tearDownClass(cls):
         os.unlink(cls._serialized_model_path)
 
-    def test_preload(self):
+    def test_default_cpu(self):
         in_file = open(self._serialized_model_path, "rb")
         gc.collect()
         before_deserialization = utils.get_mem_usage()
-        deserialized = TensorDeserializer(in_file, preload=True, device="cpu")
+        deserialized = TensorDeserializer(in_file,
+                                          device="cpu")
         after_deserialization = utils.get_mem_usage()
         check_deserialized(deserialized, model_name)
         deserialized.close()
         print(f"Before deserialization: {before_deserialization}")
         print(f"After deserialization:  {after_deserialization}")
 
-    def test_mmap(self):
+    def test_default_gpu(self):
         in_file = open(self._serialized_model_path, "rb")
         gc.collect()
         before_deserialization = utils.get_mem_usage()
         deserialized = TensorDeserializer(in_file,
-                                          device="cpu",
-                                          use_mmap=True)
-        after_deserialization = utils.get_mem_usage()
-        check_deserialized(deserialized, model_name)
-        deserialized.close()
-        print(f"Before deserialization: {before_deserialization}")
-        print(f"After deserialization:  {after_deserialization}")
-
-    def test_mmap_gpu(self):
-        in_file = open(self._serialized_model_path, "rb")
-        gc.collect()
-        before_deserialization = utils.get_mem_usage()
-        deserialized = TensorDeserializer(in_file,
-                                          device="cuda",
-                                          use_mmap=True)
+                                          device="cuda")
         check_deserialized(deserialized, model_name)
         after_deserialization = utils.get_mem_usage()
         deserialized.close()
@@ -113,30 +136,39 @@ class TestDeserialization(unittest.TestCase):
         after_del = utils.get_mem_usage()
         print(f"After del: {after_del}")
 
-    def test_mmap_preload(self):
+    def test_lazy_load(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cpu",
-                                          use_mmap=True,
-                                          preload=True)
+                                          lazy_load=True)
+
+        check_deserialized(deserialized, model_name)
+        check_inference(deserialized, model_name, "cpu")
+        deserialized.close()
+
+    def test_plaid_mode(self):
+        in_file = open(self._serialized_model_path, "rb")
+        deserialized = TensorDeserializer(in_file,
+                                          device="cuda",
+                                          plaid_mode=True)
 
         check_deserialized(deserialized, model_name)
         deserialized.close()
 
-    def test_oneshot(self):
+    def test_plaid_mode_inference(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cuda",
-                                          oneshot=True)
+                                          plaid_mode=True)
 
-        check_deserialized(deserialized, model_name)
+        check_inference(deserialized, model_name, "cuda")
         deserialized.close()
 
-    def test_oneshot_guards(self):
+    def test_plaid_mode_guards(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cuda",
-                                          oneshot=True)
+                                          plaid_mode=True)
         keys = list(deserialized.keys())
         _ = deserialized[keys[0]]
         _ = deserialized[keys[1]]
@@ -145,3 +177,57 @@ class TestDeserialization(unittest.TestCase):
             _ = deserialized[keys[0]]
 
         deserialized.close()
+
+    def test_filter_func(self):
+        # These two filters should produce identical results
+        pattern = re.compile(r"transformer\.h\.0.*")
+
+        def custom_check(tensor_name: str) -> bool:
+            return tensor_name.startswith("transformer.h.0")
+
+        with self.subTest(msg="Testing no filter_func"):
+            in_file = open(self._serialized_model_path, "rb")
+            deserialized = TensorDeserializer(in_file,
+                                              device="cuda",
+                                              filter_func=None)
+            all_keys = set(deserialized.keys())
+            assert all_keys, "Deserializing the model with no filter_func" \
+                             " loaded an empty set of tensors"
+            check_deserialized(deserialized, model_name)
+            deserialized.close()
+
+        expected_regex_keys = set(filter(pattern.match, all_keys))
+        expected_custom_keys = set(filter(custom_check, all_keys))
+
+        assert (
+            expected_regex_keys and expected_regex_keys < all_keys
+            and expected_custom_keys and expected_custom_keys < all_keys
+        ), "The filter_func test cannot continue" \
+           " because a filter_func used in the test" \
+           " does not appear in the test model," \
+           " or matches all tensor names." \
+           " Update the pattern and/or custom_check" \
+           " to use more informative filtering criteria." \
+           "\n\nTensors present in the model: " + " ".join(all_keys)
+
+        with self.subTest(msg="Testing regex filter_func"):
+            in_file = open(self._serialized_model_path, "rb")
+            deserialized = TensorDeserializer(in_file,
+                                              device="cuda",
+                                              filter_func=pattern.match)
+            regex_keys = set(deserialized.keys())
+            # Test that the deserialized tensors form a proper,
+            # non-empty subset of the original list of tensors.
+            assert regex_keys == expected_regex_keys
+            check_deserialized(deserialized, model_name)
+            deserialized.close()
+
+        with self.subTest(msg="Testing custom filter_func"):
+            in_file = open(self._serialized_model_path, "rb")
+            deserialized = TensorDeserializer(in_file,
+                                              device="cuda",
+                                              filter_func=custom_check)
+            custom_keys = set(deserialized.keys())
+            assert custom_keys == expected_custom_keys
+            check_deserialized(deserialized, model_name)
+            deserialized.close()
