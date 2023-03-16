@@ -141,6 +141,40 @@ where `df_main()` serializes models from
 and `hf_main()` serializes
 [HuggingFace Transformers](https://github.com/huggingface/transformers) models.
 
+## S3 Usage Notes
+`tensorizer` uses the `boto3` library to interact with S3. The easiest way
+to use `tensorizer` with S3 is to configure your S3 credentials in
+`~/.s3cfg`.
+
+If you don't want to use `~/.s3cfg`, you can also pass your S3 credentials using
+the `stream_io.open_stream()` function, and then passing that into `TensorSerializer`
+or `TensorDeserializer`. The `stream_io.open_stream()` function takes a `stream_uri`
+argument, which can be an S3 endpoint, and accepts the following keyword arguments:
+* `s3_access_key_id`: AWS access key ID
+* `s3_secret_access_key`: AWS secret access key
+* `s3_endpoint`: S3 endpoint
+
+For example:
+```python
+  TensorSerializer(
+     open_stream(s3_uri,
+                 "wb",
+                 aws_access_key_id=AWS_ACCESS_KEY,
+                 aws_secret_access_key=AWS_SECRET_KEY,
+                 s3_endpoint="object.ord1.coreweave.com"))
+```
+
+and ...
+
+```python
+  TensorDeserializer(
+     open_stream(s3_uri,
+                 "rb",
+                 aws_access_key_id=AWS_ACCESS_KEY,
+                 aws_secret_access_key=AWS_SECRET_KEY,
+                 s3_endpoint="object.ord1.coreweave.com"))
+```
+
 ## Additional Features
 `tensorizer` has a few additional features that make it more useful than
 just a serialization/deserialization tool.
