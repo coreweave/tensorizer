@@ -4,15 +4,20 @@ import tempfile
 import unittest
 import re
 from typing import Tuple
-
 import torch
 
-from transformers import AutoModelForCausalLM
+os.environ[
+    "TRANSFORMERS_VERBOSITY"
+] = "error"  # disable missing keys and unexpected key warnings
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tensorizer.serialization import TensorSerializer, TensorDeserializer
 from tensorizer import utils
+from collections import OrderedDict
 
 model_name = "EleutherAI/gpt-neo-125M"
+num_hellos = 400
 
 
 def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
@@ -21,7 +26,7 @@ def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
     out_file = tempfile.NamedTemporaryFile("wb+", delete=False)
     try:
         serializer = TensorSerializer(out_file)
-        serializer.write_state_dict(sd)
+        serializer.write_module(model)
         serializer.close()
     except Exception:
         os.unlink(out_file)
@@ -38,6 +43,34 @@ def check_deserialized(deserialized, model_name: str):
         assert torch.all(orig_sd[k].to(v.device) == v)
     del orig_sd
     gc.collect()
+
+
+def check_inference(deserializer: TensorDeserializer,
+                    model_ref: str,
+                    device: str):
+    # This ensures that the model is not initialized.
+    model = utils.no_init_or_tensor(
+        lambda: AutoModelForCausalLM.from_pretrained(
+            model_ref, state_dict=OrderedDict()
+        )
+    )
+
+    deserializer.load_into_module(model)
+
+    # Tokenize and generate
+    tokenizer = AutoTokenizer.from_pretrained(model_ref)
+    input_ids = tokenizer.encode(
+        " hello" * num_hellos,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        output = model.generate(
+            input_ids, max_new_tokens=50, do_sample=True
+        )
+
+    decoded = tokenizer.decode(output[0], skip_special_tokens=True)
+    assert decoded.count("hello") > num_hellos
 
 
 class TestSerialization(unittest.TestCase):
@@ -103,13 +136,14 @@ class TestDeserialization(unittest.TestCase):
         after_del = utils.get_mem_usage()
         print(f"After del: {after_del}")
 
-    def test_on_demand(self):
+    def test_lazy_load(self):
         in_file = open(self._serialized_model_path, "rb")
         deserialized = TensorDeserializer(in_file,
                                           device="cpu",
-                                          on_demand=True)
+                                          lazy_load=True)
 
         check_deserialized(deserialized, model_name)
+        check_inference(deserialized, model_name, "cpu")
         deserialized.close()
 
     def test_plaid_mode(self):
@@ -119,6 +153,15 @@ class TestDeserialization(unittest.TestCase):
                                           plaid_mode=True)
 
         check_deserialized(deserialized, model_name)
+        deserialized.close()
+
+    def test_plaid_mode_inference(self):
+        in_file = open(self._serialized_model_path, "rb")
+        deserialized = TensorDeserializer(in_file,
+                                          device="cuda",
+                                          plaid_mode=True)
+
+        check_inference(deserialized, model_name, "cuda")
         deserialized.close()
 
     def test_plaid_mode_guards(self):

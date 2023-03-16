@@ -28,6 +28,7 @@ import tempfile
 import hashlib
 import zlib
 import ctypes
+
 cudart = torch.cuda.cudart()
 
 from collections import OrderedDict
@@ -58,7 +59,6 @@ class TensorEntry(typing.TypedDict):
     offset: int
     data_offset: int
     data_length: int
-    length: int
     dtype: str
     shape: List[int]
 
@@ -75,8 +75,8 @@ class TensorHash(typing.TypedDict):
 
 class TensorDeserializer(collections.abc.Mapping):
     """
-    Given a file-like object for read, deserialize tensors to a state_dict or a
-    torch.nn.Module.
+    Given a file-like object for read, deserialize tensors to a state_dict or
+    a torch.nn.Module.
 
     Args:
         file_obj: A file-like object to read from. It can also be a string
@@ -87,8 +87,9 @@ class TensorDeserializer(collections.abc.Mapping):
             If None, all tensors are loaded.
         dtype: The dtype to load the tensors as. If None, the dtype will be
             inferred from the file.
-        on_demand: If True, tensors will be loaded on demand. If False, all
-            tensors will be loaded into memory up front.
+        lazy_load: If True, tensors will be loaded and cached when keys are
+            accessed. If False, all tensors will be loaded into memory up
+            front.
         plaid_mode: If True, tensors will be loaded extremely fast into the
             target device. This is only supported on CUDA devices, and the
             buffers are going to be inconsistent due to the extreme
@@ -98,11 +99,12 @@ class TensorDeserializer(collections.abc.Mapping):
 
     def __init__(
             self,
-            file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO, str],
+            file_obj: Union[io.BufferedIOBase, io.RawIOBase,
+            typing.BinaryIO, str],
             device: Union[torch.device, str, None] = None,
             filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
             dtype: Union[torch.dtype, str, None] = None,
-            on_demand: bool = False,
+            lazy_load: bool = False,
             plaid_mode: bool = False):
         if isinstance(file_obj, str):
             self._file = stream_io.open_stream(file_obj, "rb")
@@ -111,10 +113,14 @@ class TensorDeserializer(collections.abc.Mapping):
             self._file = file_obj
         self.total_compressed_tensor_bytes = 0
         self.read_bytes = 0
-        self._state_dict = None
-        self._idx = 0
+        self._device = device
         self._metadata: Dict[str, TensorEntry] = {}
-        self._on_demand = on_demand
+
+        if plaid_mode and (not torch.cuda.is_available() or device == "cpu"):
+            raise ValueError("Plaid mode requires CUDA")
+
+        # plaid_mode implies lazy_load
+        self._lazy_load = lazy_load or plaid_mode
 
         # Read the magic
         magic = self._file.read(5)
@@ -127,7 +133,8 @@ class TensorDeserializer(collections.abc.Mapping):
         # Check the version
         if version > TENSORIZER_VERSION:
             raise ValueError(
-                f"Cannot read version {version} with version {TENSORIZER_VERSION}"
+                f"This {TENSORIZER_VERSION} version cannot read"
+                f"file versioned {version}."
             )
 
         # Skip 32-byte hash (unused)
@@ -146,7 +153,7 @@ class TensorDeserializer(collections.abc.Mapping):
         # file where the per-tensor data is stored. filter_func is a test that
         # determines the tensor names to read. If filter_func is None,
         # all tensors are read.
-        self._read_metadatas(filter_func)
+        self._load_metadatas(filter_func)
 
         # If device is None, use the current device, otherwise use the given
         # device.
@@ -158,9 +165,9 @@ class TensorDeserializer(collections.abc.Mapping):
         self._plaid_mode: bool = plaid_mode
         self._prior_key: Optional[str] = None
 
-        # We calculate the total tensor bytes here so that we can use mmap, based
-        # on the total size of the tensors that we're going to read, filtered by
-        # the filter_func.
+        # We calculate the total tensor bytes here so that we can use mmap,
+        # based on the total size of the tensors that we're going to read,
+        # filtered by the filter_func.
         self.total_tensor_bytes = 0
         self._largest_tensor_bytes = 0
         for name, metadata in self._metadata.items():
@@ -168,44 +175,67 @@ class TensorDeserializer(collections.abc.Mapping):
             if metadata["data_length"] > self._largest_tensor_bytes:
                 self._largest_tensor_bytes = metadata["data_length"]
 
-        # Allocate the buffer for the tensors. If we're not in on_demand mode,
-        # we'll allocate a buffer for all of the tensors. Otherwise, we'll
+        # Allocate the buffer for the tensors. If we're not in lazy_load mode,
+        # we'll allocate a single buffer for all the tensors. Otherwise, we'll
         # allocate a buffer for the largest tensor.
         self._buffer_addr = None
-        if not on_demand and not plaid_mode:
+        if not lazy_load and not plaid_mode:
             start_allocate = time.time()
 
+            # Check if our platform supports mmap.MAP_ANONYMOUS and
+            # mmap.MAP_PRIVATE
             mmap_flags = 0
             mmap_flags |= getattr(mmap, "MAP_PRIVATE", 0)
             mmap_flags |= getattr(mmap, "MAP_ANONYMOUS", 0)
-            mmap_flags = {"flags": mmap_flags} if mmap_flags else {}
-            self._buffer = mmap.mmap(-1, self.total_tensor_bytes, **mmap_flags)
+            mmap_args = {"flags": mmap_flags} if mmap_flags else {}
+            self._buffer = mmap.mmap(-1,
+                                     self.total_tensor_bytes,
+                                     **mmap_args)
 
-            tb = ctypes.c_char * self.total_tensor_bytes
-            ctb = tb.from_buffer(self._buffer)
+            # If we're on CUDA, we register the buffer with CUDA so that
+            # it is pinned. This allows for Torch to internally use
+            # cudaMemcpyAsync.
             if self._device == "cuda":
+                # We need to use ctypes to get the address of the buffer
+                # because mmap.mmap doesn't expose the buffer address.
+                tb = ctypes.c_char * self.total_tensor_bytes
+                ctb = tb.from_buffer(self._buffer)
                 self._buffer_addr = ctypes.addressof(ctb)
+
+                # Register the buffer with CUDA
                 cudart.cudaHostRegister(self._buffer_addr,
                                         self.total_tensor_bytes,
                                         0)
             end_allocate = time.time()
-            logger.info(f"Memory allocate time: {end_allocate - start_allocate:0.4f}")
+            tensor_bytes_str = utils.convert_bytes(self.total_tensor_bytes)
+            logger.info(f"Allocated {tensor_bytes_str} "
+                        f"for {len(self._metadata)} tensors "
+                        f"in {end_allocate - start_allocate:0.4f}")
         else:
             self._buffer = bytearray(self._largest_tensor_bytes)
 
+        # The number of bytes we've allocated so far. Tensors may be read
+        # from the file in any order, so we need to keep track of how much
+        # we've used so far so that we can index into the buffer correctly.
         self._allocated = 0
 
-        # Our cache of tensors. This is a dict of name -> tensor.
+        # Our cache of tensors. This is a dict of name -> tensor. If lazy_load
+        # is True, then the tensors are not loaded until they are accessed.
         self._cache: typing.OrderedDict[str, Union[torch.Tensor, None, bool]]
 
         # The offset in the file where the tensor data begins.
         self._tensors_begin = self._file.tell()
 
-        if not on_demand:
+        if not lazy_load:
+            # If we're not in lazy_load mode, we populate the cache with all
+            # the tensors.
             self._cache = self._generate_state_dict(device=device,
                                                     filter_func=filter_func,
                                                     dtype=dtype)
         else:
+            # We populate the cache with None values so that we can
+            # differentiate between tensors that have not been loaded yet
+            # and tensors that are not present in the file.
             self._cache = OrderedDict.fromkeys(self._metadata.keys())
 
     @staticmethod
@@ -259,10 +289,12 @@ class TensorDeserializer(collections.abc.Mapping):
 
     def _read_metadata(self, metadata_stream: io.BytesIO) -> TensorEntry:
         name = self._read_string(metadata_stream)
-        tensor_type = TensorType(struct.unpack("<B", metadata_stream.read(1))[0])
+        tensor_type = TensorType(struct.unpack("<B",
+                                               metadata_stream.read(1))[0])
         dtype = self._read_dtype(metadata_stream)
         shape_len = struct.unpack("<B", metadata_stream.read(1))[0]
-        shape = self._read_shapes(metadata_stream.read(shape_len * 4), shape_len)
+        shape = self._read_shapes(metadata_stream.read(shape_len * 4),
+                                  shape_len)
         offset = struct.unpack("<Q", metadata_stream.read(8))[0]
         data_offset = struct.unpack("<Q", metadata_stream.read(8))[0]
         data_length = struct.unpack("<Q", metadata_stream.read(8))[0]
@@ -276,7 +308,9 @@ class TensorDeserializer(collections.abc.Mapping):
             shape=shape,
         )
 
-    def _read_metadatas(self, filter_func: Optional[Callable[[str], Union[bool, Any]]]):
+    def _load_metadatas(self,
+                        filter_func: Optional[Callable[[str],
+                                              Union[bool, Any]]]):
         """
         Read the metadata of tensors into self._metadata.
         """
@@ -308,15 +342,22 @@ class TensorDeserializer(collections.abc.Mapping):
 
     def __getitem__(self, name) -> torch.nn.Parameter:
         if self._plaid_mode:
+            # In plaid_mode, we only have one valid tensor at a time, so
+            # we need to make sure that prior tensors are not accessed.
             if self._prior_key is not None and self._prior_key != name:
                 self._cache[self._prior_key] = False
             if self._cache[name] is False:
-                raise RuntimeError(f"Tensor {name} already overwritten in plaid_mode")
+                raise RuntimeError(f"Tensor {name} already overwritten in "
+                                   "plaid_mode")
             self._prior_key = name
 
         if name in self._cache and self._cache[name] is not None:
             return self._cache[name]
 
+        # If we're in lazy_load mode, we populate the cache with the
+        # tensor data and then convert it to a torch parameter. Most
+        # of the time, access patterns are front to back, so seeking
+        # forward in a stream works well even for HTTP/HTTPS streams.
         if name in self._metadata:
             self._file.seek(self._metadata[name]["offset"])
             tensor_arr = next(self.read_tensors(num_tensors=1))[3]
@@ -337,6 +378,7 @@ class TensorDeserializer(collections.abc.Mapping):
     # 2. keys()
     # 3. items()
     # 4. values()
+    #
     # It also inherits __contains__(key), but it isn't efficient.
     # The default __contains__ implementation uses __getitem__,
     # so it loads tensor data unnecessarily. Instead, we can
@@ -351,10 +393,12 @@ class TensorDeserializer(collections.abc.Mapping):
     # - items() -> collections.abc.ItemsView:
     #   - Also doesn't need to load data up front
     #   - Implements __iter__ as basically zip(keys(), values())
-    #   - Implements __contains__ with __getitem__ since it knows where to look
-    #     and needs the data anyway
-    # In summary, ignoring the (still efficient) __contains__, these are simply
-    # lazy iterables over the respective elements from this parent mapping.
+    #   - Implements __contains__ with __getitem__ since it knows where to
+    #     look and needs the data anyway
+    #
+    # In summary, ignoring the (still efficient) __contains__, these are
+    # simply lazy iterables over the respective elements from this parent
+    # mapping.
 
     def __iter__(self):
         # iter() on a mapping returns an iterator of only keys
@@ -369,9 +413,10 @@ class TensorDeserializer(collections.abc.Mapping):
     def keys(self):
         # We override keys() because dict_keys can be slightly more efficient
         # than an extra collections.abc.KeysView wrapper.
-        # Technically this makes mapping.keys().mapping invalid on Python 3.10+
-        # but it is not intended to be supported anyway,
-        # so treat it as not implemented.
+        #
+        # Technically this makes mapping.keys().mapping invalid on
+        # Python 3.10+ but it is not intended to be supported anyway, so treat
+        # it as not implemented.
         return self._metadata.keys()
 
     @staticmethod
@@ -388,9 +433,9 @@ class TensorDeserializer(collections.abc.Mapping):
         # Read the hashes.
         for i in range(num_hashes):
             # Read the hash type.
-            hash_type = struct.unpack("<B", b[hash_idx:hash_idx+1])[0]
+            hash_type = struct.unpack("<B", b[hash_idx:hash_idx + 1])[0]
             # Read the size of the hash.
-            hash_size = struct.unpack("<B", b[hash_idx+1:hash_idx+2])[0]
+            hash_size = struct.unpack("<B", b[hash_idx + 1:hash_idx + 2])[0]
             # Read the hash.
             hash_begin = hash_idx + 2
             hash_end = hash_begin + hash_size
@@ -418,6 +463,20 @@ class TensorDeserializer(collections.abc.Mapping):
         Note that this function does not seek to the beginning of the tensor
         data. It assumes that the file pointer is already at the beginning
         of the tensor data that it should read.
+
+        It will read `num_tensors` tensors from the file, or all tensors
+        if `num_tensors` is -1.
+
+        The generator yields tuples of the form:
+            (module_idx, tensor_type, name, arr)
+
+        Args:
+            filter_func: A function that takes a tensor name and returns
+                True if the tensor should be returned, False otherwise.
+            num_tensors: The number of tensors to read. If -1, all tensors
+                will be read. If the zero-byte header is encountered before
+                `num_tensors` tensors are read, the generator will stop
+                yielding values.
         """
 
         try:
@@ -426,29 +485,40 @@ class TensorDeserializer(collections.abc.Mapping):
                 header_sz = struct.unpack("<Q", self._file.read(8))[0]
                 if header_sz == 0:
                     break
+                # We read the entire header into memory rather than reading
+                # it piecewise to avoid the overhead of many small reads,
+                # especially for network streams.
                 headers = self._file.read(header_sz - 8)
                 header_len = len(headers)
+
                 module_idx = struct.unpack("<H", headers[0:2])[0]
+
                 tensor_type = TensorType(struct.unpack("<B", headers[2:3])[0])
+
+                # Read the name.
                 name_sz = struct.unpack("<H", headers[3:5])[0]
                 idx = name_sz + 5
                 name_bytes = headers[5:idx]
                 name: str = name_bytes.decode("utf-8")
+
+                # Read the dtype of the tensor.
                 dtype_len = struct.unpack("<B", headers[idx: idx + 1])[0]
                 dtype_end = idx + dtype_len + 1
                 dtype = headers[idx + 1: dtype_end]
-                # read the shape amount, according to the serialized format. the shape
-                # length is 1 byte after the dtype end.
+
+                # Read the shape amount, according to the serialized format.
+                # The shape length is 1 byte after the dtype end.
                 shape_len = struct.unpack(
                     "<B", headers[dtype_end: dtype_end + 1]
                 )[0]
-                # the shape elements are <I, so we read 4 bytes. _read_shapes takes in
-                # the header object and the number of elements in the shape.
+                # The shape elements are <I, so we read 4 bytes. _read_shapes
+                # takes in the header object and the number of elements in
+                # the shape.
                 #
-                # the amount of bytes for the shape is 4 * the number of elements in
-                # the shape. so, we need to read 4 * shape_len bytes after the
-                # dtype end + 1 byte for the shape length. sort of convoluted, but it
-                # works.
+                # The amount of bytes for the shape is 4 * number of elements
+                # in the shape. so, we need to read 4 * shape_len bytes after
+                # the dtype end + 1 byte for the shape length. sort of
+                # convoluted, but it works.
                 shape_begin = dtype_end + 1
                 shape_end = shape_begin + (4 * shape_len)
                 shape_list = self._read_shapes(
@@ -456,36 +526,57 @@ class TensorDeserializer(collections.abc.Mapping):
                     shape_len,
                 )
 
-                # Read our hashes in. We need to read the hashes size, then read the
-                # hash bytes.
+                # Read our hashes in. We need to read the hashes size, then
+                # read the hash bytes.
                 #
                 # TODO: Actually verify the hashes on request.
                 hashes_begin = shape_end
-                hashes_sz = struct.unpack("<H",
-                                          headers[hashes_begin: hashes_begin + 2])[0]
+                hashes_sz_slice = headers[hashes_begin: hashes_begin + 2]
+                hashes_sz = struct.unpack("<H", hashes_sz_slice)[0]
                 hashes_end = hashes_begin + hashes_sz
-                hashes = self._decode_hashes(headers[hashes_begin + 2: hashes_end])
 
+                hashes_slice = headers[hashes_begin + 2: hashes_end]
+                hashes = self._decode_hashes(hashes_slice)
+
+                # Finally, get the tensor data length.
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
+
                 # Check if the name passes the filter_func, drop if it doesn't.
                 if filter_func is not None and not filter_func(name):
                     self._file.seek(data_length, io.SEEK_CUR)
                     continue
 
+                # We use memoryview to avoid copying the data.
                 mv: memoryview
-                if not self._plaid_mode and not self._on_demand:
+                if not self._plaid_mode and not self._lazy_load:
+                    # In default mode, we've already allocated all the
+                    # memory we need in a single buffer that contains
+                    # all the tensors. We just need to slice out the
+                    # memoryview for the current tensor.
                     mv = memoryview(self._buffer)[self._allocated:
-                                                  self._allocated + data_length]
+                                                  self._allocated +
+                                                  data_length]
                     self._file.readinto(mv)
                     self._allocated += data_length
                 elif self._plaid_mode:
+                    # In plaid_mode, we don't allocate a buffer, we just
+                    # reuse the same one. This is a filthy hack, as we're
+                    # overwriting the buffer contents that is used to back
+                    # the prior tensor. This works because we don't use
+                    # the buffer contents after we yield the tensor, which
+                    # is loaded straight into the GPU memory.
                     mv = memoryview(self._buffer)
                     self._file.readinto(mv[:data_length])
                 else:
+                    # In lazy_load mode, we allocate a new buffer for each
+                    # tensor. This is a bit slower, but it's the only way
+                    # to support lazy loading.
                     buffer = bytearray(data_length)
                     mv = memoryview(buffer)
                     self._file.readinto(mv)
 
+                # Convert the memoryview to a numpy array. We use the
+                # memmap class to avoid copying the data.
                 arr = numpy.ndarray.__new__(
                     numpy.memmap,
                     shape_list,
@@ -503,7 +594,9 @@ class TensorDeserializer(collections.abc.Mapping):
                             dtype: Optional[str] = None,
                             device=utils.get_device()) -> torch.nn.Parameter:
         """
-        Convert a numpy array to a torch tensor on a device.
+        Convert a numpy array to a torch.nn.Parameter on a device, forcing
+        gradient when appropriate. We also handle torch.nn.Parameter objects in
+        a passthrough manner.
         """
         if isinstance(arr, torch.nn.Parameter):
             arr.data = arr.data.to(device)
@@ -520,12 +613,13 @@ class TensorDeserializer(collections.abc.Mapping):
 
     def _generate_state_dict(
             self,
-            device=utils.get_device(),
+            device: Union[str, torch.device, None] = None,
             dtype: Optional[str] = None,
             filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
     ) -> OrderedDict:
         """
-        Load the tensors in this Tensorizer object into a state_dict.
+        Load the tensors in this Tensorizer object into a state_dict. This
+        is used to populate the cache in non-lazy_load cases.
 
         :param device: The device to load the tensors onto.
         :param dtype: The dtype to load the tensors as. Defaults to None, which
@@ -535,6 +629,11 @@ class TensorDeserializer(collections.abc.Mapping):
             If None, all tensors are loaded.
         :return:
         """
+        if device is None:
+            device = self._device
+            if device is None:
+                device = utils.get_device()
+
         if self._file.closed:
             raise IOError("IO closed, instantiate if you want to load again.")
 
@@ -548,16 +647,31 @@ class TensorDeserializer(collections.abc.Mapping):
     def load_into_module(
             self,
             m: torch.nn.Module,
-            device=utils.get_device(),
+            device: Union[str, torch.device, None] = None,
             dtype: Optional[str] = None,
             filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
     ) -> int:
         """
         Given `m`, a torch.nn.Module, load the associate tensors in this
-        Tensorizer object into the `torch.nn.Module`. Returns the number of tensors
-        loaded into the module.
+        Tensorizer object into the `torch.nn.Module`. Returns the number of
+        tensors loaded into the module.
+
+        Args:
+            m: The module to load the tensors into.
+            device: The device to load the tensors onto.
+            dtype: The dtype to load the tensors as. Defaults to None, which
+                means the dtype is not changed from the serialized dtype.
+            filter_func: A function (tensor_name: str) -> bool that returns
+                True if a tensor should be loaded, or False if it should be
+                skipped.
         """
+        if device is None:
+            device = self._device
+            if device is None:
+                device = utils.get_device()
+
         modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
+
         for name, module in m.named_modules():
             modules[name] = module
 
@@ -589,6 +703,13 @@ class TensorSerializer:
     """
     Given a file-like object or path, serialize tensors from a torch.nn.Module
     to it.
+
+    Args:
+        file_obj: A file-like object or path to a file to write to. The path
+            can be a S3 URI.
+        compress_tensors: If True, compress the tensors using lz4. This
+            exists as an internal curiousity as it doesn't seem to make
+            much of a difference in practice.
     """
 
     def __init__(
@@ -602,13 +723,10 @@ class TensorSerializer:
             self._mode_check(file_obj)
             self._file = file_obj
         self._tensors = 0
+        self._idx = 0
         self.total_tensor_bytes = 0
         self.total_compressed_tensor_bytes = 0
         self.compress_tensors = compress_tensors
-        self.read_bytes = 0
-        self._buffer = bytearray(1024 * 1024)
-        self._state_dict = None
-        self._idx = 0
         if self.compress_tensors:
             import lz4.frame
             self.lz4_frame = lz4.frame
@@ -727,6 +845,13 @@ class TensorSerializer:
         Serializes a tensor, laying things out so that it can be read in three
         calls from the input -- once for the size, once for the header, and
         once for the tensor itself.
+
+        Args:
+            idx: The index of the tensor in the module.
+            name: The name of the tensor.
+            tensor_type: The type of the tensor. This is used to determine
+                how to interpret the tensor.
+            tensor: The tensor to serialize.
 
         Serialization format:
 
@@ -931,6 +1056,11 @@ class TensorSerializer:
     def write_state_dict(self, state_dict: Dict):
         """
         Write the state_dict to the file in Tensorizer format.
+
+        It is strongly recommended that you use write_module instead of
+        this function, as it will also write out the parameter type,
+        allowing for zero-copy loading of the module with
+        TensorDeserializer.load_into_module.
         """
         idx = 0
         for name, param in state_dict.items():

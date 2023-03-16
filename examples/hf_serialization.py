@@ -119,7 +119,7 @@ def load_model(
 
     logger.info(f"Loading {tensors_uri}, {ram_usage}")
 
-    tensor_deserializer = TensorDeserializer(tensor_stream, on_demand=True)
+    tensor_deserializer = TensorDeserializer(tensor_stream, lazy_load=True)
 
     if configclass is not None:
         try:
