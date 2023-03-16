@@ -153,14 +153,17 @@ class TestDeserialization(unittest.TestCase):
             check_deserialized(deserialized, model_name)
             deserialized.close()
 
+        expected_regex_keys = set(filter(pattern.match, all_keys))
+        expected_custom_keys = set(filter(custom_check, all_keys))
+
         assert (
-            any(map(custom_check, all_keys))
-            and not all(map(custom_check, all_keys))
+            expected_regex_keys and expected_regex_keys < all_keys
+            and expected_custom_keys and expected_custom_keys < all_keys
         ), "The filter_func test cannot continue" \
-           " because the filter_func used in the test" \
+           " because a filter_func used in the test" \
            " does not appear in the test model," \
            " or matches all tensor names." \
-           " Update the pattern and custom_check" \
+           " Update the pattern and/or custom_check" \
            " to use more informative filtering criteria." \
            "\n\nTensors present in the model: " + " ".join(all_keys)
 
@@ -172,8 +175,7 @@ class TestDeserialization(unittest.TestCase):
             regex_keys = set(deserialized.keys())
             # Test that the deserialized tensors form a proper,
             # non-empty subset of the original list of tensors.
-            assert regex_keys and regex_keys < all_keys
-            assert all(pattern.match(name) for name in regex_keys)
+            assert regex_keys == expected_regex_keys
             check_deserialized(deserialized, model_name)
             deserialized.close()
 
@@ -183,11 +185,6 @@ class TestDeserialization(unittest.TestCase):
                                               device="cuda",
                                               filter_func=custom_check)
             custom_keys = set(deserialized.keys())
-            assert custom_keys and custom_keys < all_keys
-            assert all(custom_check(name) for name in custom_keys)
+            assert custom_keys == expected_custom_keys
             check_deserialized(deserialized, model_name)
             deserialized.close()
-
-        with self.subTest(msg="Testing that equivalent filters"
-                              " produce equivalent results"):
-            assert regex_keys == custom_keys != all_keys
