@@ -174,10 +174,12 @@ class TensorDeserializer(collections.abc.Mapping):
         self._buffer_addr = None
         if not on_demand and not plaid_mode:
             start_allocate = time.time()
-            self._buffer = mmap.mmap(-1,
-                                     self.total_tensor_bytes,
-                                     prot=mmap.PROT_READ | mmap.PROT_WRITE,
-                                     flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+
+            mmap_flags = 0
+            mmap_flags |= getattr(mmap, "MAP_PRIVATE", 0)
+            mmap_flags |= getattr(mmap, "MAP_ANONYMOUS", 0)
+            mmap_flags = {"flags": mmap_flags} if mmap_flags else {}
+            self._buffer = mmap.mmap(-1, self.total_tensor_bytes, **mmap_flags)
 
             tb = ctypes.c_char * self.total_tensor_bytes
             ctb = tb.from_buffer(self._buffer)
