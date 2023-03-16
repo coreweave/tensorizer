@@ -104,6 +104,7 @@ class TensorDeserializer(collections.abc.Mapping):
             device: Union[torch.device, str, None] = None,
             filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
             dtype: Union[torch.dtype, str, None] = None,
+            *,
             lazy_load: bool = False,
             plaid_mode: bool = False):
         if isinstance(file_obj, str):
