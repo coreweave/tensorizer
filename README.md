@@ -3,7 +3,7 @@ Module, Model, and Tensor Serialization/Deserialization
 
 ## TLDR
 Extremely fast model loads from HTTP/HTTPS and S3 endpoints. GPT-J
-(`20gb`) loads at wire-speed (`~5GB/s`) on a 40gige network, and is
+(`20GB`) loads at wire-speed (`~5GB/s`) on a 40GbE network, and is
 only bottlenecked by the Linux kernel TCP stack.
 
 ## Rationale
