@@ -29,7 +29,10 @@ import hashlib
 import zlib
 import ctypes
 
-cudart = torch.cuda.cudart()
+if torch.cuda.is_available():
+    cudart = torch.cuda.cudart()
+else:
+    cudart = None
 
 from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Iterator, Dict, Callable, Any

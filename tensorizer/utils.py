@@ -40,6 +40,8 @@ def _get_gpu_mem_usage():
     Returns a tuple of (total_vram, free_vram, used_vram) in bytes if possible.
     Returns None if neither PyTorch >=1.10 nor pynvml is available.
     """
+    if not torch.cuda.is_available():
+        return None
     mem_get_info = getattr(torch.cuda, "mem_get_info", None)
     if mem_get_info is not None:
         free, total = mem_get_info()
