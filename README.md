@@ -167,5 +167,3 @@ likely be much slower than `load_into_module`.
 The `state_dict` can also be used to initialize a Huggingface Transfomers
 AutoModel. But Hugginface Transformers performs three or more copies of
 the data, so memory use will explode.
-
-
