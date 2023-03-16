@@ -67,8 +67,8 @@ Conversely, deserialization is done with the `TensorDeserializer` class.
 It takes a `path_uri` argument that can be a local filesystem path, an
 HTTP/HTTPS endpoint, or an S3 endpoint.
 
-`load_module` is the main method of the `TensorDeserializer` class. It
-takes a `torch.nn.Module` and loads the tensors from the `path_uri`
+`load_into_module` is the main method of the `TensorDeserializer` class.
+It takes a `torch.nn.Module` and loads the tensors from the `path_uri`
 endpoint into the `torch.nn.Module`.
 
 The below example loads the `EleutherAI/gpt-j-6B` model from an S3
@@ -134,10 +134,38 @@ algo desconocido, ya que en este mundo han
 llegado a dominar tantos
 ```
 
-
 More practical examples for the usage of `tensorizer` can be found in
 [examples/hf_serialization.py](examples/hf_serialization.py),
 where `df_main()` serializes models from
 [HuggingFace Diffusers](https://github.com/huggingface/diffusers)
 and `hf_main()` serializes
 [HuggingFace Transformers](https://github.com/huggingface/transformers) models.
+
+## Additional Features
+`tensorizer` has a few additional features that make it more useful than
+just a serialization/deserialization tool.
+
+### Plaid Mode
+`tensorizer` has a `plaid_mode` argument that can be passed to the
+`TensorDeserializer` class. When `plaid_mode` is `True`, `tensorizer`
+will load the tensors extremely fast. This is done by loading the tensors
+into a `torch.nn.Module` that is not initialized, by overriding the
+`__init__` method of the `torch.nn.Module` to do nothing.
+
+The tensors are them loaded into a buffer, and the buffer is zero-copied
+into the uninitialized `torch.nn.Module`. This is unsafe, and should only
+be used in inference cases where the model is not being trained.
+
+### `state_dict` Support
+The `TensorDeserializer` object can be used as-is as a `state_dict` for
+`torch.nn.Module.load_state_dict`. This is useful for loading the tensors
+into a `torch.nn.Module` that is already initialized, or for inspection.
+
+Keep in mind that `load_state_dict` is not a fast operation, and will
+likely be much slower than `load_into_module`.
+
+The `state_dict` can also be used to initialize a Huggingface Transfomers
+AutoModel. But Hugginface Transformers performs three or more copies of
+the data, so memory use will explode.
+
+
