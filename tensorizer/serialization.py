@@ -35,6 +35,8 @@ from typing import Optional, Tuple, Union, List, Iterator, Dict, Callable, Any
 
 lz4 = None
 
+__all__ = ["TensorSerializer", "TensorDeserializer"]
+
 # Setup logger
 logger = logging.getLogger(__name__)
 

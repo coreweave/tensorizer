@@ -14,6 +14,8 @@ import shutil
 
 import tensorizer._wide_pipes as _wide_pipes
 
+__all__ = ["open_stream", "CURLStreamFile"]
+
 logger = logging.getLogger(__name__)
 
 curl_path = shutil.which("curl")
