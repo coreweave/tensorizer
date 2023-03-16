@@ -10,7 +10,6 @@ from urllib.parse import urlparse
 import boto3
 from io import SEEK_SET, SEEK_CUR, SEEK_END
 from typing import Union, Optional, Dict, Any
-import requests
 import shutil
 
 import tensorizer._wide_pipes as _wide_pipes
@@ -86,6 +85,10 @@ class CURLStreamFile:
                  end: Optional[int] = None,
                  headers: Dict[str, Any] = None) -> None:
         self._uri = uri
+
+        if curl_path is None:
+            RuntimeError("cURL is a required dependency for streaming downloads"
+                         " and could not be found.")
 
         # NOTE: `256mb` buffer on the python IO object.
         cmd = [
@@ -215,86 +218,6 @@ class CURLStreamFile:
             self.__init__(self._uri, position, None)
 
 
-class RequestsStreamFile:
-    """
-    RequestsStreamFile implements a file-like object around an HTTP download, the
-    intention being to not buffer more than we have to. Not as fast or efficient
-    as CURLStreamFile, but it works on Windows.
-    """
-
-    def __init__(self, uri: str) -> None:
-        self._uri = uri
-        self._curr = 0
-        self._r = requests.get(uri, stream=True)
-        self.closed = False
-
-    def _read_until(
-            self, goal_position: int, ba: Union[bytearray, None] = None
-    ) -> Union[bytes, int]:
-        if ba is None:
-            rq_sz = goal_position - self._curr
-            ret_buff = self._r.raw.read(rq_sz)
-            ret_buff_sz = len(ret_buff)
-        else:
-            rq_sz = len(ba)
-            ret_buff_sz = self._r.raw.readinto(ba)
-            ret_buff = ba
-        if ret_buff_sz != rq_sz:
-            self.closed = True
-            raise IOError(f"Requested {rq_sz} != {ret_buff_sz}")
-        self._curr += ret_buff_sz
-        if ba is None:
-            return ret_buff
-        else:
-            return ret_buff_sz
-
-    def tell(self) -> int:
-        return self._curr
-
-    def readinto(self, ba: bytearray) -> int:
-        goal_position = self._curr + len(ba)
-        return self._read_until(goal_position, ba)
-
-    def read(self, size=None) -> bytes:
-        if self.closed:
-            raise IOError("RequestsStreamFile closed.")
-        if size is None:
-            return self._r.raw.read()
-        goal_position = self._curr + size
-        return self._read_until(goal_position)
-
-    @staticmethod
-    def writable() -> bool:
-        return False
-
-    @staticmethod
-    def fileno() -> int:
-        return -1
-
-    def close(self):
-        self.closed = True
-        self._r.close()
-        del self._r
-
-    def readline(self):
-        raise NotImplementedError("Unimplemented")
-
-    """
-    This seek() implementation is effectively a no-op, and will throw an
-    exception for anything other than a seek to the current position.
-    """
-
-    def seek(self, position, whence=SEEK_SET):
-        if whence == SEEK_CUR:
-            position += self._curr
-        if position == self._curr:
-            return
-        if whence == SEEK_END:
-            raise ValueError("Unsupported `whence`")
-        else:
-            raise ValueError("Seeking is unsupported")
-
-
 def s3_upload(path: str,
               target_uri: str,
               s3_access_key_id: str,
@@ -355,7 +278,7 @@ def open_stream(
         s3_access_key_id: Optional[str] = None,
         s3_secret_access_key: Optional[str] = None,
         s3_endpoint: Optional[str] = None,
-) -> Union[RequestsStreamFile, CURLStreamFile, typing.BinaryIO]:
+) -> Union[CURLStreamFile, typing.BinaryIO]:
     """Open a file path, http(s):// URL, or s3:// URI.
     :param path_uri: File path, http(s):// URL, or s3:// URI to open.
     :param mode: Mode with which to open the stream.
@@ -389,14 +312,7 @@ def open_stream(
         if normalized_mode != "br":
             raise ValueError(
                 'Only the mode "rb" is valid when opening http(s):// streams.')
-        if curl_path is not None:
-            # curl exists, so we can use the fast CURL-based loader.
-            logger.debug(f"Using CURL for tensor streaming of {path_uri}")
-            return CURLStreamFile(path_uri)
-        else:
-            # Fallback to slow requests-based loader.
-            logger.debug(f"Using requests for tensor streaming {path_uri}")
-            return RequestsStreamFile(path_uri)
+        return CURLStreamFile(path_uri)
 
     elif scheme == "s3":
         if normalized_mode not in ("br", "bw", "ab"):
