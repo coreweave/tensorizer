@@ -363,12 +363,15 @@ def open_stream(
                 def close(self):
                     # Close, upload by name, and then delete the file.
                     #
-                    # boto3's upload_fileobj could be used before closing the file,
-                    # instead of closing it and then uploading it by name,
-                    # but upload_fileobj is less performant than upload_file
-                    # as of boto3's s3 library s3transfer, version 0.6.0.
+                    # boto3's upload_fileobj could be used before closing the
+                    # file, instead of closing it and then uploading it by
+                    # name, but upload_fileobj is less performant than
+                    # upload_file as of boto3's s3 library s3transfer,
+                    # version 0.6.0.
+
                     # For details, see the implementation & comments:
                     # https://github.com/boto/s3transfer/blob/0.6.0/s3transfer/upload.py#L351
+
                     # TL;DR: s3transfer does multithreaded transfers
                     # that require multiple file handles to work properly,
                     # but Python cannot duplicate file handles such that
@@ -376,10 +379,14 @@ def open_stream(
                     # so they have to buffer it all in memory.
                     if self.closed:
                         # Makes close() idempotent.
-                        # If the resulting object is used as a context manager,
-                        # close() is called twice (once in the serializer code,
-                        # once after, when leaving the context).
-                        # Without this check, this would trigger two separate uploads.
+
+                        # If the resulting object is used as a context
+                        # manager, close() is called twice (once in the
+                        # serializer code, once after, when leaving the
+                        # context).
+
+                        # Without this check, this would trigger two
+                        # separate uploads.
                         return
                     try:
                         super().close()
@@ -391,8 +398,8 @@ def open_stream(
                     finally:
                         os.unlink(self.file)
             # delete must be False or the file will be deleted by the OS
-            # as soon as it closes, before it can be uploaded
-            # on platforms with primitive temporary file support (e.g. Windows)
+            # as soon as it closes, before it can be uploaded on platforms
+            # with primitive temporary file support (e.g. Windows)
             return AutoUploadedTempFile(mode="wb+", delete=False)
         else:
             return s3_download(path_uri,
@@ -401,6 +408,7 @@ def open_stream(
                                s3_endpoint)
 
     else:
+        os.makedirs(os.path.dirname(path_uri), exist_ok=True)
         handle: typing.BinaryIO = open(path_uri, mode)
         handle.seek(0)
         return handle
