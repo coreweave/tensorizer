@@ -49,18 +49,31 @@ The below example serializes the `EleutherAI/gpt-j-6B` model to an S3
 endpoint. It assumes that you have already configured your S3
 credentials in `~/.s3cfg`.
 
+**NOTE:** Loading and serializing `gpt-j-6B` will take a lot of CPU RAM,
+up to `~20GB`. Additionally, when loading `gpt-j-6B` into a GPU, you
+will need about `~16GB` of VRAM.
+
+If you don't have that much RAM or VRAM, you can use the smaller
+`gpt-neo-125m` model instead.
+
+[deserialize.py](examples/serialize.py)
 ```python
 from transformers import AutoModelForCausalLM
 from tensorizer.serialization import TensorSerializer
+import torch
 
-model_name = "EleutherAI/gpt-j-6B"
-# To run this at home, swap this with the line below for a smaller example:
-# model_name = "EleutherAI/gpt-neo-125m"
+model_ref = "EleutherAI/gpt-j-6B"
+# For less intensive requirements, swap above with the line below:
+# model_ref = "EleutherAI/gpt-neo-125m"
+model_name = model_ref.split("/")[-1]
+# Change this to your S3 bucket.
+s3_bucket = "bucket"
 
-output_dir = model_name.split("/")[-1]
-s3_uri = f"s3://bucket/{output_dir}.tensors"
+s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 
-model = AutoModelForCausalLM.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_ref,
+                                             revision="float16",
+                                             torch_dtype=torch.float16)
 
 serializer = TensorSerializer(s3_uri)
 serializer.write_module(model)
@@ -77,12 +90,13 @@ endpoint into the `torch.nn.Module`.
 The below example loads the `EleutherAI/gpt-j-6B` model from an S3
 endpoint.
 
+[serialize.py](examples/deserialize.py)
 ```python
 import torch
 import os
 import time
 from tensorizer.serialization import TensorDeserializer
-from tensorizer.utils import no_init_or_tensor
+from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
 from collections import OrderedDict
 
 # disable missing keys and unexpected key warnings
@@ -93,9 +107,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 model_ref = "EleutherAI/gpt-j-6B"
 # To run this at home, swap this with the line below for a smaller example:
 # model_ref = "EleutherAI/gpt-neo-125m"
-
 model_name = model_ref.split("/")[-1]
-s3_uri = f"s3://bucket/{model_name}.tensors"
+# Change this to your S3 bucket.
+s3_bucket = "bucket"
+s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 
 config = AutoConfig.from_pretrained(model_ref)
 
@@ -106,6 +121,8 @@ model = no_init_or_tensor(
     )
 )
 
+before_mem = get_mem_usage()
+
 # Lazy load the tensors from S3 into the model.
 start = time.time()
 deserializer = TensorDeserializer(s3_uri, plaid_mode=True)
@@ -113,22 +130,25 @@ deserializer.load_into_module(model)
 end = time.time()
 
 # Brag about how fast we are.
-print(f"Deserialized model in {end - start:0.2f} seconds")
+total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
+duration = end - start
+per_second = convert_bytes(deserializer.total_tensor_bytes / duration)
+after_mem = get_mem_usage()
+print(f"Deserialized {total_bytes_str} in {end - start:0.2f}s, {per_second}")
+print(f"Memory usage before: {before_mem}")
+print(f"Memory usage after: {after_mem}")
 
 # Tokenize and generate
+model.eval()
 tokenizer = AutoTokenizer.from_pretrained(model_ref)
 input_ids = tokenizer.encode(
     "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
 ).to("cuda")
 
 with torch.no_grad():
-    output = model.generate(
-        input_ids, max_new_tokens=50, do_sample=True
-    )
+    output = model.generate(input_ids, max_new_tokens=50, do_sample=True)
 
-print(
-    f"Test Output: {tokenizer.decode(output[0], skip_special_tokens=True)}"
-)
+print(f"Output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
 ```
 
 It should produce output similar to the following, with GPT-J-6B:
