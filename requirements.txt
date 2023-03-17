@@ -1,5 +1,5 @@
 torch>=1.9.0
-numpy>=1.24.0
+numpy>=1.19.5
 protobuf>=3.19.5
 psutil>=5.9.4
-boto3>=1.26.92
+boto3>=1.23.10
