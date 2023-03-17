@@ -36,3 +36,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["tensorizer"]
+
+[tool.setuptools.package-data]
+tensorizer = ["tensors.proto"]
