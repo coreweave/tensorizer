@@ -270,7 +270,7 @@ def hf_main(args):
 
 
 def main():
-    # usage: tensorizer [input-directory] [output-prefix] [model-type]
+    # usage: python hf_serialization.py <hf_id/model_path> <output_path> --model_type <transformers/diffusers> --validate
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
