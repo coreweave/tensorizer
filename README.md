@@ -54,6 +54,9 @@ from transformers import AutoModelForCausalLM
 from tensorizer.serialization import TensorSerializer
 
 model_name = "EleutherAI/gpt-j-6B"
+# To run this at home, swap this with the line below for a smaller example:
+# model_name = "EleutherAI/gpt-neo-125m"
+
 output_dir = model_name.split("/")[-1]
 s3_uri = f"s3://bucket/{output_dir}.tensors"
 
@@ -88,6 +91,9 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 model_ref = "EleutherAI/gpt-j-6B"
+# To run this at home, swap this with the line below for a smaller example:
+# model_ref = "EleutherAI/gpt-neo-125m"
+
 model_name = model_ref.split("/")[-1]
 s3_uri = f"s3://bucket/{model_name}.tensors"
 
@@ -125,7 +131,7 @@ print(
 )
 ```
 
-It should produce output similar to the following:
+It should produce output similar to the following, with GPT-J-6B:
 ```
 Deserialized model in 6.25 seconds
 Test Output: ¡Hola! Encantado de conocerte. hoy voy a comentar por primera
