@@ -406,7 +406,7 @@ def open_stream(
                               s3_secret_access_key,
                               s3_endpoint)
                 finally:
-                    os.unlink(self.file.name)
+                    os.unlink(self.name)
 
             # Bind the method to the instance
             temp_file.close = MethodType(close, temp_file)
