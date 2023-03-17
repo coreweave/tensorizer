@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 curl_path = shutil.which("curl")
 
-default_s3_endpoint = "object.ord1.coreweave.com"
+default_s3_read_endpoint = "accel-object.ord1.coreweave.com"
+default_s3_write_endpoint = "object.ord1.coreweave.com"
+
 if sys.platform != "win32":
     _s3_config_paths = (os.path.expanduser("~/.s3cfg"),)
 else:
@@ -224,7 +226,7 @@ def s3_upload(path: str,
               target_uri: str,
               s3_access_key_id: str,
               s3_secret_access_key: str,
-              s3_endpoint: str = default_s3_endpoint):
+              s3_endpoint: str = default_s3_write_endpoint):
     if s3_secret_access_key is None:
         raise TypeError("No secret key provided")
     if s3_access_key_id is None:
@@ -247,7 +249,7 @@ def s3_upload(path: str,
 def s3_download(path_uri: str,
                 s3_access_key_id: str,
                 s3_secret_access_key: str,
-                s3_endpoint: str = default_s3_endpoint) -> CURLStreamFile:
+                s3_endpoint: str = default_s3_read_endpoint) -> CURLStreamFile:
     if s3_secret_access_key is None:
         raise TypeError("No secret key provided")
     if s3_access_key_id is None:
@@ -356,9 +358,10 @@ def open_stream(
 
         # Regardless of whether the config needed to be parsed,
         # the endpoint gets a default value.
-        s3_endpoint = s3_endpoint or default_s3_endpoint
 
         if 'w' in mode or 'a' in mode:
+            s3_endpoint = s3_endpoint or default_s3_write_endpoint
+
             class AutoUploadedTempFile(tempfile.NamedTemporaryFile):
                 def close(self):
                     # Close, upload by name, and then delete the file.
@@ -402,6 +405,7 @@ def open_stream(
             # with primitive temporary file support (e.g. Windows)
             return AutoUploadedTempFile(mode="wb+", delete=False)
         else:
+            s3_endpoint = s3_endpoint or default_s3_read_endpoint
             return s3_download(path_uri,
                                s3_access_key_id,
                                s3_secret_access_key,

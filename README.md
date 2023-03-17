@@ -227,3 +227,11 @@ likely be much slower than `load_into_module`.
 The `state_dict` can also be used to initialize a HuggingFace Transformers
 AutoModel. But HuggingFace Transformers performs three or more copies of
 the data, so memory use will explode.
+
+## Running Tests
+`tensorizer` uses `pytest` for testing. It has its own set of dependencies,
+which can be installed with `pip install -r tests/requirements.txt`.
+
+Some tests require a GPU, and will be skipped if no GPU is available.
+
+To run the tests, run `pytest` from the root of the repository.
