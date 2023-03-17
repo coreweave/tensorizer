@@ -198,6 +198,6 @@ into a `torch.nn.Module` that is already initialized, or for inspection.
 Keep in mind that `load_state_dict` is not a fast operation, and will
 likely be much slower than `load_into_module`.
 
-The `state_dict` can also be used to initialize a Huggingface Transfomers
-AutoModel. But Hugginface Transformers performs three or more copies of
+The `state_dict` can also be used to initialize a HuggingFace Transformers
+AutoModel. But HuggingFace Transformers performs three or more copies of
 the data, so memory use will explode.
