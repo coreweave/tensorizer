@@ -785,7 +785,8 @@ class TensorSerializer:
                 .format(mode and f', current mode="{mode}"'))
 
     def __del__(self):
-        self._file.close()
+        if getattr(self, "_file", None) is not None:
+            self._file.close()
 
     @staticmethod
     def _dump_shape(obj) -> bytes:
