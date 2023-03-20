@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import boto3
 from io import SEEK_SET, SEEK_CUR, SEEK_END
-from typing import Union, Optional, Dict, Any
+from typing import Union, Optional, Dict, Any, Tuple
 import shutil
 
 import tensorizer._wide_pipes as _wide_pipes
@@ -25,13 +25,13 @@ default_s3_read_endpoint = "accel-object.ord1.coreweave.com"
 default_s3_write_endpoint = "object.ord1.coreweave.com"
 
 if sys.platform != "win32":
-    _s3_config_paths = (os.path.expanduser("~/.s3cfg"),)
+    _s3_default_config_paths = (os.path.expanduser("~/.s3cfg"),)
 else:
     # s3cmd generates its config at a different path on Windows by default,
     # but it may have been manually placed at ~\.s3cfg instead, so check both.
-    _s3_config_paths = tuple(map(os.path.expanduser,
-                                 (r"~\.s3cfg",
-                                  r"~\AppData\Roaming\s3cmd.ini")))
+    _s3_default_config_paths = tuple(map(
+        os.path.expanduser, (r"~\.s3cfg", r"~\AppData\Roaming\s3cmd.ini"))
+    )
 
 
 class _ParsedCredentials(typing.NamedTuple):
@@ -42,14 +42,39 @@ class _ParsedCredentials(typing.NamedTuple):
 
 
 @functools.lru_cache(maxsize=None)
-def _get_s3cfg_values(config_paths=_s3_config_paths) -> _ParsedCredentials:
+def _get_s3cfg_values(
+        config_paths: Optional[
+            Union[
+                Tuple[Union[str, bytes, os.PathLike], ...],
+                str, bytes, os.PathLike
+            ]
+        ] = None
+) -> _ParsedCredentials:
     """
     Gets S3 credentials from the .s3cfg file.
 
-    Returns the 4-tuple config_file, s3_endpoint, s3_access_key, s3_secret_key,
-    where each element may be None if not found.
-    config_file is the config file path used. If it is None, no config file was found.
+    :param config_paths: The sequence of potential file paths to check
+        for s3cmd config settings. If not provided or an empty tuple,
+        platform-specific default search locations are used.
+        When specifying a sequence, this argument must be a tuple,
+        because this function is cached, and that requires
+        all arguments to be hashable.
+    :return: A 4-tuple, config_file, s3_endpoint, s3_access_key, s3_secret_key,
+        where each element may be None if not found,
+        and config_file is the config file path used.
+        If config_file is None, no valid config file
+        was found, and nothing was parsed.
+
+    If the config_paths argument is not provided or is an empty tuple,
+    platform-specific default search locations are used.
+    This function is cached, and hence config_paths must be a (hashable) tuple
+    when specifying a sequence
     """
+    if not config_paths:
+        config_paths = _s3_default_config_paths
+    elif isinstance(config_paths, (str, bytes, os.PathLike)):
+        config_paths = (config_paths,)
+
     import configparser
     config = configparser.ConfigParser()
 
@@ -64,7 +89,7 @@ def _get_s3cfg_values(config_paths=_s3_config_paths) -> _ParsedCredentials:
         raise ValueError(f"No default section in {config_path}")
 
     return _ParsedCredentials(
-        config_file=config_path,
+        config_file=os.fsdecode(config_path),
         s3_endpoint=config["default"].get("host_base"),
         s3_access_key=config["default"].get("access_key"),
         s3_secret_key=config["default"].get("secret_key")
@@ -277,12 +302,89 @@ def s3_download(path_uri: str,
     return CURLStreamFile(url)
 
 
+def _infer_credentials(
+        s3_access_key_id: Optional[str],
+        s3_secret_access_key: Optional[str],
+        s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None
+) -> _ParsedCredentials:
+    """
+    Fill in a potentially incomplete S3 credential pair
+    by parsing the s3cmd config file if necessary.
+    An empty string ("") is considered a specified credential,
+    while None is an unspecified credential.
+    Use "" for public buckets.
+
+    :param s3_access_key_id: `s3_access_key_id` if explicitly specified,
+        otherwise None. If None, the s3cmd config file is parsed for the key.
+    :param s3_secret_access_key: `s3_secret_access_key` if explicitly specified,
+        otherwise None. If None, the s3cmd config file is parsed for the key.
+    :param s3_config_path: An explicit path to the s3cmd config file to search,
+        if necessary. If None, platform-specific default paths are used.
+    :return: A `_ParsedCredentials` object with both the
+        `s3_access_key` and `s3_secret_key` fields guaranteed to not be None.
+    :raises ValueError: If the credential pair is incomplete and the
+        missing parts could not be found in any s3cmd config file.
+    """
+    if None not in (s3_access_key_id, s3_secret_access_key):
+        # All required credentials were specified; don't parse anything
+        return _ParsedCredentials(
+            config_file=None,
+            s3_endpoint=None,
+            s3_access_key=s3_access_key_id,
+            s3_secret_key=s3_secret_access_key
+        )
+
+    # Try to find default credentials if at least one is not specified
+    if s3_config_path is not None and not os.path.exists(s3_config_path):
+        raise FileNotFoundError(f"Explicitly specified s3_config_path does not exist: {s3_config_path}")
+    try:
+        parsed: _ParsedCredentials = _get_s3cfg_values(s3_config_path)
+    except ValueError as parse_error:
+        raise ValueError(
+            "Attempted to access an S3 bucket,"
+            " but credentials were not provided,"
+            " and the fallback .s3cfg file could not be parsed.") \
+            from parse_error
+
+    if parsed.config_file is None:
+        raise ValueError("Attempted to access an S3 bucket,"
+                         " but credentials were not provided,"
+                         " and no default .s3cfg file could be found.")
+
+    # Don't override a specified credential
+    if s3_access_key_id is None:
+        s3_access_key_id = parsed.s3_access_key
+    if s3_secret_access_key is None:
+        s3_secret_access_key = parsed.s3_secret_key
+
+    # Verify that both keys were ultimately found
+    for required_credential, credential_name in (
+            (s3_access_key_id, "s3_access_key_id"),
+            (s3_secret_access_key, "s3_secret_access_key")
+    ):
+        if not required_credential:
+            raise ValueError(
+                "Attempted to access an S3 bucket,"
+                f" but {credential_name} was not provided,"
+                " and could not be found in the default"
+                f" config file at {parsed.config_file}."
+            )
+
+    return _ParsedCredentials(
+        config_file=parsed.config_file,
+        s3_endpoint=parsed.s3_endpoint,
+        s3_access_key=s3_access_key_id,
+        s3_secret_key=s3_secret_access_key
+    )
+
+
 def open_stream(
         path_uri: Union[str, os.PathLike],
         mode: str = "rb",
         s3_access_key_id: Optional[str] = None,
         s3_secret_access_key: Optional[str] = None,
         s3_endpoint: Optional[str] = None,
+        s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None
 ) -> Union[CURLStreamFile, typing.BinaryIO]:
     """Open a file path, http(s):// URL, or s3:// URI.
     :param path_uri: File path, http(s):// URL, or s3:// URI to open.
@@ -320,42 +422,19 @@ def open_stream(
         return CURLStreamFile(path_uri)
 
     elif scheme == "s3":
-        if normalized_mode not in ("br", "bw", "ab"):
+        if normalized_mode not in ("br", "bw", "ab", "+bw", "+ab"):
             raise ValueError(
-                'Only the modes "rb", "wb", and "ab" are valid'
+                'Only the modes "rb", "wb[+]", and "ab[+]" are valid'
                 ' when opening s3:// streams.'
             )
-        if not s3_access_key_id or not s3_secret_access_key:
-            # Try to find default credentials if not specified
-            try:
-                parsed: _ParsedCredentials = _get_s3cfg_values()
-            except ValueError as parse_error:
-                raise ValueError(
-                    "Attempted to access S3 bucket,"
-                    " but credentials were not provided,"
-                    " and the fallback .s3cfg file could not be parsed.") \
-                    from parse_error
 
-            if parsed.config_file is None:
-                raise ValueError("Attempted to access S3 bucket,"
-                                 " but credentials were not provided,"
-                                 " and no default .s3cfg file could be found.")
+        s3 = _infer_credentials(s3_access_key_id, s3_secret_access_key, s3_config_path)
+        s3_access_key_id = s3.s3_access_key
+        s3_secret_access_key = s3.s3_secret_key
 
-            s3_access_key_id = s3_access_key_id or parsed.s3_access_key
-            s3_secret_access_key = s3_secret_access_key or parsed.s3_secret_key
-            s3_endpoint = s3_endpoint or parsed.s3_endpoint
-
-            for required_credential, credential_name in (
-                    (s3_access_key_id, "s3_access_key_id"),
-                    (s3_secret_access_key, "s3_secret_access_key")
-            ):
-                if not required_credential:
-                    raise ValueError(
-                        "Attempted to access S3 bucket,"
-                        f" but {credential_name} was not provided,"
-                        " and could not be found in the default"
-                        f" config file at {parsed.config_file}."
-                    )
+        # Not required to have been found,
+        # and doesn't overwrite an explicitly specified endpoint.
+        s3_endpoint = s3_endpoint or s3.s3_endpoint
 
         # Regardless of whether the config needed to be parsed,
         # the endpoint gets a default value.
