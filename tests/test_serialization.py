@@ -117,6 +117,8 @@ class TestSerialization(unittest.TestCase):
 
 
 class TestDeserialization(unittest.TestCase):
+    _serialized_model_path: str
+
     @classmethod
     def setUpClass(cls):
         serialized_model_path, sd = serialize_model(model_name, "cpu")
