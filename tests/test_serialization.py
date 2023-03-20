@@ -166,7 +166,7 @@ class TestDeserialization(unittest.TestCase):
                                           lazy_load=True)
 
         check_deserialized(deserialized, model_name)
-        check_inference(deserialized, model_name, "cpu")
+        check_inference(deserialized, model_name, default_device)
         deserialized.close()
 
     @unittest.skipIf(not is_cuda_available, "plaid_mode requires CUDA")
@@ -211,16 +211,16 @@ class TestDeserialization(unittest.TestCase):
         def custom_check(tensor_name: str) -> bool:
             return tensor_name.startswith("transformer.h.0")
 
-        with self.subTest(msg="Testing no filter_func"):
-            in_file = open(self._serialized_model_path, "rb")
-            deserialized = TensorDeserializer(in_file,
-                                              device=default_device,
-                                              filter_func=None)
-            all_keys = set(deserialized.keys())
-            assert all_keys, "Deserializing the model with no filter_func" \
-                             " loaded an empty set of tensors"
-            check_deserialized(deserialized, model_name)
-            deserialized.close()
+        # Testing no filter_func
+        in_file = open(self._serialized_model_path, "rb")
+        deserialized = TensorDeserializer(in_file,
+                                          device=default_device,
+                                          filter_func=None)
+        all_keys = set(deserialized.keys())
+        assert all_keys, "Deserializing the model with no filter_func" \
+                         " loaded an empty set of tensors"
+        check_deserialized(deserialized, model_name)
+        deserialized.close()
 
         expected_regex_keys = set(filter(pattern.match, all_keys))
         expected_custom_keys = set(filter(custom_check, all_keys))
