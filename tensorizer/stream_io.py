@@ -149,6 +149,12 @@ class CURLStreamFile:
         self._end = end
         self.closed = False
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     def __del__(self):
         self.close()
 
@@ -219,6 +225,10 @@ class CURLStreamFile:
                 self._curl.stdout.close()
                 self._curl.terminate()
                 self._curl.wait()
+            else:
+                # stdout is normally closed by the Popen.communicate() method,
+                # which we skip in favour of Popen.stdout.read()
+                self._curl.stdout.close()
             self._curl = None
 
     def readline(self):
