@@ -56,7 +56,7 @@ will need about `~16GB` of VRAM.
 If you don't have that much RAM or VRAM, you can use the smaller
 `gpt-neo-125m` model instead.
 
-[deserialize.py](examples/serialize.py)
+[serialize.py](examples/serialize.py)
 ```python
 from transformers import AutoModelForCausalLM
 from tensorizer.serialization import TensorSerializer
@@ -90,7 +90,7 @@ endpoint into the `torch.nn.Module`.
 The below example loads the `EleutherAI/gpt-j-6B` model from an S3
 endpoint.
 
-[serialize.py](examples/deserialize.py)
+[deserialize.py](examples/deserialize.py)
 ```python
 import torch
 import os
