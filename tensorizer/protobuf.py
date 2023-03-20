@@ -3,7 +3,8 @@ from torch import Tensor
 import numpy as np
 import tensors.tensors_pb2 as tensors_pb
 from tensors.tensors_pb2 import Tensor as TensorPb
-from typing import OrderedDict, Tuple, Union, BinaryIO
+from typing import OrderedDict as OrderedDictType, Tuple, Union, BinaryIO
+from collections import OrderedDict
 
 DtypePbs = {
     torch.float32: tensors_pb.DT_FLOAT32,
@@ -135,7 +136,7 @@ def deserialize_model(model: torch.nn.Module, file_stream: BinaryIO) -> None:
     model_proto = tensors_pb.Module()
     model_proto.ParseFromString(file_stream.read())
 
-    modules: OrderedDict[str, torch.nn.Module] = OrderedDict()
+    modules: OrderedDictType[str, torch.nn.Module] = OrderedDict()
     for name, module in model.named_modules():
         modules[name] = module
 
