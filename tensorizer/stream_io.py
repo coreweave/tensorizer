@@ -248,6 +248,17 @@ class CURLStreamFile:
             self.__init__(self._uri, position, None)
 
 
+def _ensure_https_endpoint(endpoint: str):
+    scheme, *location = endpoint.split("://", maxsplit=1)
+    scheme = scheme.lower() if location else None
+    if scheme is None:
+        return "https://" + endpoint
+    elif scheme == "https":
+        return endpoint
+    else:
+        raise ValueError("Non-HTTPS endpoint URLs are not allowed.")
+
+
 def s3_upload(path: str,
               target_uri: str,
               s3_access_key_id: str,
@@ -259,9 +270,10 @@ def s3_upload(path: str,
         raise TypeError("No access key provided")
     if s3_endpoint is None:
         raise TypeError("No S3 endpoint provided")
+
     client = boto3.session.Session.client(
         boto3.session.Session(),
-        endpoint_url="https://" + s3_endpoint,
+        endpoint_url=_ensure_https_endpoint(s3_endpoint),
         service_name="s3",
         aws_access_key_id=s3_access_key_id,
         aws_secret_access_key=s3_secret_access_key)
@@ -285,7 +297,7 @@ def s3_download(path_uri: str,
 
     client = boto3.session.Session.client(
         boto3.session.Session(),
-        endpoint_url="https://" + s3_endpoint,
+        endpoint_url=_ensure_https_endpoint(s3_endpoint),
         service_name="s3",
         aws_access_key_id=s3_access_key_id,
         aws_secret_access_key=s3_secret_access_key)
@@ -298,7 +310,6 @@ def s3_download(path_uri: str,
         Params={'Bucket': bucket,
                 'Key': key},
         ExpiresIn=300)
-    print(url)
     return CURLStreamFile(url)
 
 
@@ -391,7 +402,7 @@ def open_stream(
     :param mode: Mode with which to open the stream.
         Supported values are:
         * "rb" for http(s)://,
-        * "rb", "wb', and "ab" for s3://,
+        * "rb", "wb[+]", and "ab[+]" for s3://,
         * All standard modes for file paths.
     :param s3_access_key_id: S3 access key, corresponding to
         "aws_access_key_id" in boto3.
