@@ -5,7 +5,7 @@ from collections import OrderedDict
 from typing import Optional, Union
 
 import tensorizer.utils as utils
-from tensorizer.serialization import TensorSerializer, TensorDeserializer
+from tensorizer import TensorSerializer, TensorDeserializer
 import tensorizer.stream_io as stream_io
 import logging
 import time

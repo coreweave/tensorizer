@@ -59,7 +59,7 @@ If you don't have that much RAM or VRAM, you can use the smaller
 [serialize.py](examples/serialize.py)
 ```python
 from transformers import AutoModelForCausalLM
-from tensorizer.serialization import TensorSerializer
+from tensorizer import TensorSerializer
 import torch
 
 model_ref = "EleutherAI/gpt-j-6B"
@@ -95,7 +95,7 @@ endpoint.
 import torch
 import os
 import time
-from tensorizer.serialization import TensorDeserializer
+from tensorizer import TensorDeserializer
 from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
 from collections import OrderedDict
 

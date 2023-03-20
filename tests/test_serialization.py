@@ -16,7 +16,7 @@ os.environ[
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from tensorizer.serialization import TensorSerializer, TensorDeserializer
+from tensorizer import TensorSerializer, TensorDeserializer
 from tensorizer import utils
 from collections import OrderedDict
 
