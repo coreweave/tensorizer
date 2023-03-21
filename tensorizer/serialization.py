@@ -136,7 +136,15 @@ class TensorDeserializer(collections.abc.Mapping):
 
     def __init__(
         self,
-        file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO, str],
+        file_obj: Union[
+            io.BufferedIOBase,
+            io.RawIOBase,
+            typing.BinaryIO,
+            str,
+            bytes,
+            os.PathLike,
+            int
+        ],
         device: Union[torch.device, str, None] = None,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         dtype: Union[numpy.dtype, str, None] = None,
@@ -144,7 +152,7 @@ class TensorDeserializer(collections.abc.Mapping):
         lazy_load: bool = False,
         plaid_mode: bool = False,
     ):
-        if isinstance(file_obj, str):
+        if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "rb")
         else:
             self._mode_check(file_obj)
@@ -748,7 +756,7 @@ class TensorSerializer:
         file_obj: A file-like object or path to a file to write to. The path
             can be a S3 URI.
         compress_tensors: If True, compress the tensors using lz4. This
-            exists as an internal curiousity as it doesn't seem to make
+            exists as an internal curiosity as it doesn't seem to make
             much of a difference in practice.
     """
 
