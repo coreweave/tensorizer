@@ -1,5 +1,5 @@
 from transformers import AutoModelForCausalLM
-from tensorizer.serialization import TensorSerializer
+from tensorizer import TensorSerializer
 import torch
 
 model_ref = "EleutherAI/gpt-j-6B"
@@ -16,3 +16,4 @@ model = AutoModelForCausalLM.from_pretrained(model_ref,
 
 serializer = TensorSerializer(s3_uri)
 serializer.write_module(model)
+serializer.close()
