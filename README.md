@@ -46,6 +46,7 @@ python -m pip install tensorizer
 
 ### From Source
 You can also install `tensorizer` from source using `pip`.
+
 To clone the repository and install `tensorizer` in
 [editable mode](https://pip.pypa.io/en/stable/topics/local-project-installs/#editable-installs),
 run:
