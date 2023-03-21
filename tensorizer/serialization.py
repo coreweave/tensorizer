@@ -588,8 +588,12 @@ class TensorDeserializer(collections.abc.Mapping):
                 # Finally, get the tensor data length.
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
 
-                # Check if the name passes the filter_func, drop if it doesn't.
-                if filter_func is not None and not filter_func(name):
+                # Check if the name is in our pre-filtered list of keys
+                # from the class-level filter_func, and then verify
+                # that it passes the method-level filter_func.
+                # Skip it if it fails either check.
+                if name not in self.keys() \
+                        or (filter_func is not None and not filter_func(name)):
                     self._file.seek(data_length, io.SEEK_CUR)
                     continue
 
