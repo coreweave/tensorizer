@@ -1,0 +1,2 @@
+transformers>=4.27.1
+moto[s3,server]>=4.1.4

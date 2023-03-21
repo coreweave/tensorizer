@@ -1,0 +1,41 @@
+[project]
+name = "tensorizer"
+version = "1.0.0"
+license = { text = "MIT License" }
+keywords = ["tensorizer", "machine learning", "serialization", "tensor", "pytorch"]
+authors = [
+  { name="CoreWeave" }
+]
+description = "A tool for fast PyTorch module, model, and tensor serialization + deserialization."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=1.9.0",
+    "numpy>=1.19.5",
+    "protobuf>=3.19.5",
+    "psutil>=5.9.4",
+    "boto3>=1.26.0"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Development Status :: 5 - Production/Stable",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: Internet",
+    "Intended Audience :: Developers"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/coreweave/tensorizer"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["tensorizer"]
+
+[tool.setuptools.package-data]
+tensorizer = ["tensors.proto"]

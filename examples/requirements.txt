@@ -1,0 +1,3 @@
+transformers~=4.27.1
+diffusers==0.11.1
+accelerate==0.17.1
