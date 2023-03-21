@@ -30,8 +30,8 @@ if sys.platform != "win32":
 else:
     # s3cmd generates its config at a different path on Windows by default,
     # but it may have been manually placed at ~\.s3cfg instead, so check both.
-    _s3_default_config_paths = tuple(map(
-        os.path.expanduser, (r"~\.s3cfg", r"~\AppData\Roaming\s3cmd.ini"))
+    _s3_default_config_paths = tuple(
+        map(os.path.expanduser, (r"~\.s3cfg", r"~\AppData\Roaming\s3cmd.ini"))
     )
 
 
@@ -44,12 +44,11 @@ class _ParsedCredentials(typing.NamedTuple):
 
 @functools.lru_cache(maxsize=None)
 def _get_s3cfg_values(
-        config_paths: Optional[
-            Union[
-                Tuple[Union[str, bytes, os.PathLike], ...],
-                str, bytes, os.PathLike
-            ]
-        ] = None
+    config_paths: Optional[
+        Union[
+            Tuple[Union[str, bytes, os.PathLike], ...], str, bytes, os.PathLike
+        ]
+    ] = None
 ) -> _ParsedCredentials:
     """
     Gets S3 credentials from the .s3cfg file.
@@ -77,6 +76,7 @@ def _get_s3cfg_values(
         config_paths = (config_paths,)
 
     import configparser
+
     config = configparser.ConfigParser()
 
     # Stop on the first path that can be successfully read
@@ -93,7 +93,7 @@ def _get_s3cfg_values(
         config_file=os.fsdecode(config_path),
         s3_endpoint=config["default"].get("host_base"),
         s3_access_key=config["default"].get("access_key"),
-        s3_secret_key=config["default"].get("secret_key")
+        s3_secret_key=config["default"].get("secret_key"),
     )
 
 
@@ -110,16 +110,20 @@ class CURLStreamFile:
     in doing so as it requires re-opening the connection to the server.
     """
 
-    def __init__(self,
-                 uri: str,
-                 begin: Optional[int] = None,
-                 end: Optional[int] = None,
-                 headers: Dict[str, Any] = None) -> None:
+    def __init__(
+        self,
+        uri: str,
+        begin: Optional[int] = None,
+        end: Optional[int] = None,
+        headers: Dict[str, Any] = None,
+    ) -> None:
         self._uri = uri
 
         if curl_path is None:
-            RuntimeError("cURL is a required dependency for streaming downloads"
-                         " and could not be found.")
+            RuntimeError(
+                "cURL is a required dependency for streaming downloads"
+                " and could not be found."
+            )
 
         # NOTE: `256mb` buffer on the python IO object.
         cmd = [
@@ -160,7 +164,7 @@ class CURLStreamFile:
         self.close()
 
     def _read_until(
-            self, goal_position: int, ba: Union[bytearray, None] = None
+        self, goal_position: int, ba: Union[bytearray, None] = None
     ) -> Union[bytes, int]:
         if ba is None:
             rq_sz = goal_position - self._curr
@@ -270,11 +274,13 @@ def _ensure_https_endpoint(endpoint: str):
         raise ValueError("Non-HTTPS endpoint URLs are not allowed.")
 
 
-def s3_upload(path: str,
-              target_uri: str,
-              s3_access_key_id: str,
-              s3_secret_access_key: str,
-              s3_endpoint: str = default_s3_write_endpoint):
+def s3_upload(
+    path: str,
+    target_uri: str,
+    s3_access_key_id: str,
+    s3_secret_access_key: str,
+    s3_endpoint: str = default_s3_write_endpoint,
+):
     if s3_secret_access_key is None:
         raise TypeError("No secret key provided")
     if s3_access_key_id is None:
@@ -287,18 +293,21 @@ def s3_upload(path: str,
         endpoint_url=_ensure_https_endpoint(s3_endpoint),
         service_name="s3",
         aws_access_key_id=s3_access_key_id,
-        aws_secret_access_key=s3_secret_access_key)
+        aws_secret_access_key=s3_secret_access_key,
+    )
     path_uri = urlparse(target_uri)
     bucket = path_uri.netloc
-    key = path_uri.path.lstrip('/')
+    key = path_uri.path.lstrip("/")
 
     client.upload_file(path, bucket, key)
 
 
-def s3_download(path_uri: str,
-                s3_access_key_id: str,
-                s3_secret_access_key: str,
-                s3_endpoint: str = default_s3_read_endpoint) -> CURLStreamFile:
+def s3_download(
+    path_uri: str,
+    s3_access_key_id: str,
+    s3_secret_access_key: str,
+    s3_endpoint: str = default_s3_read_endpoint,
+) -> CURLStreamFile:
     if s3_secret_access_key is None:
         raise TypeError("No secret key provided")
     if s3_access_key_id is None:
@@ -311,23 +320,24 @@ def s3_download(path_uri: str,
         endpoint_url=_ensure_https_endpoint(s3_endpoint),
         service_name="s3",
         aws_access_key_id=s3_access_key_id,
-        aws_secret_access_key=s3_secret_access_key)
+        aws_secret_access_key=s3_secret_access_key,
+    )
     path_uri = urlparse(path_uri)
     bucket = path_uri.netloc
-    key = path_uri.path.lstrip('/')
+    key = path_uri.path.lstrip("/")
 
     url = client.generate_presigned_url(
-        ClientMethod='get_object',
-        Params={'Bucket': bucket,
-                'Key': key},
-        ExpiresIn=300)
+        ClientMethod="get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=300,
+    )
     return CURLStreamFile(url)
 
 
 def _infer_credentials(
-        s3_access_key_id: Optional[str],
-        s3_secret_access_key: Optional[str],
-        s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None
+    s3_access_key_id: Optional[str],
+    s3_secret_access_key: Optional[str],
+    s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
 ) -> _ParsedCredentials:
     """
     Fill in a potentially incomplete S3 credential pair
@@ -353,25 +363,29 @@ def _infer_credentials(
             config_file=None,
             s3_endpoint=None,
             s3_access_key=s3_access_key_id,
-            s3_secret_key=s3_secret_access_key
+            s3_secret_key=s3_secret_access_key,
         )
 
     # Try to find default credentials if at least one is not specified
     if s3_config_path is not None and not os.path.exists(s3_config_path):
-        raise FileNotFoundError(f"Explicitly specified s3_config_path does not exist: {s3_config_path}")
+        raise FileNotFoundError(
+            f"Explicitly specified s3_config_path does not exist: {s3_config_path}"
+        )
     try:
         parsed: _ParsedCredentials = _get_s3cfg_values(s3_config_path)
     except ValueError as parse_error:
         raise ValueError(
             "Attempted to access an S3 bucket,"
             " but credentials were not provided,"
-            " and the fallback .s3cfg file could not be parsed.") \
-            from parse_error
+            " and the fallback .s3cfg file could not be parsed."
+        ) from parse_error
 
     if parsed.config_file is None:
-        raise ValueError("Attempted to access an S3 bucket,"
-                         " but credentials were not provided,"
-                         " and no default .s3cfg file could be found.")
+        raise ValueError(
+            "Attempted to access an S3 bucket,"
+            " but credentials were not provided,"
+            " and no default .s3cfg file could be found."
+        )
 
     # Don't override a specified credential
     if s3_access_key_id is None:
@@ -381,8 +395,8 @@ def _infer_credentials(
 
     # Verify that both keys were ultimately found
     for required_credential, credential_name in (
-            (s3_access_key_id, "s3_access_key_id"),
-            (s3_secret_access_key, "s3_secret_access_key")
+        (s3_access_key_id, "s3_access_key_id"),
+        (s3_secret_access_key, "s3_secret_access_key"),
     ):
         if not required_credential:
             raise ValueError(
@@ -396,15 +410,11 @@ def _infer_credentials(
         config_file=parsed.config_file,
         s3_endpoint=parsed.s3_endpoint,
         s3_access_key=s3_access_key_id,
-        s3_secret_key=s3_secret_access_key
+        s3_secret_key=s3_secret_access_key,
     )
 
 
-def _temp_file_closer(
-        file: io.IOBase,
-        file_name: str,
-        *upload_args
-):
+def _temp_file_closer(file: io.IOBase, file_name: str, *upload_args):
     """
     Close, upload by name, and then delete the file.
     Meant to replace .close() on a particular instance
@@ -453,12 +463,12 @@ def _temp_file_closer(
 
 
 def open_stream(
-        path_uri: Union[str, os.PathLike],
-        mode: str = "rb",
-        s3_access_key_id: Optional[str] = None,
-        s3_secret_access_key: Optional[str] = None,
-        s3_endpoint: Optional[str] = None,
-        s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None
+    path_uri: Union[str, os.PathLike],
+    mode: str = "rb",
+    s3_access_key_id: Optional[str] = None,
+    s3_secret_access_key: Optional[str] = None,
+    s3_endpoint: Optional[str] = None,
+    s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
 ) -> Union[CURLStreamFile, typing.BinaryIO]:
     """Open a file path, http(s):// URL, or s3:// URI.
     :param path_uri: File path, http(s):// URL, or s3:// URI to open.
@@ -499,17 +509,20 @@ def open_stream(
     if scheme in ("http", "https"):
         if normalized_mode != "br":
             raise ValueError(
-                'Only the mode "rb" is valid when opening http(s):// streams.')
+                'Only the mode "rb" is valid when opening http(s):// streams.'
+            )
         return CURLStreamFile(path_uri)
 
     elif scheme == "s3":
         if normalized_mode not in ("br", "bw", "ab", "+bw", "+ab"):
             raise ValueError(
                 'Only the modes "rb", "wb[+]", and "ab[+]" are valid'
-                ' when opening s3:// streams.'
+                " when opening s3:// streams."
             )
 
-        s3 = _infer_credentials(s3_access_key_id, s3_secret_access_key, s3_config_path)
+        s3 = _infer_credentials(
+            s3_access_key_id, s3_secret_access_key, s3_config_path
+        )
         s3_access_key_id = s3.s3_access_key
         s3_secret_access_key = s3.s3_secret_key
 
@@ -536,21 +549,22 @@ def open_stream(
                 path_uri,
                 s3_access_key_id,
                 s3_secret_access_key,
-                s3_endpoint
+                s3_endpoint,
             )
             temp_file.close = guaranteed_closer
             return temp_file
         else:
             s3_endpoint = s3_endpoint or default_s3_read_endpoint
-            return s3_download(path_uri,
-                               s3_access_key_id,
-                               s3_secret_access_key,
-                               s3_endpoint)
+            return s3_download(
+                path_uri, s3_access_key_id, s3_secret_access_key, s3_endpoint
+            )
 
     else:
         if "b" not in normalized_mode:
-            raise ValueError('Only binary modes ("rb", "wb", "wb+", etc.)'
-                             ' are valid when opening local file streams.')
+            raise ValueError(
+                'Only binary modes ("rb", "wb", "wb+", etc.)'
+                " are valid when opening local file streams."
+            )
         os.makedirs(os.path.dirname(path_uri), exist_ok=True)
         handle: typing.BinaryIO = open(path_uri, mode)
         handle.seek(0)

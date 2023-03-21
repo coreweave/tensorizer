@@ -103,14 +103,17 @@ if sys.platform != "win32":
             _logger.warning(
                 f"Couldn't fcntl F_SETPIPE_SZ to {pipe_buf_sz}: {e.strerror}"
             )
+
 else:
     # Windows cannot change the size of a pipe after creation,
     # but it can set one's size during creation, so a context manager
     # is used to temporarily modify the creation of all pipes.
     _winapi = getattr(subprocess, "_winapi", None)
     if _winapi is not None and hasattr(_winapi, "CreatePipe"):
+
         class _LocalPipeSize(threading.local):
             pipe_size = 0
+
         _local = _LocalPipeSize()
         _original_create_pipe = _winapi.CreatePipe
         _pipe_routine_swap_mutex = threading.Lock()

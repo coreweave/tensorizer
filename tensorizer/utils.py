@@ -1,4 +1,5 @@
 import torch
+
 try:
     import resource
 except ImportError:
@@ -8,6 +9,7 @@ import psutil
 
 try:
     import pynvml
+
     try:
         pynvml.nvmlInit()
     except pynvml.nvml.NVMLError_LibraryNotFound:
@@ -15,7 +17,13 @@ try:
 except ImportError:
     pynvml = None
 
-__all__ = ["convert_bytes", "get_device", "get_mem_usage", "get_gpu_name", "no_init_or_tensor"]
+__all__ = [
+    "convert_bytes",
+    "get_device",
+    "get_mem_usage",
+    "get_gpu_name",
+    "no_init_or_tensor",
+]
 
 
 # Silly function to convert to human bytes
@@ -70,9 +78,7 @@ def get_mem_usage() -> str:
             gpu_total >>= 20
             gpu_free >>= 20
             gpu_used >>= 20
-            gpu_str = (
-                f"GPU: (U: {gpu_used:,}MiB F: {gpu_free:,}MiB T: {gpu_total:,}MiB) "
-            )
+            gpu_str = f"GPU: (U: {gpu_used:,}MiB F: {gpu_free:,}MiB T: {gpu_total:,}MiB) "
         torch_reserved_gpu = torch.cuda.memory.memory_reserved() >> 20
         torch_reserved_max = torch.cuda.memory.max_memory_reserved() >> 20
         torch_used_gpu = torch.cuda.memory_allocated() >> 20

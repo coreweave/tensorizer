@@ -95,12 +95,14 @@ def _convert_dtype_to_numpy(dtype: Union[numpy.dtype, str, torch.dtype]):
             torch.float32: numpy.float32,
             torch.float64: numpy.float64,
             torch.complex64: numpy.complex64,
-            torch.complex128: numpy.complex128
+            torch.complex128: numpy.complex128,
         }.get(dtype)
 
         if numpy_dtype is None:
-            raise TypeError("The provided torch.dtype class could not"
-                            " be converted to a numpy.dtype")
+            raise TypeError(
+                "The provided torch.dtype class could not"
+                " be converted to a numpy.dtype"
+            )
         else:
             # Convert it from a dtype class to a dtype object instance
             return numpy.dtype(numpy_dtype)
@@ -133,15 +135,15 @@ class TensorDeserializer(collections.abc.Mapping):
     """
 
     def __init__(
-            self,
-            file_obj: Union[io.BufferedIOBase, io.RawIOBase,
-            typing.BinaryIO, str],
-            device: Union[torch.device, str, None] = None,
-            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-            dtype: Union[numpy.dtype, str, None] = None,
-            *,
-            lazy_load: bool = False,
-            plaid_mode: bool = False):
+        self,
+        file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO, str],
+        device: Union[torch.device, str, None] = None,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        dtype: Union[numpy.dtype, str, None] = None,
+        *,
+        lazy_load: bool = False,
+        plaid_mode: bool = False,
+    ):
         if isinstance(file_obj, str):
             self._file = stream_io.open_stream(file_obj, "rb")
         else:
@@ -164,7 +166,7 @@ class TensorDeserializer(collections.abc.Mapping):
         self._metadata: Dict[str, TensorEntry] = {}
 
         if plaid_mode and (
-                not torch.cuda.is_available() or self._device.type == "cpu"
+            not torch.cuda.is_available() or self._device.type == "cpu"
         ):
             raise ValueError("Plaid mode requires CUDA")
 
@@ -231,9 +233,7 @@ class TensorDeserializer(collections.abc.Mapping):
             mmap_flags |= getattr(mmap, "MAP_PRIVATE", 0)
             mmap_flags |= getattr(mmap, "MAP_ANONYMOUS", 0)
             mmap_args = {"flags": mmap_flags} if mmap_flags else {}
-            self._buffer = mmap.mmap(-1,
-                                     self.total_tensor_bytes,
-                                     **mmap_args)
+            self._buffer = mmap.mmap(-1, self.total_tensor_bytes, **mmap_args)
 
             # If we're on CUDA, we register the buffer with CUDA so that
             # it is pinned. This allows for Torch to internally use
@@ -247,15 +247,17 @@ class TensorDeserializer(collections.abc.Mapping):
                 del ctb  # don't leave an open exported pointer into the mmap
 
                 # Register the buffer with CUDA
-                cudart.cudaHostRegister(self._buffer_addr,
-                                        self.total_tensor_bytes,
-                                        0)
+                cudart.cudaHostRegister(
+                    self._buffer_addr, self.total_tensor_bytes, 0
+                )
                 self._is_memory_pinned = True
             end_allocate = time.time()
             tensor_bytes_str = utils.convert_bytes(self.total_tensor_bytes)
-            logger.info(f"Allocated {tensor_bytes_str} "
-                        f"for {len(self._metadata)} tensors "
-                        f"in {end_allocate - start_allocate:0.4f}")
+            logger.info(
+                f"Allocated {tensor_bytes_str} "
+                f"for {len(self._metadata)} tensors "
+                f"in {end_allocate - start_allocate:0.4f}"
+            )
         else:
             self._buffer = bytearray(self._largest_tensor_bytes)
 
@@ -292,9 +294,11 @@ class TensorDeserializer(collections.abc.Mapping):
         if isinstance(file_obj, io.TextIOBase) or not readable:
             mode = getattr(file_obj, "mode", "")
             raise ValueError(
-                'TensorSerializer\'s file_obj must be readable '
-                'and in binary mode (mode="rb"{})'
-                .format(mode and f', current mode="{mode}"'))
+                "TensorSerializer's file_obj must be readable "
+                'and in binary mode (mode="rb"{})'.format(
+                    mode and f', current mode="{mode}"'
+                )
+            )
 
     def __del__(self):
         self.close()
@@ -338,12 +342,14 @@ class TensorDeserializer(collections.abc.Mapping):
 
     def _read_metadata(self, metadata_stream: io.BytesIO) -> TensorEntry:
         name = self._read_string(metadata_stream)
-        tensor_type = TensorType(struct.unpack("<B",
-                                               metadata_stream.read(1))[0])
+        tensor_type = TensorType(
+            struct.unpack("<B", metadata_stream.read(1))[0]
+        )
         dtype = self._read_dtype(metadata_stream)
         shape_len = struct.unpack("<B", metadata_stream.read(1))[0]
-        shape = self._read_shapes(metadata_stream.read(shape_len * 4),
-                                  shape_len)
+        shape = self._read_shapes(
+            metadata_stream.read(shape_len * 4), shape_len
+        )
         offset = struct.unpack("<Q", metadata_stream.read(8))[0]
         data_offset = struct.unpack("<Q", metadata_stream.read(8))[0]
         data_length = struct.unpack("<Q", metadata_stream.read(8))[0]
@@ -357,9 +363,9 @@ class TensorDeserializer(collections.abc.Mapping):
             shape=shape,
         )
 
-    def _load_metadatas(self,
-                        filter_func: Optional[Callable[[str],
-                                              Union[bool, Any]]]):
+    def _load_metadatas(
+        self, filter_func: Optional[Callable[[str], Union[bool, Any]]]
+    ):
         """
         Read the metadata of tensors into self._metadata.
         """
@@ -396,8 +402,9 @@ class TensorDeserializer(collections.abc.Mapping):
             if self._prior_key is not None and self._prior_key != name:
                 self._cache[self._prior_key] = False
             if self._cache[name] is False:
-                raise RuntimeError(f"Tensor {name} already overwritten in "
-                                   "plaid_mode")
+                raise RuntimeError(
+                    f"Tensor {name} already overwritten in " "plaid_mode"
+                )
             self._prior_key = name
 
         if name in self._cache and self._cache[name] is not None:
@@ -480,9 +487,9 @@ class TensorDeserializer(collections.abc.Mapping):
         # Read the hashes.
         for i in range(num_hashes):
             # Read the hash type.
-            hash_type = struct.unpack("<B", b[hash_idx:hash_idx + 1])[0]
+            hash_type = struct.unpack("<B", b[hash_idx : hash_idx + 1])[0]
             # Read the size of the hash.
-            hash_size = struct.unpack("<B", b[hash_idx + 1:hash_idx + 2])[0]
+            hash_size = struct.unpack("<B", b[hash_idx + 1 : hash_idx + 2])[0]
             # Read the hash.
             hash_begin = hash_idx + 2
             hash_end = hash_begin + hash_size
@@ -498,9 +505,9 @@ class TensorDeserializer(collections.abc.Mapping):
         return hashes
 
     def read_tensors(
-            self,
-            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-            num_tensors: int = -1,
+        self,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
     ) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
@@ -549,14 +556,14 @@ class TensorDeserializer(collections.abc.Mapping):
                 name: str = name_bytes.decode("utf-8")
 
                 # Read the dtype of the tensor.
-                dtype_len = struct.unpack("<B", headers[idx: idx + 1])[0]
+                dtype_len = struct.unpack("<B", headers[idx : idx + 1])[0]
                 dtype_end = idx + dtype_len + 1
-                dtype = headers[idx + 1: dtype_end]
+                dtype = headers[idx + 1 : dtype_end]
 
                 # Read the shape amount, according to the serialized format.
                 # The shape length is 1 byte after the dtype end.
                 shape_len = struct.unpack(
-                    "<B", headers[dtype_end: dtype_end + 1]
+                    "<B", headers[dtype_end : dtype_end + 1]
                 )[0]
                 # The shape elements are <I, so we read 4 bytes. _read_shapes
                 # takes in the header object and the number of elements in
@@ -578,22 +585,23 @@ class TensorDeserializer(collections.abc.Mapping):
                 #
                 # TODO: Actually verify the hashes on request.
                 hashes_begin = shape_end
-                hashes_sz_slice = headers[hashes_begin: hashes_begin + 2]
+                hashes_sz_slice = headers[hashes_begin : hashes_begin + 2]
                 hashes_sz = struct.unpack("<H", hashes_sz_slice)[0]
                 hashes_end = hashes_begin + hashes_sz
 
-                hashes_slice = headers[hashes_begin + 2: hashes_end]
+                hashes_slice = headers[hashes_begin + 2 : hashes_end]
                 hashes = self._decode_hashes(hashes_slice)
 
                 # Finally, get the tensor data length.
-                data_length = struct.unpack("<q", headers[header_len - 8:])[0]
+                data_length = struct.unpack("<q", headers[header_len - 8 :])[0]
 
                 # Check if the name is in our pre-filtered list of keys
                 # from the class-level filter_func, and then verify
                 # that it passes the method-level filter_func.
                 # Skip it if it fails either check.
-                if name not in self.keys() \
-                        or (filter_func is not None and not filter_func(name)):
+                if name not in self.keys() or (
+                    filter_func is not None and not filter_func(name)
+                ):
                     self._file.seek(data_length, io.SEEK_CUR)
                     continue
 
@@ -604,9 +612,9 @@ class TensorDeserializer(collections.abc.Mapping):
                     # memory we need in a single buffer that contains
                     # all the tensors. We just need to slice out the
                     # memoryview for the current tensor.
-                    mv = memoryview(self._buffer)[self._allocated:
-                                                  self._allocated +
-                                                  data_length]
+                    mv = memoryview(self._buffer)[
+                        self._allocated : self._allocated + data_length
+                    ]
                     self._file.readinto(mv)
                     self._allocated += data_length
                 elif self._plaid_mode:
@@ -641,7 +649,7 @@ class TensorDeserializer(collections.abc.Mapping):
             return
 
     def _to_torch_parameter(
-            self, arr: Union[numpy.ndarray, torch.nn.Parameter]
+        self, arr: Union[numpy.ndarray, torch.nn.Parameter]
     ) -> torch.nn.Parameter:
         """
         Convert a numpy array to a torch.nn.Parameter on a device, forcing
@@ -654,7 +662,11 @@ class TensorDeserializer(collections.abc.Mapping):
                 arr.grad = arr.grad.to(self._device)
             return arr
 
-        if self._dtype is not None and arr.dtype != "bool" and arr.dtype != self._dtype:
+        if (
+            self._dtype is not None
+            and arr.dtype != "bool"
+            and arr.dtype != self._dtype
+        ):
             arr = arr.astype(self._dtype)
         gradient = arr.dtype.kind in ("f", "c")
 
@@ -678,9 +690,9 @@ class TensorDeserializer(collections.abc.Mapping):
         return d
 
     def load_into_module(
-            self,
-            m: torch.nn.Module,
-            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        self,
+        m: torch.nn.Module,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
     ) -> int:
         """
         Given `m`, a torch.nn.Module, load the associate tensors in this
@@ -719,7 +731,8 @@ class TensorDeserializer(collections.abc.Mapping):
                     "This was serialized using the write_state_dict() method,"
                     " and cannot be loaded using the load_tensors() method."
                     " Use the TensorDeserializer object directly as a"
-                    " state_dict mapping instead.")
+                    " state_dict mapping instead."
+                )
             tensor_ct += 1
 
         self._file.close()
@@ -740,10 +753,18 @@ class TensorSerializer:
     """
 
     def __init__(
-            self,
-            file_obj: Union[io.BufferedIOBase, io.RawIOBase, typing.BinaryIO,
-                            str, bytes, os.PathLike, int],
-            compress_tensors: bool = False) -> None:
+        self,
+        file_obj: Union[
+            io.BufferedIOBase,
+            io.RawIOBase,
+            typing.BinaryIO,
+            str,
+            bytes,
+            os.PathLike,
+            int,
+        ],
+        compress_tensors: bool = False,
+    ) -> None:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "wb+")
         else:
@@ -756,6 +777,7 @@ class TensorSerializer:
         self.compress_tensors = compress_tensors
         if self.compress_tensors:
             import lz4.frame
+
             self.lz4_frame = lz4.frame
         else:
             self.lz4_frame = None
@@ -803,9 +825,11 @@ class TensorSerializer:
         if isinstance(file_obj, io.TextIOBase) or not read_write:
             mode = getattr(file_obj, "mode", "")
             raise ValueError(
-                'TensorSerializer\'s file_obj must be readable, writable, '
-                'and in binary mode (mode="wb+"{})'
-                .format(mode and f', current mode="{mode}"'))
+                "TensorSerializer's file_obj must be readable, writable, "
+                'and in binary mode (mode="wb+"{})'.format(
+                    mode and f', current mode="{mode}"'
+                )
+            )
 
     def __del__(self):
         if getattr(self, "_file", None) is not None:
@@ -832,7 +856,7 @@ class TensorSerializer:
         logger.info(f"Tensors completed serializing to {final_sz} bytes")
         if self.compress_tensors:
             compression_ratio = (
-                    self.total_tensor_bytes / self.total_compressed_tensor_bytes
+                self.total_tensor_bytes / self.total_compressed_tensor_bytes
             )
             logger.info(f"Uncomp'd bytes: {self.total_tensor_bytes}")
             logger.info(f"Comp'd bytes: {self.total_compressed_tensor_bytes}")
@@ -864,11 +888,12 @@ class TensorSerializer:
         self._file.seek(curr)
 
     def write_tensor(
-            self,
-            idx,
-            name,
-            tensor_type: TensorType,
-            tensor: Union[torch.Tensor, numpy.ndarray]) -> None:
+        self,
+        idx,
+        name,
+        tensor_type: TensorType,
+        tensor: Union[torch.Tensor, numpy.ndarray],
+    ) -> None:
         """
         Serializes a tensor, laying things out so that it can be read in three
         calls from the input -- once for the size, once for the header, and
@@ -1048,15 +1073,17 @@ class TensorSerializer:
         ds_size = self._file.tell() - ds_header_begin
         ds_bytes = f"{ds_size:,} bytes"
 
-        typ = {TensorType.PARAM: "p",
-               TensorType.BUFFER: "b",
-               TensorType.STATE_DICT: "sd"}[tensor_type]
+        typ = {
+            TensorType.PARAM: "p",
+            TensorType.BUFFER: "b",
+            TensorType.STATE_DICT: "sd",
+        }[tensor_type]
 
         if self.compress_tensors:
             comp_report = (
-                    f" - tensor:[raw: {tensor_raw_sz},"
-                    + f" compressed: {tensor_compressed_sz},"
-                    + f" ratio: {compression_ratio:.2f}]"
+                f" - tensor:[raw: {tensor_raw_sz},"
+                + f" compressed: {tensor_compressed_sz},"
+                + f" ratio: {compression_ratio:.2f}]"
             )
         else:
             comp_report = ""
@@ -1065,9 +1092,9 @@ class TensorSerializer:
             f"{tensor.shape} -> {ds_bytes}{comp_report}"
         )
 
-    def write_module(self,
-                     m: torch.nn.Module,
-                     remove_tensors: bool = False) -> None:
+    def write_module(
+        self, m: torch.nn.Module, remove_tensors: bool = False
+    ) -> None:
         for module_name, module in m.named_modules():
             for name, param in module.named_parameters(recurse=False):
                 label = module_name + "." + name
