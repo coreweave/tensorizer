@@ -119,7 +119,9 @@ def load_model(
 
     logger.info(f"Loading {tensors_uri}, {ram_usage}")
 
-    tensor_deserializer = TensorDeserializer(tensor_stream, lazy_load=True)
+    tensor_deserializer = TensorDeserializer(
+        tensor_stream, device=device, dtype=dtype, lazy_load=True
+    )
 
     if configclass is not None:
         try:
@@ -146,7 +148,7 @@ def load_model(
                 config = json.load(f)
         model = utils.no_init_or_tensor(lambda: modelclass(**config))
 
-    tensor_deserializer.load_into_module(model, device=device, dtype=dtype)
+    tensor_deserializer.load_into_module(model)
 
     tensor_load_s = time.time() - begin_load
     rate_str = utils.convert_bytes(
