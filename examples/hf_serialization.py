@@ -220,7 +220,8 @@ def df_main(args: argparse.Namespace) -> None:
         prompt = "a photo of an astronaut riding a horse on mars"
         with torch.autocast(
             "cuda" if torch.cuda.is_available() else "cpu"
-        ):  # for some reason device_type needs to be a string instead of an actual device
+        ):  # for some reason device_type needs to be a string
+            # instead of an actual device
             pipeline(prompt).images[0]
 
 
@@ -233,7 +234,10 @@ def hf_main(args):
 
     model_config = AutoConfig.from_pretrained(args.input_directory)
     model = AutoModelForCausalLM.from_pretrained(
-        args.input_directory, config=model_config, torch_dtype=torch.float16
+        args.input_directory,
+        config=model_config,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
     )
 
     logger.info("Serializing model")

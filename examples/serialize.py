@@ -11,7 +11,10 @@ s3_bucket = "bucket"
 s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 
 model = AutoModelForCausalLM.from_pretrained(
-    model_ref, revision="float16", torch_dtype=torch.float16
+    model_ref,
+    revision="float16",
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
 )
 
 serializer = TensorSerializer(s3_uri)

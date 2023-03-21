@@ -77,10 +77,14 @@ credentials in `~/.s3cfg`.
 
 **NOTE:** Loading and serializing `gpt-j-6B` will take a lot of CPU RAM,
 up to `~20GB`. Additionally, when loading `gpt-j-6B` into a GPU, you
-will need about `~16GB` of VRAM.
+will need about `~16GB` of VRAM. If you don't have that much RAM or VRAM,
+you can use the smaller `gpt-neo-125m` model instead.
 
-If you don't have that much RAM or VRAM, you can use the smaller
-`gpt-neo-125m` model instead.
+**NOTE2:** The below examples require the `transformers` and `accelerate`
+libraries. You can install them with `pip`:
+```bash
+python -m pip install transformers accelerate
+```
 
 [serialize.py](examples/serialize.py)
 ```python
@@ -94,12 +98,14 @@ model_ref = "EleutherAI/gpt-j-6B"
 model_name = model_ref.split("/")[-1]
 # Change this to your S3 bucket.
 s3_bucket = "bucket"
-
 s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 
-model = AutoModelForCausalLM.from_pretrained(model_ref,
-                                             revision="float16",
-                                             torch_dtype=torch.float16)
+model = AutoModelForCausalLM.from_pretrained(
+    model_ref,
+    revision="float16",
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
+)
 
 serializer = TensorSerializer(s3_uri)
 serializer.write_module(model)
@@ -203,9 +209,11 @@ to use `tensorizer` with S3 is to configure your S3 credentials in
 If you don't want to use `~/.s3cfg`, or wish to use a `.s3cfg` config file
 saved at a nonstandard location (e.g. under `/var/run`), you can also specify
 your S3 credentials using the `tensorizer.stream_io.open_stream()` function,
-and then pass that into the `TensorSerializer` or `TensorDeserializer` constructor.
-The `stream_io.open_stream()` function takes a `path_uri`
-argument, which can be an `s3://` URI, and accepts the following keyword arguments:
+and then pass that into the `TensorSerializer` or `TensorDeserializer`
+constructor.
+
+The `stream_io.open_stream()` function takes a `path_uri` argument, which can
+be an `s3://` URI, and accepts the following keyword arguments:
 * `s3_access_key_id`: S3 access key ID
 * `s3_secret_access_key`: S3 secret access key
 * `s3_endpoint`: S3 endpoint
@@ -234,6 +242,19 @@ TensorDeserializer(
                 s3_secret_access_key=SECRET_KEY,
                 s3_endpoint="object.ord1.coreweave.com"))
 ```
+
+**NOTE:** For faster object downloads in the CoreWeave Cloud, you can use
+the `accel-object.ord1.coreweave.com` endpoint. This endpoint is optimized
+for object downloads, and will be faster than the `object.ord1.coreweave.com`
+endpoint once the object is cached.
+
+**NOTE2:** The cache above does not get invalidated when the object is updated
+in S3. If you update an object in S3, you will need to wait for the cache to
+expire before you can download the updated object. This takes 24 hours since
+the last download.
+
+For this reason, it is recommended to use an unique S3 key for each version
+of a model if you use the `accel-object.ord1.coreweave.com` endpoint.
 
 ## Additional Features
 `tensorizer` has a few additional features that make it more useful than
