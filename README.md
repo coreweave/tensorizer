@@ -36,6 +36,31 @@ so you can use it to serialize models locally and load them locally. This
 is extremely fast, as the same principles that make it fast for HTTP/HTTPS
 and S3 endpoints also apply to local filesystems.
 
+## Installation
+
+### From PyPI
+`tensorizer` can be installed from PyPI with `pip`:
+```bash
+python -m pip install tensorizer
+```
+
+### From Source
+You can also install `tensorizer` from source using `pip`.
+To clone the repository and install `tensorizer` in
+[editable mode](https://pip.pypa.io/en/stable/topics/local-project-installs/#editable-installs),
+run:
+```bash
+git clone https://github.com/coreweave/tensorizer
+cd tensorizer
+python -m pip install -e .
+```
+
+Or, run the following for `pip` to install `tensorizer`
+[directly from GitHub](https://pip.pypa.io/en/stable/topics/vcs-support/#git):
+```bash
+python -m pip install git+https://github.com/coreweave/tensorizer
+```
+
 ## Basic Usage
 Serialization is done with the `TensorSerializer` class. It takes a
 `path_uri` argument that can be a local filesystem path, an HTTP/HTTPS
@@ -231,9 +256,15 @@ AutoModel. But HuggingFace Transformers performs three or more copies of
 the data, so memory use will explode.
 
 ## Running Tests
-`tensorizer` uses `pytest` for testing. It has its own set of dependencies,
-which can be installed with `pip install -r tests/requirements.txt`.
+`tensorizer` uses `unittest` for testing.
+The tests have their own set of dependencies, which can be installed with
+`pip install -r tests/requirements.txt`.
 
 Some tests require a GPU, and will be skipped if no GPU is available.
+To run the tests, run the following in the root of the repository:
 
-To run the tests, run `pytest` from the root of the repository.
+```bash
+python -m pip install -e .
+python -m pip install -r tests/requirements.txt
+python -m unittest discover tests/ --verbose
+```
