@@ -466,7 +466,7 @@ def open_stream(
         Supported values are:
         * "rb" for http(s)://,
         * "rb", "wb[+]", and "ab[+]" for s3://,
-        * All standard modes for file paths.
+        * All standard binary modes for file paths.
     :param s3_access_key_id: S3 access key, corresponding to
         "aws_access_key_id" in boto3.
         If not specified, an s3:// URI is being opened, and ~/.s3cfg exists,
@@ -513,7 +513,7 @@ def open_stream(
         # Regardless of whether the config needed to be parsed,
         # the endpoint gets a default value.
 
-        if 'w' in mode or 'a' in mode:
+        if "w" in mode or "a" in mode:
             s3_endpoint = s3_endpoint or default_s3_write_endpoint
 
             # delete must be False or the file will be deleted by the OS
@@ -541,6 +541,9 @@ def open_stream(
                                s3_endpoint)
 
     else:
+        if "b" not in normalized_mode:
+            raise ValueError('Only binary modes ("rb", "wb", "wb+", etc.)'
+                             ' are valid when opening local file streams.')
         os.makedirs(os.path.dirname(path_uri), exist_ok=True)
         handle: typing.BinaryIO = open(path_uri, mode)
         handle.seek(0)
