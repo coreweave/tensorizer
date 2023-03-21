@@ -5,7 +5,9 @@ import moto
 import boto3
 from tensorizer import stream_io
 
-NEO_URL = "https://raw.githubusercontent.com/EleutherAI/gpt-neo/master/README.md"
+NEO_URL = (
+    "https://raw.githubusercontent.com/EleutherAI/gpt-neo/master/README.md"
+)
 
 
 class TestCurlStream(unittest.TestCase):
@@ -47,13 +49,17 @@ def set_up_moto(*endpoints):
 
     # Clear any environment variables that boto3 may attempt to access
     # to avoid accidentally writing to a real bucket in case of failure
-    old_environment = {key: os.environ[key] for key in (
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SECURITY_TOKEN",
-        "AWS_SESSION_TOKEN",
-        "AWS_DEFAULT_REGION"
-    ) if key in os.environ}
+    old_environment = {
+        key: os.environ[key]
+        for key in (
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SECURITY_TOKEN",
+            "AWS_SESSION_TOKEN",
+            "AWS_DEFAULT_REGION",
+        )
+        if key in os.environ
+    }
 
     for key in old_environment:
         test_value = "us-east-1" if key == "AWS_DEFAULT_REGION" else "TEST"
@@ -76,16 +82,21 @@ def mock_server():
 
     # Disable mock server logs
     import logging
+
     werkzeug_logger = logging.getLogger("werkzeug")
     old_log_level = werkzeug_logger.getEffectiveLevel()
     werkzeug_logger.setLevel(logging.CRITICAL + 1)
 
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=5000, verbose=False)
+    server = ThreadedMotoServer(
+        ip_address="127.0.0.1", port=5000, verbose=False
+    )
     server.start()
 
     # Disable https validation on endpoints
-    ensure_https_endpoint, stream_io._ensure_https_endpoint = \
-        stream_io._ensure_https_endpoint, lambda endpoint: endpoint
+    ensure_https_endpoint, stream_io._ensure_https_endpoint = (
+        stream_io._ensure_https_endpoint,
+        lambda endpoint: endpoint,
+    )
     try:
         yield "http://127.0.0.1:5000"
     finally:
@@ -107,10 +118,12 @@ class TestS3(unittest.TestCase):
         # Can be replaced for testing without mocks.
         cls.endpoint = "https://" + stream_io.default_s3_write_endpoint
         cls.BUCKET_NAME = "test-bucket"
-        (cls.mock_s3,
-         cls.ACCESS_KEY,
-         cls.SECRET_KEY,
-         cls.old_environment) = set_up_moto(cls.endpoint)
+        (
+            cls.mock_s3,
+            cls.ACCESS_KEY,
+            cls.SECRET_KEY,
+            cls.old_environment,
+        ) = set_up_moto(cls.endpoint)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -147,7 +160,7 @@ class TestS3(unittest.TestCase):
             mode="wb",
             s3_access_key_id=self.ACCESS_KEY,
             s3_secret_access_key=self.SECRET_KEY,
-            s3_endpoint=self.endpoint
+            s3_endpoint=self.endpoint,
         )
         long_string = b"Hello" * 1024
         s.write(long_string)
@@ -164,10 +177,10 @@ class TestS3(unittest.TestCase):
             self.put_bucket_contents(key, long_string)
             self.assert_bucket_contents(key, long_string)
             with stream_io.open_stream(
-                    f"s3://{self.BUCKET_NAME}/{key}",
-                    mode="rb",
-                    s3_access_key_id="X",
-                    s3_secret_access_key="X",
-                    s3_endpoint=endpoint
+                f"s3://{self.BUCKET_NAME}/{key}",
+                mode="rb",
+                s3_access_key_id="X",
+                s3_secret_access_key="X",
+                s3_endpoint=endpoint,
             ) as s:
                 self.assertEqual(s.read(), long_string)
