@@ -471,14 +471,21 @@ def open_stream(
         "aws_access_key_id" in boto3.
         If not specified, an s3:// URI is being opened, and ~/.s3cfg exists,
         ~/.s3cfg's "access_key" will be parsed as this credential.
+        To specify blank credentials, for a public bucket,
+        pass the empty string ("") rather than None.
     :param s3_secret_access_key: S3 secret key, corresponding to
         "aws_secret_access_key" in boto3.
         If not specified, an s3:// URI is being opened, and ~/.s3cfg exists,
         ~/.s3cfg's "secret_key" will be parsed as this credential.
+        To specify blank credentials, for a public bucket,
+        pass the empty string ("") rather than None.
     :param s3_endpoint: S3 endpoint.
         If not specified and a host_base was found
         alongside previously parsed credentials, that will be used.
         Otherwise, object.ord1.coreweave.com is the default.
+    :param s3_config_path: An explicit path to the ~/.s3cfg config file
+        to be parsed if full credentials are not provided.
+        If None, platform-specific default paths are used.
     :return: An opened file-like object representing the target resource.
     """
     if isinstance(path_uri, os.PathLike):
