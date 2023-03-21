@@ -40,6 +40,7 @@ total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
 duration = end - start
 per_second = convert_bytes(deserializer.total_tensor_bytes / duration)
 after_mem = get_mem_usage()
+deserializer.close()
 print(f"Deserialized {total_bytes_str} in {end - start:0.2f}s, {per_second}")
 print(f"Memory usage before: {before_mem}")
 print(f"Memory usage after: {after_mem}")

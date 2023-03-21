@@ -16,3 +16,4 @@ model = AutoModelForCausalLM.from_pretrained(model_ref,
 
 serializer = TensorSerializer(s3_uri)
 serializer.write_module(model)
+serializer.close()
