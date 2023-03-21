@@ -200,33 +200,39 @@ and `hf_main()` serializes
 to use `tensorizer` with S3 is to configure your S3 credentials in
 `~/.s3cfg`.
 
-If you don't want to use `~/.s3cfg`, you can also pass your S3 credentials using
-the `stream_io.open_stream()` function, and then passing that into `TensorSerializer`
-or `TensorDeserializer`. The `stream_io.open_stream()` function takes a `stream_uri`
-argument, which can be an S3 endpoint, and accepts the following keyword arguments:
-* `s3_access_key_id`: AWS access key ID
-* `s3_secret_access_key`: AWS secret access key
+If you don't want to use `~/.s3cfg`, or wish to use a `.s3cfg` config file
+saved at a nonstandard location (e.g. under `/var/run`), you can also specify
+your S3 credentials using the `tensorizer.stream_io.open_stream()` function,
+and then pass that into the `TensorSerializer` or `TensorDeserializer` constructor.
+The `stream_io.open_stream()` function takes a `path_uri`
+argument, which can be an `s3://` URI, and accepts the following keyword arguments:
+* `s3_access_key_id`: S3 access key ID
+* `s3_secret_access_key`: S3 secret access key
 * `s3_endpoint`: S3 endpoint
+
+*Or,*
+
+* `s3_config_path`: Alternative filesystem path to a `.s3cfg` config file
 
 For example:
 ```python
-  TensorSerializer(
-     open_stream(s3_uri,
-                 "wb",
-                 aws_access_key_id=AWS_ACCESS_KEY,
-                 aws_secret_access_key=AWS_SECRET_KEY,
-                 s3_endpoint="object.ord1.coreweave.com"))
+TensorSerializer(
+    open_stream(s3_uri,
+                "wb",
+                s3_access_key_id=ACCESS_KEY,
+                s3_secret_access_key=SECRET_KEY,
+                s3_endpoint="object.ord1.coreweave.com"))
 ```
 
-and ...
+and...
 
 ```python
-  TensorDeserializer(
-     open_stream(s3_uri,
-                 "rb",
-                 aws_access_key_id=AWS_ACCESS_KEY,
-                 aws_secret_access_key=AWS_SECRET_KEY,
-                 s3_endpoint="object.ord1.coreweave.com"))
+TensorDeserializer(
+    open_stream(s3_uri,
+                "rb",
+                s3_access_key_id=ACCESS_KEY,
+                s3_secret_access_key=SECRET_KEY,
+                s3_endpoint="object.ord1.coreweave.com"))
 ```
 
 ## Additional Features
