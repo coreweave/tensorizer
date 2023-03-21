@@ -76,6 +76,38 @@ class TensorHash(typing.TypedDict):
     hash: bytes
 
 
+def _convert_dtype_to_numpy(dtype: Union[numpy.dtype, str, torch.dtype]):
+    if isinstance(dtype, numpy.dtype):
+        return dtype
+    elif isinstance(dtype, str):
+        return numpy.dtype(dtype)
+    elif isinstance(dtype, torch.dtype):
+        # Converted from PyTorch's own mapping used in their testing:
+        # https://github.com/pytorch/pytorch/blob/v2.0.0/torch/testing/_internal/common_utils.py#L1009
+        numpy_dtype = {
+            torch.bool: numpy.bool_,
+            torch.uint8: numpy.uint8,
+            torch.int8: numpy.int8,
+            torch.int16: numpy.int16,
+            torch.int32: numpy.int32,
+            torch.int64: numpy.int64,
+            torch.float16: numpy.float16,
+            torch.float32: numpy.float32,
+            torch.float64: numpy.float64,
+            torch.complex64: numpy.complex64,
+            torch.complex128: numpy.complex128
+        }.get(dtype)
+
+        if numpy_dtype is None:
+            raise TypeError("The provided torch.dtype class could not"
+                            " be converted to a numpy.dtype")
+        else:
+            # Convert it from a dtype class to a dtype object instance
+            return numpy.dtype(numpy_dtype)
+    else:
+        raise TypeError("Could not interpret provided dtype as a numpy.dtype")
+
+
 class TensorDeserializer(collections.abc.Mapping):
     """
     Given a file-like object for read, deserialize tensors to a state_dict or
@@ -106,7 +138,7 @@ class TensorDeserializer(collections.abc.Mapping):
             typing.BinaryIO, str],
             device: Union[torch.device, str, None] = None,
             filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-            dtype: Union[torch.dtype, str, None] = None,
+            dtype: Union[numpy.dtype, str, None] = None,
             *,
             lazy_load: bool = False,
             plaid_mode: bool = False):
@@ -117,10 +149,23 @@ class TensorDeserializer(collections.abc.Mapping):
             self._file = file_obj
         self.total_compressed_tensor_bytes = 0
         self.read_bytes = 0
+
+        # If device is None, use the current device, otherwise use the given
+        # device.
+        device = utils.get_device() if device is None else torch.device(device)
         self._device = device
+
+        # If dtype is not None, convert all tensors to this dtype if possible.
+        if dtype is None:
+            self._dtype = None
+        else:
+            self._dtype = _convert_dtype_to_numpy(dtype)
+
         self._metadata: Dict[str, TensorEntry] = {}
 
-        if plaid_mode and (not torch.cuda.is_available() or device == "cpu"):
+        if plaid_mode and (
+                not torch.cuda.is_available() or self._device.type == "cpu"
+        ):
             raise ValueError("Plaid mode requires CUDA")
 
         # plaid_mode implies lazy_load
@@ -159,13 +204,6 @@ class TensorDeserializer(collections.abc.Mapping):
         # all tensors are read.
         self._load_metadatas(filter_func)
 
-        # If device is None, use the current device, otherwise use the given
-        # device.
-        self._device = device
-
-        # If dtype is not None, convert all tensors to this dtype if possible.
-        self._dtype = dtype
-
         self._plaid_mode: bool = plaid_mode
         self._prior_key: Optional[str] = None
 
@@ -183,6 +221,7 @@ class TensorDeserializer(collections.abc.Mapping):
         # we'll allocate a single buffer for all the tensors. Otherwise, we'll
         # allocate a buffer for the largest tensor.
         self._buffer_addr = None
+        self._is_memory_pinned = False
         if not lazy_load and not plaid_mode:
             start_allocate = time.time()
 
@@ -199,17 +238,19 @@ class TensorDeserializer(collections.abc.Mapping):
             # If we're on CUDA, we register the buffer with CUDA so that
             # it is pinned. This allows for Torch to internally use
             # cudaMemcpyAsync.
-            if self._device == "cuda":
+            if self._device.type == "cuda":
                 # We need to use ctypes to get the address of the buffer
                 # because mmap.mmap doesn't expose the buffer address.
                 tb = ctypes.c_char * self.total_tensor_bytes
                 ctb = tb.from_buffer(self._buffer)
                 self._buffer_addr = ctypes.addressof(ctb)
+                del ctb  # don't leave an open exported pointer into the mmap
 
                 # Register the buffer with CUDA
                 cudart.cudaHostRegister(self._buffer_addr,
                                         self.total_tensor_bytes,
                                         0)
+                self._is_memory_pinned = True
             end_allocate = time.time()
             tensor_bytes_str = utils.convert_bytes(self.total_tensor_bytes)
             logger.info(f"Allocated {tensor_bytes_str} "
@@ -233,9 +274,7 @@ class TensorDeserializer(collections.abc.Mapping):
         if not lazy_load:
             # If we're not in lazy_load mode, we populate the cache with all
             # the tensors.
-            self._cache = self._generate_state_dict(device=device,
-                                                    filter_func=filter_func,
-                                                    dtype=dtype)
+            self._cache = self._generate_state_dict()
         else:
             # We populate the cache with None values so that we can
             # differentiate between tensors that have not been loaded yet
@@ -263,11 +302,17 @@ class TensorDeserializer(collections.abc.Mapping):
     def close(self):
         # Don't throw an attribute error if these aren't defined yet,
         # e.g. if __init__ threw an error before defining both
-        if getattr(self, "_buffer", None) is not None:
-            if hasattr(self._buffer, "close"):
-                if self._device == "cuda" and self._buffer_addr:
-                    cudart.cudaHostUnregister(self._buffer_addr)
-                self._buffer.close()
+        buffer = getattr(self, "_buffer", None)
+        if buffer is not None:
+            if self._is_memory_pinned and self._buffer_addr:
+                cudart.cudaHostUnregister(self._buffer_addr)
+                self._is_memory_pinned = False
+            if self._device.type != "cpu" and hasattr(buffer, "close"):
+                # Don't close the mmap buffer for CPU tensors because
+                # it would free their memory out from under them.
+                # For GPU tensors we just need to wait until
+                # they are transferred out of RAM.
+                buffer.close()
         if getattr(self, "_file", None) is not None:
             self._file.close()
 
@@ -365,9 +410,7 @@ class TensorDeserializer(collections.abc.Mapping):
         if name in self._metadata:
             self._file.seek(self._metadata[name]["offset"])
             tensor_arr = next(self.read_tensors(num_tensors=1))[3]
-            self._cache[name] = self._to_torch_parameter(tensor_arr,
-                                                         self._dtype,
-                                                         self._device)
+            self._cache[name] = self._to_torch_parameter(tensor_arr)
             return self._cache[name]
         else:
             raise KeyError(f"Tensor {name} not found")
@@ -593,57 +636,39 @@ class TensorDeserializer(collections.abc.Mapping):
         except EOFError:
             return
 
-    @staticmethod
-    def _to_torch_parameter(arr: Union[numpy.ndarray, torch.nn.Parameter],
-                            dtype: Optional[str] = None,
-                            device=utils.get_device()) -> torch.nn.Parameter:
+    def _to_torch_parameter(
+            self, arr: Union[numpy.ndarray, torch.nn.Parameter]
+    ) -> torch.nn.Parameter:
         """
         Convert a numpy array to a torch.nn.Parameter on a device, forcing
         gradient when appropriate. We also handle torch.nn.Parameter objects in
         a passthrough manner.
         """
         if isinstance(arr, torch.nn.Parameter):
-            arr.data = arr.data.to(device)
+            arr.data = arr.data.to(self._device)
             if arr.grad is not None:
-                arr.grad = arr.grad.to(device)
+                arr.grad = arr.grad.to(self._device)
             return arr
-        if dtype is not None and arr.dtype != "bool" and arr.dtype != dtype:
-            arr = arr.astype(dtype)
+
+        if self._dtype is not None and arr.dtype != "bool" and arr.dtype != self._dtype:
+            arr = arr.astype(self._dtype)
         gradient = arr.dtype.kind in ("f", "c")
 
         return torch.nn.Parameter(
-            torch.from_numpy(arr).to(device), requires_grad=gradient
+            torch.from_numpy(arr).to(self._device), requires_grad=gradient
         )
 
-    def _generate_state_dict(
-            self,
-            device: Union[str, torch.device, None] = None,
-            dtype: Optional[str] = None,
-            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-    ) -> OrderedDict:
+    def _generate_state_dict(self) -> OrderedDict:
         """
         Load the tensors in this Tensorizer object into a state_dict. This
         is used to populate the cache in non-lazy_load cases.
-
-        :param device: The device to load the tensors onto.
-        :param dtype: The dtype to load the tensors as. Defaults to None, which
-            means the dtype is not changed from the serialized dtype.
-        :param filter_func: A function (tensor_name: str) -> bool that returns True
-            if a tensor should be loaded, or False if it should be skipped.
-            If None, all tensors are loaded.
-        :return:
         """
-        if device is None:
-            device = self._device
-            if device is None:
-                device = utils.get_device()
-
         if self._file.closed:
             raise IOError("IO closed, instantiate if you want to load again.")
 
         d = OrderedDict()
-        for idx, typ, name, arr in self.read_tensors(filter_func=filter_func):
-            d[name] = self._to_torch_parameter(arr, dtype, device)
+        for idx, typ, name, arr in self.read_tensors():
+            d[name] = self._to_torch_parameter(arr)
         self.total_tensor_bytes = self._file.tell()
         self._file.close()
         return d
@@ -651,8 +676,6 @@ class TensorDeserializer(collections.abc.Mapping):
     def load_into_module(
             self,
             m: torch.nn.Module,
-            device: Union[str, torch.device, None] = None,
-            dtype: Optional[str] = None,
             filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
     ) -> int:
         """
@@ -669,11 +692,6 @@ class TensorDeserializer(collections.abc.Mapping):
                 True if a tensor should be loaded, or False if it should be
                 skipped.
         """
-        if device is None:
-            device = self._device
-            if device is None:
-                device = utils.get_device()
-
         modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
 
         for name, module in m.named_modules():
@@ -687,16 +705,17 @@ class TensorDeserializer(collections.abc.Mapping):
             obj_path, attr = name.rsplit(".", 1)
             module: torch.nn.Module = modules[obj_path]
             entry = self._metadata[name]
-            param = self._to_torch_parameter(self.get(name), dtype, device)
+            param = self._to_torch_parameter(self.get(name))
             if entry["type"] is TensorType.PARAM:
                 module.register_parameter(attr, param)
             elif entry["type"] is TensorType.BUFFER:
                 module.register_buffer(attr, param)
             elif entry["type"] is TensorType.STATE_DICT:
                 raise NotImplementedError(
-                    "This was serialized using the write_state_dict() method, and"
-                    " cannot be loaded using the load_tensors() method. Use the"
-                    " state_dict() method instead.")
+                    "This was serialized using the write_state_dict() method,"
+                    " and cannot be loaded using the load_tensors() method."
+                    " Use the TensorDeserializer object directly as a"
+                    " state_dict mapping instead.")
             tensor_ct += 1
 
         self._file.close()

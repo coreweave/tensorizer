@@ -72,7 +72,7 @@ def check_inference(deserializer: TensorDeserializer,
         )
     )
 
-    deserializer.load_into_module(model, device=device)
+    deserializer.load_into_module(model)
 
     # Tokenize and generate
     with enable_tokenizers_parallelism():
