@@ -118,6 +118,7 @@ class CURLStreamFile:
         headers: Dict[str, Any] = None,
     ) -> None:
         self._uri = uri
+        self._error_context = []
 
         if curl_path is None:
             RuntimeError(
@@ -131,6 +132,7 @@ class CURLStreamFile:
             "--header",
             "Accept-Encoding: identity",
             "-s",
+            "-f",
             uri,
         ]
 
@@ -163,42 +165,122 @@ class CURLStreamFile:
     def __del__(self):
         self.close()
 
+    def register_error_context(self, msg: str) -> None:
+        """
+        Registers a message to serve as context for possible errors
+        encountered later.
+        This method serves to keep track of any dubious conditions
+        under which the CURLStreamFile was opened for more descriptive
+        error messages if those conditions eventually lead to an error,
+        while still attempting to connect regardless, in accordance with
+        the "easier to ask for forgiveness than permission" principle.
+        :param msg: The message to be registered.
+        """
+        self._error_context.append(msg)
+
+    def _reproduce_and_capture_error(
+            self, expect_code: Optional[int]
+    ) -> Optional[str]:
+        """
+        Re-attempts the connection with stderr attached to a pipe
+        to capture an HTTP error code.
+        stderr is not a pipe on the original self._curl Popen object
+        because it would get the same `bufsize` as stdout, and waste RAM,
+        so this optimizes for the non-error path
+        at the slight expense of the error path
+
+        :param expect_code: The error code to expect.
+            If this doesn't match the new error, the original error
+            is considered not to have been reproduced.
+        :return: The cURL error message if the error could be reproduced,
+            otherwise None.
+        """
+        args = [
+            curl_path,
+            "-I",  # Only read headers
+            "-XGET",  # Use a GET request (in case HEAD is not supported)
+            "-f",  # Don't return HTML/XML error webpages
+            "-s",  # Silence most output
+            "-S",  # Keep error messages
+            self._uri
+        ]
+        try:
+            result = subprocess.run(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3
+            )
+
+        except subprocess.TimeoutExpired:
+            return None
+        if result.returncode == 0 or (
+            expect_code and result.returncode != expect_code
+        ):
+            return None
+        error_text = result.stderr.strip()
+        return error_text if error_text else None
+
+    def _create_read_error_from_context(self) -> IOError:
+        return_code = self._curl.poll()
+        self._curl.terminate()
+        if return_code:
+            error = self._reproduce_and_capture_error(expect_code=return_code)
+            if error is None:
+                error = f"curl error: ({return_code}), see" \
+                        f" https://curl.se/docs/manpage.html#{return_code}"
+        else:
+            error = ""
+
+        if self._error_context:
+            error += "\n" + "\n".join(self._error_context)
+
+        error = error.strip()
+        if not error:
+            # No other context is available, so give a generic error description
+            error = "Failed to read from stream"
+
+        return IOError(error)
+
     def _read_until(
         self, goal_position: int, ba: Union[bytearray, None] = None
     ) -> Union[bytes, int]:
-        if ba is None:
-            rq_sz = goal_position - self._curr
-            if self._end is not None and self._curr + rq_sz > self._end:
-                rq_sz = self._end - self._curr
-                if rq_sz <= 0:
-                    return bytes()
-            ret_buff = self._curl.stdout.read(rq_sz)
-            ret_buff_sz = len(ret_buff)
-        else:
-            rq_sz = len(ba)
-            if self._end is not None and self._curr + rq_sz > self._end:
-                rq_sz = self._end - self._curr
-                if rq_sz <= 0:
-                    return 0
-                tmp_ba = bytearray(rq_sz)
-                ret_buff_sz = self._curl.stdout.readinto(tmp_ba)
-                ba[:ret_buff_sz] = tmp_ba[:ret_buff_sz]
-                ret_buff = ba
+        try:
+            if ba is None:
+                rq_sz = goal_position - self._curr
+                if self._end is not None and self._curr + rq_sz > self._end:
+                    rq_sz = self._end - self._curr
+                    if rq_sz <= 0:
+                        return bytes()
+                ret_buff = self._curl.stdout.read(rq_sz)
+                ret_buff_sz = len(ret_buff)
             else:
-                ret_buff_sz = self._curl.stdout.readinto(ba)
-                ret_buff = ba
-        if ret_buff_sz != rq_sz:
-            self.closed = True
-            self._curl.terminate()
-            if self._curl.returncode != 0:
-                raise IOError(f"curl error: {self._curl.returncode}")
-            else:
+                rq_sz = len(ba)
+                if self._end is not None and self._curr + rq_sz > self._end:
+                    rq_sz = self._end - self._curr
+                    if rq_sz <= 0:
+                        return 0
+                    tmp_ba = bytearray(rq_sz)
+                    ret_buff_sz = self._curl.stdout.readinto(tmp_ba)
+                    ba[:ret_buff_sz] = tmp_ba[:ret_buff_sz]
+                    ret_buff = ba
+                else:
+                    ret_buff_sz = self._curl.stdout.readinto(ba)
+                    ret_buff = ba
+            if ret_buff_sz != rq_sz:
+                self.closed = True
+                self._curl.terminate()
                 raise IOError(f"Requested {rq_sz} != {ret_buff_sz}")
-        self._curr += ret_buff_sz
-        if ba is None:
-            return ret_buff
-        else:
-            return ret_buff_sz
+            self._curr += ret_buff_sz
+            if ba is None:
+                return ret_buff
+            else:
+                return ret_buff_sz
+        except (IOError, OSError) as e:
+            # Attach a maximally descriptive error message for cURL errors
+            raise self._create_read_error_from_context() from e
 
     def tell(self) -> int:
         return self._curr
@@ -356,6 +438,8 @@ def _infer_credentials(
         `s3_access_key` and `s3_secret_key` fields guaranteed to not be None.
     :raises ValueError: If the credential pair is incomplete and the
         missing parts could not be found in any s3cmd config file.
+    :raises FileNotFoundError: If `s3_config_path` was explicitly provided,
+        but the file specified does not exist.
     """
     if None not in (s3_access_key_id, s3_secret_access_key):
         # All required credentials were specified; don't parse anything
@@ -519,21 +603,44 @@ def open_stream(
                 'Only the modes "rb", "wb[+]", and "ab[+]" are valid'
                 " when opening s3:// streams."
             )
+        is_s3_upload = "w" in mode or "a" in mode
+        error_context = None
+        try:
+            s3 = _infer_credentials(
+                s3_access_key_id, s3_secret_access_key, s3_config_path
+            )
+            s3_access_key_id = s3.s3_access_key
+            s3_secret_access_key = s3.s3_secret_key
 
-        s3 = _infer_credentials(
-            s3_access_key_id, s3_secret_access_key, s3_config_path
-        )
-        s3_access_key_id = s3.s3_access_key
-        s3_secret_access_key = s3.s3_secret_key
-
-        # Not required to have been found,
-        # and doesn't overwrite an explicitly specified endpoint.
-        s3_endpoint = s3_endpoint or s3.s3_endpoint
+            # Not required to have been found,
+            # and doesn't overwrite an explicitly specified endpoint.
+            s3_endpoint = s3_endpoint or s3.s3_endpoint
+        except (ValueError, FileNotFoundError) as e:
+            # Uploads always require credentials here, but downloads may not
+            if is_s3_upload:
+                raise
+            else:
+                # Credentials may be absent because a public read
+                # bucket is being used, so try blank credentials,
+                # but provide a descriptive warning for future errors
+                # that may occur due to this exception being suppressed.
+                # Don't save the whole exception object since it holds
+                # a stack trace, which can interfere with garbage collection.
+                error_context = (
+                    "Warning: empty credentials were used for S3."
+                    f"\nReason: {e}"
+                    "\nIf the connection failed due to missing permissions"
+                    " (e.g. HTTP error 403), try providing credentials"
+                    " directly with the tensorizer.stream_io.open_stream()"
+                    " function."
+                )
+                s3_access_key_id = s3_access_key_id or ""
+                s3_secret_access_key = s3_access_key_id or ""
 
         # Regardless of whether the config needed to be parsed,
-        # the endpoint gets a default value.
+        # the endpoint gets a default value based on the operation.
 
-        if "w" in mode or "a" in mode:
+        if is_s3_upload:
             s3_endpoint = s3_endpoint or default_s3_write_endpoint
 
             # delete must be False or the file will be deleted by the OS
@@ -555,9 +662,12 @@ def open_stream(
             return temp_file
         else:
             s3_endpoint = s3_endpoint or default_s3_read_endpoint
-            return s3_download(
+            curl_stream_file = s3_download(
                 path_uri, s3_access_key_id, s3_secret_access_key, s3_endpoint
             )
+            if error_context:
+                curl_stream_file.register_error_context(error_context)
+            return curl_stream_file
 
     else:
         if "b" not in normalized_mode:
