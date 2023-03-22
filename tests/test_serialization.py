@@ -215,7 +215,10 @@ class TestDeserialization(unittest.TestCase):
             f"s3://tensorized/{model_name}/fp16/model.tensors",
             device=default_device,
         )
-        check_inference(deserialized, model_name, default_device)
+        assert deserialized.total_tensor_bytes > 0
+        if is_cuda_available and default_device != "cpu":
+            # FP16 tensors don't work correctly on CPU in PyTorch
+            check_inference(deserialized, model_name, default_device)
         deserialized.close()
 
     def test_s3_lazy_load(self):
