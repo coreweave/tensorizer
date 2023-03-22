@@ -45,9 +45,12 @@ def check_deserialized(deserialized, model_name: str, allow_subset=False):
     if not allow_subset:
         assert orig_sd.keys() == deserialized.keys()
     for k, v in deserialized.items():
-        assert k in orig_sd
-        assert v.size() == orig_sd[k].size()
-        assert v.dtype == orig_sd[k].dtype
+        assert k in orig_sd, \
+            f"{k} not in {orig_sd.keys()}"
+        assert v.size() == orig_sd[k].size(), \
+            f"{v.size()} != {orig_sd[k].size()}"
+        assert v.dtype == orig_sd[k].dtype, \
+            f"{v.dtype} != {orig_sd[k].dtype}"
         assert torch.all(orig_sd[k].to(v.device) == v)
     del orig_sd
     gc.collect()
