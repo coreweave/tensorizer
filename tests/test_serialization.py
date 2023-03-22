@@ -45,9 +45,12 @@ def check_deserialized(deserialized, model_name: str, allow_subset=False):
     if not allow_subset:
         assert orig_sd.keys() == deserialized.keys()
     for k, v in deserialized.items():
-        assert k in orig_sd
-        assert v.size() == orig_sd[k].size()
-        assert v.dtype == orig_sd[k].dtype
+        assert k in orig_sd, \
+            f"{k} not in {orig_sd.keys()}"
+        assert v.size() == orig_sd[k].size(), \
+            f"{v.size()} != {orig_sd[k].size()}"
+        assert v.dtype == orig_sd[k].dtype, \
+            f"{v.dtype} != {orig_sd[k].dtype}"
         assert torch.all(orig_sd[k].to(v.device) == v)
     del orig_sd
     gc.collect()
@@ -212,7 +215,10 @@ class TestDeserialization(unittest.TestCase):
             f"s3://tensorized/{model_name}/fp16/model.tensors",
             device=default_device,
         )
-        check_inference(deserialized, model_name, default_device)
+        assert deserialized.total_tensor_bytes > 0
+        if is_cuda_available and default_device != "cpu":
+            # FP16 tensors don't work correctly on CPU in PyTorch
+            check_inference(deserialized, model_name, default_device)
         deserialized.close()
 
     def test_s3_lazy_load(self):
