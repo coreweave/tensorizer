@@ -30,7 +30,7 @@ from diffusers import (
     StableDiffusionPipeline,
     LMSDiscreteScheduler,
 )
-from diffusers.modeling_utils import ModelMixin
+from diffusers.models.modeling_utils import ModelMixin
 from diffusers.configuration_utils import ConfigMixin
 
 # Setup logger
@@ -222,7 +222,7 @@ def df_main(args: argparse.Namespace) -> None:
             "cuda" if torch.cuda.is_available() else "cpu"
         ):  # for some reason device_type needs to be a string
             # instead of an actual device
-            pipeline(prompt).images[0]
+            pipeline(prompt).images[0].save('test.png')
 
 
 def hf_main(args):
