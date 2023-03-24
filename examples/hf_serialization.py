@@ -30,7 +30,7 @@ from diffusers import (
     StableDiffusionPipeline,
     LMSDiscreteScheduler,
 )
-from diffusers.modeling_utils import ModelMixin
+from diffusers.models.modeling_utils import ModelMixin
 from diffusers.configuration_utils import ConfigMixin
 
 # Setup logger
@@ -188,6 +188,7 @@ def df_main(args: argparse.Namespace) -> None:
     serialize_model(pipeline.unet.eval(), None, output_prefix, "unet")
 
     pipeline.tokenizer.save_pretrained(output_prefix)
+    pipeline.scheduler.save_pretrained(output_prefix)
 
     if args.validate:
         device = utils.get_device()
@@ -206,12 +207,8 @@ def df_main(args: argparse.Namespace) -> None:
             tokenizer=CLIPTokenizer.from_pretrained(
                 args.input_directory, subfolder="tokenizer"
             ),
-            scheduler=LMSDiscreteScheduler(
-                beta_end=0.012,
-                beta_schedule="scaled_linear",
-                beta_start=0.00085,
-                num_train_timesteps=1000,
-                trained_betas=None,
+            scheduler=LMSDiscreteScheduler.from_pretrained(
+                args.input_directory, subfolder="scheduler"
             ),
             safety_checker=None,
             feature_extractor=None,
@@ -222,7 +219,7 @@ def df_main(args: argparse.Namespace) -> None:
             "cuda" if torch.cuda.is_available() else "cpu"
         ):  # for some reason device_type needs to be a string
             # instead of an actual device
-            pipeline(prompt).images[0]
+            pipeline(prompt).images[0].save('test.png')
 
 
 def hf_main(args):
