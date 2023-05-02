@@ -1,6 +1,6 @@
 [project]
 name = "tensorizer"
-version = "1.0.1"
+version = "1.1.0"
 license = { text = "MIT License" }
 keywords = ["tensorizer", "machine learning", "serialization", "tensor", "pytorch"]
 authors = [
