@@ -88,9 +88,9 @@ python -m pip install transformers accelerate
 
 [serialize.py](examples/serialize.py)
 ```python
-from transformers import AutoModelForCausalLM
-from tensorizer import TensorSerializer
 import torch
+from tensorizer import TensorSerializer
+from transformers import AutoModelForCausalLM
 
 model_ref = "EleutherAI/gpt-j-6B"
 # For less intensive requirements, swap above with the line below:
@@ -125,8 +125,8 @@ endpoint.
 
 [deserialize.py](examples/deserialize.py)
 ```python
-import torch
 import time
+import torch
 from tensorizer import TensorDeserializer
 from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
 

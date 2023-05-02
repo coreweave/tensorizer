@@ -2,17 +2,17 @@ import functools
 import io
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import typing
 import weakref
+from io import SEEK_CUR, SEEK_END, SEEK_SET
+from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import boto3
-from io import SEEK_SET, SEEK_CUR, SEEK_END
-from typing import Union, Optional, Dict, Any, Tuple
-import shutil
 
 import tensorizer._wide_pipes as _wide_pipes
 
@@ -185,7 +185,7 @@ class CURLStreamFile:
         self._error_context.append(msg)
 
     def _reproduce_and_capture_error(
-            self, expect_code: Optional[int]
+        self, expect_code: Optional[int]
     ) -> Optional[str]:
         """
         Re-attempts the connection with stderr attached to a pipe
@@ -211,7 +211,7 @@ class CURLStreamFile:
             "-f",  # Don't return HTML/XML error webpages
             "-s",  # Silence most output
             "-S",  # Keep error messages
-            self._uri
+            self._uri,
         ]
         try:
             result = subprocess.run(
@@ -220,7 +220,7 @@ class CURLStreamFile:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=3
+                timeout=3,
             )
 
         except subprocess.TimeoutExpired:
@@ -238,8 +238,10 @@ class CURLStreamFile:
         if return_code:
             error = self._reproduce_and_capture_error(expect_code=return_code)
             if error is None:
-                error = f"curl error: ({return_code}), see" \
-                        f" https://curl.se/docs/manpage.html#{return_code}"
+                error = (
+                    f"curl error: ({return_code}), see"
+                    f" https://curl.se/docs/manpage.html#{return_code}"
+                )
         else:
             error = ""
 
@@ -470,7 +472,8 @@ def _infer_credentials(
     # Try to find default credentials if at least one is not specified
     if s3_config_path is not None and not os.path.exists(s3_config_path):
         raise FileNotFoundError(
-            f"Explicitly specified s3_config_path does not exist: {s3_config_path}"
+            "Explicitly specified s3_config_path does not exist:"
+            f" {s3_config_path}"
         )
     try:
         parsed: _ParsedCredentials = _get_s3cfg_values(s3_config_path)

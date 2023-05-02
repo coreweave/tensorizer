@@ -11,23 +11,25 @@ except ImportError:
     fcntl = None
     resource = None
 
-from enum import Enum
 import collections.abc
+import ctypes
+import hashlib
 import io
+import logging
+import mmap
 import os
+import struct
+import tempfile
+import time
+import typing
+import zlib
+from enum import Enum
+
+import numpy
+import torch
+
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
-import mmap
-import numpy
-import struct
-import time
-import torch
-import typing
-import logging
-import tempfile
-import hashlib
-import zlib
-import ctypes
 
 if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
@@ -35,7 +37,7 @@ else:
     cudart = None
 
 from collections import OrderedDict
-from typing import Optional, Tuple, Union, List, Iterator, Dict, Callable, Any
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 lz4 = None
 
@@ -100,8 +102,8 @@ def _convert_dtype_to_numpy(dtype: Union[numpy.dtype, str, torch.dtype]):
 
         if numpy_dtype is None:
             raise TypeError(
-                "The provided torch.dtype class could not"
-                " be converted to a numpy.dtype"
+                "The provided torch.dtype class could not be converted to a"
+                " numpy.dtype"
             )
         else:
             # Convert it from a dtype class to a dtype object instance
@@ -184,7 +186,7 @@ class TensorDeserializer(collections.abc.Mapping):
             str,
             bytes,
             os.PathLike,
-            int
+            int,
         ],
         device: Union[torch.device, str, None] = None,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
@@ -452,7 +454,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 self._cache[self._prior_key] = False
             if self._cache[name] is False:
                 raise RuntimeError(
-                    f"Tensor {name} already overwritten in " "plaid_mode"
+                    f"Tensor {name} already overwritten in plaid_mode"
                 )
             self._prior_key = name
 

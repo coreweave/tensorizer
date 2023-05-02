@@ -1,5 +1,5 @@
-import torch
 import time
+import torch
 from tensorizer import TensorDeserializer
 from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
 

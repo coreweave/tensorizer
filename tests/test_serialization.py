@@ -1,20 +1,20 @@
 import contextlib
 import gc
 import os
+import re
 import tempfile
 import unittest
-import re
 from typing import Tuple
+
 import torch
 
-os.environ[
-    "TOKENIZERS_PARALLELISM"
-] = "false"  # avoids excessive warnings about forking after using a tokenizer
+os.environ["TOKENIZERS_PARALLELISM"] = (
+    "false"  # avoids excessive warnings about forking after using a tokenizer
+)
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from tensorizer import TensorSerializer, TensorDeserializer
-from tensorizer import utils
+from tensorizer import TensorDeserializer, TensorSerializer, utils
 
 model_name = "EleutherAI/gpt-neo-125M"
 num_hellos = 400
@@ -41,13 +41,18 @@ def check_deserialized(deserialized, model_name: str, allow_subset=False):
     if not allow_subset:
         assert orig_sd.keys() == deserialized.keys()
     for k, v in deserialized.items():
+        # fmt: off
         assert k in orig_sd, \
             f"{k} not in {orig_sd.keys()}"
+
         assert v.size() == orig_sd[k].size(), \
             f"{v.size()} != {orig_sd[k].size()}"
+
         assert v.dtype == orig_sd[k].dtype, \
             f"{v.dtype} != {orig_sd[k].dtype}"
+
         assert torch.all(orig_sd[k].to(v.device) == v)
+        # fmt: on
     del orig_sd
     gc.collect()
 
@@ -261,7 +266,8 @@ class TestDeserialization(unittest.TestCase):
             " or matches all tensor names."
             " Update the pattern and/or custom_check"
             " to use more informative filtering criteria."
-            "\n\nTensors present in the model: " + " ".join(all_keys)
+            "\n\nTensors present in the model: "
+            + " ".join(all_keys)
         )
 
         with self.subTest(msg="Testing regex filter_func"):

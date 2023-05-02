@@ -1,15 +1,16 @@
-import torch
 import contextlib
 import contextvars
 import threading
 from typing import (
-    Optional,
     Callable,
-    Union,
-    TypeVar,
     ContextManager,
     NamedTuple,
+    Optional,
+    TypeVar,
+    Union,
 )
+
+import torch
 
 try:
     import resource

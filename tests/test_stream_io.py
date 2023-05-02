@@ -1,8 +1,10 @@
 import contextlib
 import os
 import unittest
-import moto
+
 import boto3
+import moto
+
 from tensorizer import stream_io
 
 NEO_URL = (
@@ -78,11 +80,11 @@ def tear_down_moto(old_environment):
 
 @contextlib.contextmanager
 def mock_server():
+    import logging
+
     from moto.server import ThreadedMotoServer
 
     # Disable mock server logs
-    import logging
-
     werkzeug_logger = logging.getLogger("werkzeug")
     old_log_level = werkzeug_logger.getEffectiveLevel()
     werkzeug_logger.setLevel(logging.CRITICAL + 1)
