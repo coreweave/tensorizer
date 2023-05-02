@@ -8,17 +8,13 @@ from typing import Tuple
 import torch
 
 os.environ[
-    "TRANSFORMERS_VERBOSITY"
-] = "error"  # disable missing keys and unexpected key warnings
-os.environ[
     "TOKENIZERS_PARALLELISM"
 ] = "false"  # avoids excessive warnings about forking after using a tokenizer
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from tensorizer import TensorSerializer, TensorDeserializer
 from tensorizer import utils
-from collections import OrderedDict
 
 model_name = "EleutherAI/gpt-neo-125M"
 num_hellos = 400
@@ -69,24 +65,23 @@ def check_inference(
     deserializer: TensorDeserializer, model_ref: str, device: str
 ):
     # This ensures that the model is not initialized.
-    model = utils.no_init_or_tensor(
-        lambda: AutoModelForCausalLM.from_pretrained(
-            model_ref, state_dict=OrderedDict()
-        )
-    )
+    config = AutoConfig.from_pretrained(model_ref)
+    with utils.no_init_or_tensor():
+        model = AutoModelForCausalLM.from_config(config)
 
     deserializer.load_into_module(model)
 
     # Tokenize and generate
     with enable_tokenizers_parallelism():
         tokenizer = AutoTokenizer.from_pretrained(model_ref)
+        eos = tokenizer.eos_token_id
         input_ids = tokenizer.encode(
             " hello" * num_hellos, return_tensors="pt"
         ).to(device)
 
         with torch.no_grad():
             output = model.generate(
-                input_ids, max_new_tokens=50, do_sample=True
+                input_ids, max_new_tokens=50, do_sample=True, pad_token_id=eos
             )
 
         decoded = tokenizer.decode(output[0], skip_special_tokens=True)
