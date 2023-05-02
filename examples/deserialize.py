@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 model_ref = "EleutherAI/gpt-j-6B"
 # To run this at home, swap this with the line below for a smaller example:
-# model_ref = "EleutherAI/gpt-neo-125m"
+# model_ref = "EleutherAI/gpt-neo-125M"
 model_name = model_ref.split("/")[-1]
 # Change this to your S3 bucket.
 s3_bucket = "bucket"

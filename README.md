@@ -78,7 +78,7 @@ credentials in `~/.s3cfg`.
 **NOTE:** Loading and serializing `gpt-j-6B` will take a lot of CPU RAM,
 up to `~20GB`. Additionally, when loading `gpt-j-6B` into a GPU, you
 will need about `~16GB` of VRAM. If you don't have that much RAM or VRAM,
-you can use the smaller `gpt-neo-125m` model instead.
+you can use the smaller `gpt-neo-125M` model instead.
 
 **NOTE2:** The below examples require the `transformers` and `accelerate`
 libraries. You can install them with `pip`:
@@ -94,7 +94,7 @@ import torch
 
 model_ref = "EleutherAI/gpt-j-6B"
 # For less intensive requirements, swap above with the line below:
-# model_ref = "EleutherAI/gpt-neo-125m"
+# model_ref = "EleutherAI/gpt-neo-125M"
 model_name = model_ref.split("/")[-1]
 # Change this to your S3 bucket.
 s3_bucket = "bucket"
@@ -139,7 +139,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 model_ref = "EleutherAI/gpt-j-6B"
 # To run this at home, swap this with the line below for a smaller example:
-# model_ref = "EleutherAI/gpt-neo-125m"
+# model_ref = "EleutherAI/gpt-neo-125M"
 model_name = model_ref.split("/")[-1]
 # Change this to your S3 bucket.
 s3_bucket = "bucket"
