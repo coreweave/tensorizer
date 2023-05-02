@@ -297,7 +297,7 @@ def no_init_or_tensor(
         Otherwise, if `loading_code` is None, returns a context manager
         to be used in a `with`-statement.
 
-    Example:
+    Examples:
         As a context manager::
 
             from transformers import AutoConfig, AutoModelForCausalLM

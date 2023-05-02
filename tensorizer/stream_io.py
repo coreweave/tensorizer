@@ -53,22 +53,26 @@ def _get_s3cfg_values(
     """
     Gets S3 credentials from the .s3cfg file.
 
-    :param config_paths: The sequence of potential file paths to check
-        for s3cmd config settings. If not provided or an empty tuple,
-        platform-specific default search locations are used.
-        When specifying a sequence, this argument must be a tuple,
-        because this function is cached, and that requires
-        all arguments to be hashable.
-    :return: A 4-tuple, config_file, s3_endpoint, s3_access_key, s3_secret_key,
+    Args:
+        config_paths: The sequence of potential file paths to check
+            for s3cmd config settings. If not provided or an empty tuple,
+            platform-specific default search locations are used.
+            When specifying a sequence, this argument must be a tuple,
+            because this function is cached, and that requires
+            all arguments to be hashable.
+
+    Returns:
+        A 4-tuple, config_file, s3_endpoint, s3_access_key, s3_secret_key,
         where each element may be None if not found,
         and config_file is the config file path used.
         If config_file is None, no valid config file
         was found, and nothing was parsed.
 
-    If the config_paths argument is not provided or is an empty tuple,
-    platform-specific default search locations are used.
-    This function is cached, and hence config_paths must be a (hashable) tuple
-    when specifying a sequence
+    Note:
+        If the config_paths argument is not provided or is an empty tuple,
+        platform-specific default search locations are used.
+        This function is cached, and hence config_paths must be a
+        (hashable) tuple when specifying a sequence.
     """
     if not config_paths:
         config_paths = _s3_default_config_paths
@@ -174,7 +178,9 @@ class CURLStreamFile:
         error messages if those conditions eventually lead to an error,
         while still attempting to connect regardless, in accordance with
         the "easier to ask for forgiveness than permission" principle.
-        :param msg: The message to be registered.
+
+        Args:
+            msg: The message to be registered.
         """
         self._error_context.append(msg)
 
@@ -189,10 +195,13 @@ class CURLStreamFile:
         so this optimizes for the non-error path
         at the slight expense of the error path
 
-        :param expect_code: The error code to expect.
-            If this doesn't match the new error, the original error
-            is considered not to have been reproduced.
-        :return: The cURL error message if the error could be reproduced,
+        Args:
+            expect_code: The error code to expect.
+                If this doesn't match the new error, the original error
+                is considered not to have been reproduced.
+
+        Returns:
+            The cURL error message if the error could be reproduced,
             otherwise None.
         """
         args = [
@@ -428,18 +437,26 @@ def _infer_credentials(
     while None is an unspecified credential.
     Use "" for public buckets.
 
-    :param s3_access_key_id: `s3_access_key_id` if explicitly specified,
-        otherwise None. If None, the s3cmd config file is parsed for the key.
-    :param s3_secret_access_key: `s3_secret_access_key` if explicitly specified,
-        otherwise None. If None, the s3cmd config file is parsed for the key.
-    :param s3_config_path: An explicit path to the s3cmd config file to search,
-        if necessary. If None, platform-specific default paths are used.
-    :return: A `_ParsedCredentials` object with both the
+    Args:
+        s3_access_key_id: `s3_access_key_id` if explicitly specified,
+            otherwise None.
+            If None, the s3cmd config file is parsed for the key.
+        s3_secret_access_key: `s3_secret_access_key` if explicitly specified,
+            otherwise None.
+            If None, the s3cmd config file is parsed for the key.
+        s3_config_path: An explicit path to the s3cmd config file to search,
+            if necessary.
+            If None, platform-specific default paths are used.
+
+    Returns:
+        A `_ParsedCredentials` object with both the
         `s3_access_key` and `s3_secret_key` fields guaranteed to not be None.
-    :raises ValueError: If the credential pair is incomplete and the
-        missing parts could not be found in any s3cmd config file.
-    :raises FileNotFoundError: If `s3_config_path` was explicitly provided,
-        but the file specified does not exist.
+
+    Raises:
+        ValueError: If the credential pair is incomplete and the
+            missing parts could not be found in any s3cmd config file.
+        FileNotFoundError: If `s3_config_path` was explicitly provided,
+            but the file specified does not exist.
     """
     if None not in (s3_access_key_id, s3_secret_access_key):
         # All required credentials were specified; don't parse anything
@@ -554,33 +571,81 @@ def open_stream(
     s3_endpoint: Optional[str] = None,
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
 ) -> Union[CURLStreamFile, typing.BinaryIO]:
-    """Open a file path, http(s):// URL, or s3:// URI.
-    :param path_uri: File path, http(s):// URL, or s3:// URI to open.
-    :param mode: Mode with which to open the stream.
-        Supported values are:
-        * "rb" for http(s)://,
-        * "rb", "wb[+]", and "ab[+]" for s3://,
-        * All standard binary modes for file paths.
-    :param s3_access_key_id: S3 access key, corresponding to
-        "aws_access_key_id" in boto3.
-        If not specified, an s3:// URI is being opened, and ~/.s3cfg exists,
-        ~/.s3cfg's "access_key" will be parsed as this credential.
-        To specify blank credentials, for a public bucket,
-        pass the empty string ("") rather than None.
-    :param s3_secret_access_key: S3 secret key, corresponding to
-        "aws_secret_access_key" in boto3.
-        If not specified, an s3:// URI is being opened, and ~/.s3cfg exists,
-        ~/.s3cfg's "secret_key" will be parsed as this credential.
-        To specify blank credentials, for a public bucket,
-        pass the empty string ("") rather than None.
-    :param s3_endpoint: S3 endpoint.
-        If not specified and a host_base was found
-        alongside previously parsed credentials, that will be used.
-        Otherwise, object.ord1.coreweave.com is the default.
-    :param s3_config_path: An explicit path to the ~/.s3cfg config file
-        to be parsed if full credentials are not provided.
-        If None, platform-specific default paths are used.
-    :return: An opened file-like object representing the target resource.
+    """
+    Open a file path, http(s):// URL, or s3:// URI.
+
+    Note:
+        The file-like streams returned by this function can be passed directly
+        to `tensorizer.TensorDeserializer` when ``mode="rb"``,
+        and `tensorizer.TensorSerializer` when ``mode="wb"``.
+
+    Args:
+        path_uri: File path, http(s):// URL, or s3:// URI to open.
+        mode: Mode with which to open the stream.
+            Supported values are:
+
+            * "rb" for http(s)://,
+            * "rb", "wb[+]", and "ab[+]" for s3://,
+            * All standard binary modes for file paths.
+
+        s3_access_key_id: S3 access key, corresponding to
+            "aws_access_key_id" in boto3. If not specified and
+            an s3:// URI is being opened, and `~/.s3cfg` exists,
+            `~/.s3cfg`'s "access_key" will be parsed as this credential.
+            To specify blank credentials, for a public bucket,
+            pass the empty string ("") rather than None.
+        s3_secret_access_key: S3 secret key, corresponding to
+            "aws_secret_access_key" in boto3. If not specified and
+            an s3:// URI is being opened, and `~/.s3cfg` exists,
+            `~/.s3cfg`'s "secret_key" will be parsed as this credential.
+            To specify blank credentials, for a public bucket,
+            pass the empty string ("") rather than None.
+        s3_endpoint: S3 endpoint.
+            If not specified and a host_base was found
+            alongside previously parsed credentials, that will be used.
+            Otherwise, ``object.ord1.coreweave.com`` is the default.
+        s3_config_path: An explicit path to the `~/.s3cfg` config file
+            to be parsed if full credentials are not provided.
+            If None, platform-specific default paths are used.
+
+    Returns:
+        An opened file-like object representing the target resource.
+
+    Examples:
+        Opening an S3 stream for writing with manually specified credentials::
+
+            with open_stream(
+                "s3://some-private-bucket/my-model.tensors",
+                mode="wb",
+                s3_access_key_id=...,
+                s3_secret_access_key=...,
+                s3_endpoint=...,
+            ) as stream:
+                ...
+
+        Opening an S3 stream for reading with credentials
+        specified in `~/.s3cfg`::
+
+            # Credentials in ~/.s3cfg are parsed automatically.
+            stream = open_stream(
+                "s3://some-private-bucket/my-model.tensors",
+            )
+
+        Opening an S3 stream for reading with credentials
+        specified in `/etc/secrets/.s3cfg`
+        (e.g., as may be mounted in a Kubernetes pod)::
+
+            stream = open_stream(
+                "s3://some-private-bucket/my-model.tensors",
+                s3_config_path="/etc/secrets/.s3cfg",
+            )
+
+        Opening an http(s):// URI for reading::
+
+            with open_stream(
+                "https://raw.githubusercontent.com/EleutherAI/gpt-neo/master/README.md"
+            ) as stream:
+                print(stream.read(128))
     """
     if isinstance(path_uri, os.PathLike):
         path_uri = os.fspath(path_uri)

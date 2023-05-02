@@ -200,7 +200,7 @@ and `hf_main()` serializes
 
 The following models are available on the CoreWeave Cloud for free, and can be
 used with the `TensorDeserializer` class. The S3 support defaults to the
-`accel-object.ord1.coreweave.com` endpoint, and the bucket to use `tensorized`.
+`accel-object.ord1.coreweave.com` endpoint, and the bucket to use as `tensorized`.
 
 We name the keys in the S3 bucket after the HuggingFace model identifier, and
 append the `/fp16` suffix for the half-precision version.
