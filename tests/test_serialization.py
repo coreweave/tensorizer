@@ -1,24 +1,20 @@
 import contextlib
 import gc
 import os
+import re
 import tempfile
 import unittest
-import re
 from typing import Tuple
+
 import torch
 
-os.environ[
-    "TRANSFORMERS_VERBOSITY"
-] = "error"  # disable missing keys and unexpected key warnings
-os.environ[
-    "TOKENIZERS_PARALLELISM"
-] = "false"  # avoids excessive warnings about forking after using a tokenizer
+os.environ["TOKENIZERS_PARALLELISM"] = (
+    "false"  # avoids excessive warnings about forking after using a tokenizer
+)
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from tensorizer import TensorSerializer, TensorDeserializer
-from tensorizer import utils
-from collections import OrderedDict
+from tensorizer import TensorDeserializer, TensorSerializer, utils
 
 model_name = "EleutherAI/gpt-neo-125M"
 num_hellos = 400
@@ -45,13 +41,18 @@ def check_deserialized(deserialized, model_name: str, allow_subset=False):
     if not allow_subset:
         assert orig_sd.keys() == deserialized.keys()
     for k, v in deserialized.items():
+        # fmt: off
         assert k in orig_sd, \
             f"{k} not in {orig_sd.keys()}"
+
         assert v.size() == orig_sd[k].size(), \
             f"{v.size()} != {orig_sd[k].size()}"
+
         assert v.dtype == orig_sd[k].dtype, \
             f"{v.dtype} != {orig_sd[k].dtype}"
+
         assert torch.all(orig_sd[k].to(v.device) == v)
+        # fmt: on
     del orig_sd
     gc.collect()
 
@@ -69,24 +70,23 @@ def check_inference(
     deserializer: TensorDeserializer, model_ref: str, device: str
 ):
     # This ensures that the model is not initialized.
-    model = utils.no_init_or_tensor(
-        lambda: AutoModelForCausalLM.from_pretrained(
-            model_ref, state_dict=OrderedDict()
-        )
-    )
+    config = AutoConfig.from_pretrained(model_ref)
+    with utils.no_init_or_tensor():
+        model = AutoModelForCausalLM.from_config(config)
 
     deserializer.load_into_module(model)
 
     # Tokenize and generate
     with enable_tokenizers_parallelism():
         tokenizer = AutoTokenizer.from_pretrained(model_ref)
+        eos = tokenizer.eos_token_id
         input_ids = tokenizer.encode(
             " hello" * num_hellos, return_tensors="pt"
         ).to(device)
 
         with torch.no_grad():
             output = model.generate(
-                input_ids, max_new_tokens=50, do_sample=True
+                input_ids, max_new_tokens=50, do_sample=True, pad_token_id=eos
             )
 
         decoded = tokenizer.decode(output[0], skip_special_tokens=True)
@@ -266,7 +266,8 @@ class TestDeserialization(unittest.TestCase):
             " or matches all tensor names."
             " Update the pattern and/or custom_check"
             " to use more informative filtering criteria."
-            "\n\nTensors present in the model: " + " ".join(all_keys)
+            "\n\nTensors present in the model: "
+            + " ".join(all_keys)
         )
 
         with self.subTest(msg="Testing regex filter_func"):

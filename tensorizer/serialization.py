@@ -11,23 +11,25 @@ except ImportError:
     fcntl = None
     resource = None
 
-from enum import Enum
 import collections.abc
+import ctypes
+import hashlib
 import io
+import logging
+import mmap
 import os
+import struct
+import tempfile
+import time
+import typing
+import zlib
+from enum import Enum
+
+import numpy
+import torch
+
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
-import mmap
-import numpy
-import struct
-import time
-import torch
-import typing
-import logging
-import tempfile
-import hashlib
-import zlib
-import ctypes
 
 if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
@@ -35,7 +37,7 @@ else:
     cudart = None
 
 from collections import OrderedDict
-from typing import Optional, Tuple, Union, List, Iterator, Dict, Callable, Any
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 lz4 = None
 
@@ -100,8 +102,8 @@ def _convert_dtype_to_numpy(dtype: Union[numpy.dtype, str, torch.dtype]):
 
         if numpy_dtype is None:
             raise TypeError(
-                "The provided torch.dtype class could not"
-                " be converted to a numpy.dtype"
+                "The provided torch.dtype class could not be converted to a"
+                " numpy.dtype"
             )
         else:
             # Convert it from a dtype class to a dtype object instance
@@ -114,6 +116,10 @@ class TensorDeserializer(collections.abc.Mapping):
     """
     Given a file-like object for read, deserialize tensors to a state_dict or
     a torch.nn.Module.
+
+    See the docs_ for a usage walkthrough.
+
+    .. _docs: https://github.com/coreweave/tensorizer/tree/main#basic-usage
 
     Args:
         file_obj: A file-like object to read from. It can also be a string
@@ -132,6 +138,43 @@ class TensorDeserializer(collections.abc.Mapping):
             buffers are going to be inconsistent due to the extreme
             naughtiness of reusing a backing buffer. This is only recommended
             for use with inference, and not training.
+
+    Examples:
+        Deserializing a pre-serialized_ 16-bit ``transformers`` model from S3::
+
+            from tensorizer import TensorDeserializer, utils
+            from transformers import AutoConfig, AutoModelForCausalLM
+            import torch
+
+            model_ref = "EleutherAI/gpt-neo-125M"
+
+            # Create an empty torch.nn.Module with the right shape
+            config = AutoConfig.from_pretrained(model_ref, dtype=torch.float16)
+            with utils.no_init_or_tensor():
+                model = AutoModelForCausalLM.from_config(config)
+
+            # Public `tensorized` bucket hosted by CoreWeave; see the docs
+            s3_uri = f"s3://tensorized/{model_ref}/fp16/model.tensors"
+
+            deserializer = TensorDeserializer(s3_uri, plaid_mode=True)
+            deserializer.load_into_module(model)
+
+        ## From a private S3 bucket::
+
+            from tensorizer import stream_io
+            s3 = stream_io.open_stream(
+                "s3://some-private-bucket/my-model.tensors",
+                mode="rb",
+                s3_access_key_id=...,
+                s3_secret_access_key=...,
+                s3_endpoint=...,
+            )
+            # Set up `model` as an empty torch.nn.Module in the shape of
+            # my-model.tensors, then:
+            deserializer = TensorDeserializer(s3, plaid_mode=True)
+            deserializer.load_into_module(model)
+
+        .. _pre-serialized: https://github.com/coreweave/tensorizer/tree/main#available-pre-tensorized-models-on-the-coreweave-cloud
     """
 
     def __init__(
@@ -143,7 +186,7 @@ class TensorDeserializer(collections.abc.Mapping):
             str,
             bytes,
             os.PathLike,
-            int
+            int,
         ],
         device: Union[torch.device, str, None] = None,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
@@ -411,7 +454,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 self._cache[self._prior_key] = False
             if self._cache[name] is False:
                 raise RuntimeError(
-                    f"Tensor {name} already overwritten in " "plaid_mode"
+                    f"Tensor {name} already overwritten in plaid_mode"
                 )
             self._prior_key = name
 
@@ -752,12 +795,43 @@ class TensorSerializer:
     Given a file-like object or path, serialize tensors from a torch.nn.Module
     to it.
 
+    See the docs_ for a usage walkthrough.
+
+    .. _docs: https://github.com/coreweave/tensorizer/tree/main#basic-usage
+
     Args:
         file_obj: A file-like object or path to a file to write to. The path
             can be a S3 URI.
         compress_tensors: If True, compress the tensors using lz4. This
             exists as an internal curiosity as it doesn't seem to make
             much of a difference in practice.
+
+    Example:
+        Serializing a 16-bit HuggingFace model to a private S3 bucket::
+
+            from transformers import AutoModelForCausalLM
+            from tensorizer import TensorSerializer
+            import torch
+
+            model_ref = "EleutherAI/gpt-neo-125M"
+            s3_uri = f"s3://some-private-bucket/{model_ref}.tensors"
+
+            model = AutoModelForCausalLM.from_pretrained(
+                model_ref,
+                revision="float16",
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+            )
+
+            serializer = TensorSerializer(s3_uri)
+            serializer.write_module(model)
+            serializer.close()
+
+        This example assumes the credentials for ``some-private-bucket``
+        are configured in `~/.s3cfg`, where they will be auto-detected.
+        To specify credentials manually, use a file-like object from
+        `tensorizer.stream_io.open_stream()` in place of `s3_uri`.
+    ..
     """
 
     def __init__(
@@ -874,7 +948,6 @@ class TensorSerializer:
         """
         This is called after the tensor has been written to the file, and
         ensures that the file is in a consistent state.
-        :return:
         """
         curr = self._file.tell()
 

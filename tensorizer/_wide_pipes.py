@@ -1,9 +1,9 @@
 import contextlib
 import functools
 import logging
-import threading
 import subprocess
 import sys
+import threading
 
 # =============================================================================
 # From `pipe(7)` manpage:

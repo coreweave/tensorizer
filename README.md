@@ -78,7 +78,7 @@ credentials in `~/.s3cfg`.
 **NOTE:** Loading and serializing `gpt-j-6B` will take a lot of CPU RAM,
 up to `~20GB`. Additionally, when loading `gpt-j-6B` into a GPU, you
 will need about `~16GB` of VRAM. If you don't have that much RAM or VRAM,
-you can use the smaller `gpt-neo-125m` model instead.
+you can use the smaller `gpt-neo-125M` model instead.
 
 **NOTE2:** The below examples require the `transformers` and `accelerate`
 libraries. You can install them with `pip`:
@@ -88,13 +88,13 @@ python -m pip install transformers accelerate
 
 [serialize.py](examples/serialize.py)
 ```python
-from transformers import AutoModelForCausalLM
-from tensorizer import TensorSerializer
 import torch
+from tensorizer import TensorSerializer
+from transformers import AutoModelForCausalLM
 
 model_ref = "EleutherAI/gpt-j-6B"
 # For less intensive requirements, swap above with the line below:
-# model_ref = "EleutherAI/gpt-neo-125m"
+# model_ref = "EleutherAI/gpt-neo-125M"
 model_name = model_ref.split("/")[-1]
 # Change this to your S3 bucket.
 s3_bucket = "bucket"
@@ -125,21 +125,16 @@ endpoint.
 
 [deserialize.py](examples/deserialize.py)
 ```python
-import torch
-import os
 import time
+import torch
 from tensorizer import TensorDeserializer
 from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
-from collections import OrderedDict
-
-# disable missing keys and unexpected key warnings
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 model_ref = "EleutherAI/gpt-j-6B"
 # To run this at home, swap this with the line below for a smaller example:
-# model_ref = "EleutherAI/gpt-neo-125m"
+# model_ref = "EleutherAI/gpt-neo-125M"
 model_name = model_ref.split("/")[-1]
 # Change this to your S3 bucket.
 s3_bucket = "bucket"
@@ -148,11 +143,8 @@ s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 config = AutoConfig.from_pretrained(model_ref)
 
 # This ensures that the model is not initialized.
-model = no_init_or_tensor(
-    lambda: AutoModelForCausalLM.from_pretrained(
-        None, config=config, state_dict=OrderedDict()
-    )
-)
+with no_init_or_tensor():
+    model = AutoModelForCausalLM.from_config(config)
 
 before_mem = get_mem_usage()
 
@@ -168,19 +160,22 @@ duration = end - start
 per_second = convert_bytes(deserializer.total_tensor_bytes / duration)
 after_mem = get_mem_usage()
 deserializer.close()
-print(f"Deserialized {total_bytes_str} in {end - start:0.2f}s, {per_second}")
+print(f"Deserialized {total_bytes_str} in {end - start:0.2f}s, {per_second}/s")
 print(f"Memory usage before: {before_mem}")
 print(f"Memory usage after: {after_mem}")
 
 # Tokenize and generate
 model.eval()
 tokenizer = AutoTokenizer.from_pretrained(model_ref)
+eos = tokenizer.eos_token_id
 input_ids = tokenizer.encode(
     "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
 ).to("cuda")
 
 with torch.no_grad():
-    output = model.generate(input_ids, max_new_tokens=50, do_sample=True)
+    output = model.generate(
+        input_ids, max_new_tokens=50, do_sample=True, pad_token_id=eos
+    )
 
 print(f"Output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
 ```
@@ -205,7 +200,7 @@ and `hf_main()` serializes
 
 The following models are available on the CoreWeave Cloud for free, and can be
 used with the `TensorDeserializer` class. The S3 support defaults to the
-`accel-object.ord1.coreweave.com` endpoint, and the bucket to use `tensorized`.
+`accel-object.ord1.coreweave.com` endpoint, and the bucket to use as `tensorized`.
 
 We name the keys in the S3 bucket after the HuggingFace model identifier, and
 append the `/fp16` suffix for the half-precision version.
@@ -217,62 +212,62 @@ The below table shows the available models and their S3 URIs.
 
 ### Large Language Models
 
-| Model                                                                     | Precision | S3 URI  |
-|---------------------------------------------------------------------------|-----------|---------|
-| [EleutherAI/gpt-neo-125M](https://huggingface.co/EleutherAI/gpt-neo-125M) | `fp32`    | `s3://tensorized/EleutherAI/gpt-neo-125M/model.tensors` |
-| [EleutherAI/gpt-neo-125M](https://huggingface.co/EleutherAI/gpt-neo-125M) | `fp16`    | `s3://tensorized/EleutherAI/gpt-neo-125M/fp16/model.tensors` |
-| [EleutherAI/gpt-neo-1.3B](https://huggingface.co/EleutherAI/gpt-neo-1.3B) | `fp32`    | `s3://tensorized/EleutherAI/gpt-neo-1.3B/model.tensors` |
-| [EleutherAI/gpt-neo-1.3B](https://huggingface.co/EleutherAI/gpt-neo-1.3B) | `fp16`    | `s3://tensorized/EleutherAI/gpt-neo-1.3B/fp16/model.tensors` |
-| [EleutherAI/gpt-neo-2.7B](https://huggingface.co/EleutherAI/gpt-neo-2.7B) | `fp32`    | `s3://tensorized/EleutherAI/gpt-neo-2.7B/model.tensors` |
-| [EleutherAI/gpt-neo-2.7B](https://huggingface.co/EleutherAI/gpt-neo-2.7B) | `fp16`    | `s3://tensorized/EleutherAI/gpt-neo-2.7B/fp16/model.tensors` |
-| [EleutherAI/gpt-j-6B](https://huggingface.co/EleutherAI/gpt-j-6B)         | `fp32`    | `s3://tensorized/EleutherAI/gpt-j-6B/model.tensors` |
-| [EleutherAI/gpt-j-6B](https://huggingface.co/EleutherAI/gpt-j-6B)         | `fp16`    | `s3://tensorized/EleutherAI/gpt-j-6B/fp16/model.tensors` |
-| [EleutherAI/gpt-neox-20b](https://huggingface.co/EleutherAI/gpt-neox-20b) | `fp32`    | `s3://tensorized/EleutherAI/gpt-neox-20b/model.tensors` |
-| [EleutherAI/gpt-neox-20b](https://huggingface.co/EleutherAI/gpt-neox-20b) | `fp16`    | `s3://tensorized/EleutherAI/gpt-neox-20b/fp16/model.tensors` |
-| [EleutherAI/pythia-70m](https://huggingface.co/EleutherAI/pythia-70m)     | `fp32`    | `s3://tensorized/EleutherAI/pythia-70m/model.tensors` |
-| [EleutherAI/pythia-70m](https://huggingface.co/EleutherAI/pythia-70m)     | `fp16`    | `s3://tensorized/EleutherAI/pythia-70m/fp16/model.tensors` |
-| [EleutherAI/pythia-1.4b](https://huggingface.co/EleutherAI/pythia-1.4b)   | `fp32`    | `s3://tensorized/EleutherAI/pythia-1.4b/model.tensors` |
-| [EleutherAI/pythia-1.4b](https://huggingface.co/EleutherAI/pythia-1.4b)   | `fp16`    | `s3://tensorized/EleutherAI/pythia-1.4b/fp16/model.tensors` |
-| [EleutherAI/pythia-2.8b](https://huggingface.co/EleutherAI/pythia-2.8b)   | `fp32`    | `s3://tensorized/EleutherAI/pythia-2.8b/model.tensors` |
-| [EleutherAI/pythia-2.8b](https://huggingface.co/EleutherAI/pythia-2.8b)   | `fp16`    | `s3://tensorized/EleutherAI/pythia-2.8b/fp16/model.tensors` |
-| [EleutherAI/pythia-6.9b](https://huggingface.co/EleutherAI/pythia-6.9b)   | `fp32`    | `s3://tensorized/EleutherAI/pythia-6.9b/model.tensors` |
-| [EleutherAI/pythia-6.9b](https://huggingface.co/EleutherAI/pythia-6.9b)   | `fp16`    | `s3://tensorized/EleutherAI/pythia-6.9b/fp16/model.tensors` |
-| [EleutherAI/pythia-12b](https://huggingface.co/EleutherAI/pythia-12b)     | `fp32`    | `s3://tensorized/EleutherAI/pythia-12b/model.tensors` |
-| [EleutherAI/pythia-12b](https://huggingface.co/EleutherAI/pythia-12b)     | `fp16`    | `s3://tensorized/EleutherAI/pythia-12b/fp16/model.tensors` |
-| [EleutherAI/pythia-70m-deduped](https://huggingface.co/EleutherAI/pythia-70m-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-70m-deduped/model.tensors` |
-| [EleutherAI/pythia-70m-deduped](https://huggingface.co/EleutherAI/pythia-70m-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-70m-deduped/fp16/model.tensors` |
-| [EleutherAI/pythia-1.4b-deduped](https://huggingface.co/EleutherAI/pythia-1.4b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-1.4b-deduped/model.tensors` |
+| Model                                                                                   | Precision | S3 URI                                                              |
+|-----------------------------------------------------------------------------------------|-----------|---------------------------------------------------------------------|
+| [EleutherAI/gpt-neo-125M](https://huggingface.co/EleutherAI/gpt-neo-125M)               | `fp32`    | `s3://tensorized/EleutherAI/gpt-neo-125M/model.tensors`             |
+| [EleutherAI/gpt-neo-125M](https://huggingface.co/EleutherAI/gpt-neo-125M)               | `fp16`    | `s3://tensorized/EleutherAI/gpt-neo-125M/fp16/model.tensors`        |
+| [EleutherAI/gpt-neo-1.3B](https://huggingface.co/EleutherAI/gpt-neo-1.3B)               | `fp32`    | `s3://tensorized/EleutherAI/gpt-neo-1.3B/model.tensors`             |
+| [EleutherAI/gpt-neo-1.3B](https://huggingface.co/EleutherAI/gpt-neo-1.3B)               | `fp16`    | `s3://tensorized/EleutherAI/gpt-neo-1.3B/fp16/model.tensors`        |
+| [EleutherAI/gpt-neo-2.7B](https://huggingface.co/EleutherAI/gpt-neo-2.7B)               | `fp32`    | `s3://tensorized/EleutherAI/gpt-neo-2.7B/model.tensors`             |
+| [EleutherAI/gpt-neo-2.7B](https://huggingface.co/EleutherAI/gpt-neo-2.7B)               | `fp16`    | `s3://tensorized/EleutherAI/gpt-neo-2.7B/fp16/model.tensors`        |
+| [EleutherAI/gpt-j-6B](https://huggingface.co/EleutherAI/gpt-j-6B)                       | `fp32`    | `s3://tensorized/EleutherAI/gpt-j-6B/model.tensors`                 |
+| [EleutherAI/gpt-j-6B](https://huggingface.co/EleutherAI/gpt-j-6B)                       | `fp16`    | `s3://tensorized/EleutherAI/gpt-j-6B/fp16/model.tensors`            |
+| [EleutherAI/gpt-neox-20b](https://huggingface.co/EleutherAI/gpt-neox-20b)               | `fp32`    | `s3://tensorized/EleutherAI/gpt-neox-20b/model.tensors`             |
+| [EleutherAI/gpt-neox-20b](https://huggingface.co/EleutherAI/gpt-neox-20b)               | `fp16`    | `s3://tensorized/EleutherAI/gpt-neox-20b/fp16/model.tensors`        |
+| [EleutherAI/pythia-70m](https://huggingface.co/EleutherAI/pythia-70m)                   | `fp32`    | `s3://tensorized/EleutherAI/pythia-70m/model.tensors`               |
+| [EleutherAI/pythia-70m](https://huggingface.co/EleutherAI/pythia-70m)                   | `fp16`    | `s3://tensorized/EleutherAI/pythia-70m/fp16/model.tensors`          |
+| [EleutherAI/pythia-1.4b](https://huggingface.co/EleutherAI/pythia-1.4b)                 | `fp32`    | `s3://tensorized/EleutherAI/pythia-1.4b/model.tensors`              |
+| [EleutherAI/pythia-1.4b](https://huggingface.co/EleutherAI/pythia-1.4b)                 | `fp16`    | `s3://tensorized/EleutherAI/pythia-1.4b/fp16/model.tensors`         |
+| [EleutherAI/pythia-2.8b](https://huggingface.co/EleutherAI/pythia-2.8b)                 | `fp32`    | `s3://tensorized/EleutherAI/pythia-2.8b/model.tensors`              |
+| [EleutherAI/pythia-2.8b](https://huggingface.co/EleutherAI/pythia-2.8b)                 | `fp16`    | `s3://tensorized/EleutherAI/pythia-2.8b/fp16/model.tensors`         |
+| [EleutherAI/pythia-6.9b](https://huggingface.co/EleutherAI/pythia-6.9b)                 | `fp32`    | `s3://tensorized/EleutherAI/pythia-6.9b/model.tensors`              |
+| [EleutherAI/pythia-6.9b](https://huggingface.co/EleutherAI/pythia-6.9b)                 | `fp16`    | `s3://tensorized/EleutherAI/pythia-6.9b/fp16/model.tensors`         |
+| [EleutherAI/pythia-12b](https://huggingface.co/EleutherAI/pythia-12b)                   | `fp32`    | `s3://tensorized/EleutherAI/pythia-12b/model.tensors`               |
+| [EleutherAI/pythia-12b](https://huggingface.co/EleutherAI/pythia-12b)                   | `fp16`    | `s3://tensorized/EleutherAI/pythia-12b/fp16/model.tensors`          |
+| [EleutherAI/pythia-70m-deduped](https://huggingface.co/EleutherAI/pythia-70m-deduped)   | `fp32`    | `s3://tensorized/EleutherAI/pythia-70m-deduped/model.tensors`       |
+| [EleutherAI/pythia-70m-deduped](https://huggingface.co/EleutherAI/pythia-70m-deduped)   | `fp16`    | `s3://tensorized/EleutherAI/pythia-70m-deduped/fp16/model.tensors`  |
+| [EleutherAI/pythia-1.4b-deduped](https://huggingface.co/EleutherAI/pythia-1.4b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-1.4b-deduped/model.tensors`      |
 | [EleutherAI/pythia-1.4b-deduped](https://huggingface.co/EleutherAI/pythia-1.4b-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-1.4b-deduped/fp16/model.tensors` |
-| [EleutherAI/pythia-2.8b-deduped](https://huggingface.co/EleutherAI/pythia-2.8b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-2.8b-deduped/model.tensors` |
+| [EleutherAI/pythia-2.8b-deduped](https://huggingface.co/EleutherAI/pythia-2.8b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-2.8b-deduped/model.tensors`      |
 | [EleutherAI/pythia-2.8b-deduped](https://huggingface.co/EleutherAI/pythia-2.8b-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-2.8b-deduped/fp16/model.tensors` |
-| [EleutherAI/pythia-6.9b-deduped](https://huggingface.co/EleutherAI/pythia-6.9b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-6.9b-deduped/model.tensors` |
+| [EleutherAI/pythia-6.9b-deduped](https://huggingface.co/EleutherAI/pythia-6.9b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-6.9b-deduped/model.tensors`      |
 | [EleutherAI/pythia-6.9b-deduped](https://huggingface.co/EleutherAI/pythia-6.9b-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-6.9b-deduped/fp16/model.tensors` |
-| [EleutherAI/pythia-12b-deduped](https://huggingface.co/EleutherAI/pythia-12b-deduped) | `fp32`    | `s3://tensorized/EleutherAI/pythia-12b-deduped/model.tensors` |
-| [EleutherAI/pythia-12b-deduped](https://huggingface.co/EleutherAI/pythia-12b-deduped) | `fp16`    | `s3://tensorized/EleutherAI/pythia-12b-deduped/fp16/model.tensors` |
-| [KoboldAI/fairseq-dense-125M](https://huggingface.co/KoboldAI/fairseq-dense-125M) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-125M/model.tensors` |
-| [KoboldAI/fairseq-dense-125M](https://huggingface.co/KoboldAI/fairseq-dense-125M) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-125M/fp16/model.tensors` |
-| [KoboldAI/fairseq-dense-355M](https://huggingface.co/KoboldAI/fairseq-dense-355M) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-355M/model.tensors` |
-| [KoboldAI/fairseq-dense-355M](https://huggingface.co/KoboldAI/fairseq-dense-355M) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-355M/fp16/model.tensors` |
-| [KoboldAI/fairseq-dense-2.7B](https://huggingface.co/KoboldAI/fairseq-dense-2.7B) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-2.7B/model.tensors` |
-| [KoboldAI/fairseq-dense-2.7B](https://huggingface.co/KoboldAI/fairseq-dense-2.7B) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-2.7B/fp16/model.tensors` |
-| [KoboldAI/fairseq-dense-6.7B](https://huggingface.co/KoboldAI/fairseq-dense-6.7B) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-6.7B/model.tensors` |
-| [KoboldAI/fairseq-dense-6.7B](https://huggingface.co/KoboldAI/fairseq-dense-6.7B) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-6.7B/fp16/model.tensors` |
-| [KoboldAI/fairseq-dense-13B](https://huggingface.co/KoboldAI/fairseq-dense-13B) | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-13B/model.tensors` |
-| [KoboldAI/fairseq-dense-13B](https://huggingface.co/KoboldAI/fairseq-dense-13B) | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-13B/fp16/model.tensors` |
-| [Salesforce/codegen-350M-mono](https://huggingface.co/Salesforce/codegen-350M-mono) | `fp32`    | `s3://tensorized/Salesforce/codegen-350M-mono/model.tensors` |
-| [Salesforce/codegen-350M-mono](https://huggingface.co/Salesforce/codegen-350M-mono) | `fp16`    | `s3://tensorized/Salesforce/codegen-350M-mono/fp16/model.tensors` |
-| [Salesforce/codegen-350M-multi](https://huggingface.co/Salesforce/codegen-350M-multi) | `fp32`    | `s3://tensorized/Salesforce/codegen-350M-multi/model.tensors` |
-| [Salesforce/codegen-350M-multi](https://huggingface.co/Salesforce/codegen-350M-multi) | `fp16`    | `s3://tensorized/Salesforce/codegen-350M-multi/fp16/model.tensors` |
-| [Salesforce/codegen-2B-multi](https://huggingface.co/Salesforce/codegen-2B-multi) | `fp32`    | `s3://tensorized/Salesforce/codegen-2B-multi/model.tensors` |
-| [Salesforce/codegen-2B-multi](https://huggingface.co/Salesforce/codegen-2B-multi) | `fp16`    | `s3://tensorized/Salesforce/codegen-2B-multi/fp16/model.tensors` |
-| [Salesforce/codgen-6B-mono](https://huggingface.co/Salesforce/codgen-6B-mono) | `fp32`    | `s3://tensorized/Salesforce/codgen-6B-mono/model.tensors` |
-| [Salesforce/codgen-6B-mono](https://huggingface.co/Salesforce/codgen-6B-mono) | `fp16`    | `s3://tensorized/Salesforce/codgen-6B-mono/fp16/model.tensors` |
-| [Salesforce/codgen-6B-multi](https://huggingface.co/Salesforce/codgen-6B-multi) | `fp32`    | `s3://tensorized/Salesforce/codgen-6B-multi/model.tensors` |
-| [Salesforce/codgen-6B-multi](https://huggingface.co/Salesforce/codgen-6B-multi) | `fp16`    | `s3://tensorized/Salesforce/codgen-6B-multi/fp16/model.tensors` |
-| [Salesforce/codegen-16B-mono](https://huggingface.co/Salesforce/codegen-16B-mono) | `fp32`    | `s3://tensorized/Salesforce/codegen-16B-mono/model.tensors` |
-| [Salesforce/codegen-16B-mono](https://huggingface.co/Salesforce/codegen-16B-mono) | `fp16`    | `s3://tensorized/Salesforce/codegen-16B-mono/fp16/model.tensors` |
-| [Salesforce/codegen-16B-multi](https://huggingface.co/Salesforce/codegen-16B-multi) | `fp32`    | `s3://tensorized/Salesforce/codegen-16B-multi/model.tensors` |
-| [Salesforce/codegen-16B-multi](https://huggingface.co/Salesforce/codegen-16B-multi) | `fp16`    | `s3://tensorized/Salesforce/codegen-16B-multi/fp16/model.tensors` |
+| [EleutherAI/pythia-12b-deduped](https://huggingface.co/EleutherAI/pythia-12b-deduped)   | `fp32`    | `s3://tensorized/EleutherAI/pythia-12b-deduped/model.tensors`       |
+| [EleutherAI/pythia-12b-deduped](https://huggingface.co/EleutherAI/pythia-12b-deduped)   | `fp16`    | `s3://tensorized/EleutherAI/pythia-12b-deduped/fp16/model.tensors`  |
+| [KoboldAI/fairseq-dense-125M](https://huggingface.co/KoboldAI/fairseq-dense-125M)       | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-125M/model.tensors`         |
+| [KoboldAI/fairseq-dense-125M](https://huggingface.co/KoboldAI/fairseq-dense-125M)       | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-125M/fp16/model.tensors`    |
+| [KoboldAI/fairseq-dense-355M](https://huggingface.co/KoboldAI/fairseq-dense-355M)       | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-355M/model.tensors`         |
+| [KoboldAI/fairseq-dense-355M](https://huggingface.co/KoboldAI/fairseq-dense-355M)       | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-355M/fp16/model.tensors`    |
+| [KoboldAI/fairseq-dense-2.7B](https://huggingface.co/KoboldAI/fairseq-dense-2.7B)       | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-2.7B/model.tensors`         |
+| [KoboldAI/fairseq-dense-2.7B](https://huggingface.co/KoboldAI/fairseq-dense-2.7B)       | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-2.7B/fp16/model.tensors`    |
+| [KoboldAI/fairseq-dense-6.7B](https://huggingface.co/KoboldAI/fairseq-dense-6.7B)       | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-6.7B/model.tensors`         |
+| [KoboldAI/fairseq-dense-6.7B](https://huggingface.co/KoboldAI/fairseq-dense-6.7B)       | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-6.7B/fp16/model.tensors`    |
+| [KoboldAI/fairseq-dense-13B](https://huggingface.co/KoboldAI/fairseq-dense-13B)         | `fp32`    | `s3://tensorized/KoboldAI/fairseq-dense-13B/model.tensors`          |
+| [KoboldAI/fairseq-dense-13B](https://huggingface.co/KoboldAI/fairseq-dense-13B)         | `fp16`    | `s3://tensorized/KoboldAI/fairseq-dense-13B/fp16/model.tensors`     |
+| [Salesforce/codegen-350M-mono](https://huggingface.co/Salesforce/codegen-350M-mono)     | `fp32`    | `s3://tensorized/Salesforce/codegen-350M-mono/model.tensors`        |
+| [Salesforce/codegen-350M-mono](https://huggingface.co/Salesforce/codegen-350M-mono)     | `fp16`    | `s3://tensorized/Salesforce/codegen-350M-mono/fp16/model.tensors`   |
+| [Salesforce/codegen-350M-multi](https://huggingface.co/Salesforce/codegen-350M-multi)   | `fp32`    | `s3://tensorized/Salesforce/codegen-350M-multi/model.tensors`       |
+| [Salesforce/codegen-350M-multi](https://huggingface.co/Salesforce/codegen-350M-multi)   | `fp16`    | `s3://tensorized/Salesforce/codegen-350M-multi/fp16/model.tensors`  |
+| [Salesforce/codegen-2B-multi](https://huggingface.co/Salesforce/codegen-2B-multi)       | `fp32`    | `s3://tensorized/Salesforce/codegen-2B-multi/model.tensors`         |
+| [Salesforce/codegen-2B-multi](https://huggingface.co/Salesforce/codegen-2B-multi)       | `fp16`    | `s3://tensorized/Salesforce/codegen-2B-multi/fp16/model.tensors`    |
+| [Salesforce/codegen-6B-mono](https://huggingface.co/Salesforce/codegen-6B-mono)         | `fp32`    | `s3://tensorized/Salesforce/codegen-6B-mono/model.tensors`          |
+| [Salesforce/codegen-6B-mono](https://huggingface.co/Salesforce/codegen-6B-mono)         | `fp16`    | `s3://tensorized/Salesforce/codegen-6B-mono/fp16/model.tensors`     |
+| [Salesforce/codegen-6B-multi](https://huggingface.co/Salesforce/codegen-6B-multi)       | `fp32`    | `s3://tensorized/Salesforce/codegen-6B-multi/model.tensors`         |
+| [Salesforce/codegen-6B-multi](https://huggingface.co/Salesforce/codegen-6B-multi)       | `fp16`    | `s3://tensorized/Salesforce/codegen-6B-multi/fp16/model.tensors`    |
+| [Salesforce/codegen-16B-mono](https://huggingface.co/Salesforce/codegen-16B-mono)       | `fp32`    | `s3://tensorized/Salesforce/codegen-16B-mono/model.tensors`         |
+| [Salesforce/codegen-16B-mono](https://huggingface.co/Salesforce/codegen-16B-mono)       | `fp16`    | `s3://tensorized/Salesforce/codegen-16B-mono/fp16/model.tensors`    |
+| [Salesforce/codegen-16B-multi](https://huggingface.co/Salesforce/codegen-16B-multi)     | `fp32`    | `s3://tensorized/Salesforce/codegen-16B-multi/model.tensors`        |
+| [Salesforce/codegen-16B-multi](https://huggingface.co/Salesforce/codegen-16B-multi)     | `fp16`    | `s3://tensorized/Salesforce/codegen-16B-multi/fp16/model.tensors`   |
 
 ## S3 Usage Notes
 `tensorizer` uses the `boto3` library to interact with S3. The easiest way
@@ -326,7 +321,7 @@ in S3. If you update an object in S3, you will need to wait for the cache to
 expire before you can download the updated object. This takes 24 hours since
 the last download.
 
-For this reason, it is recommended to use an unique S3 key for each version
+For this reason, it is recommended to use a unique S3 key for each version
 of a model if you use the `accel-object.ord1.coreweave.com` endpoint.
 
 ## Additional Features

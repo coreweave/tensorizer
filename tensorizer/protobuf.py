@@ -1,10 +1,14 @@
+from collections import OrderedDict
+from typing import BinaryIO
+from typing import OrderedDict as OrderedDictType
+from typing import Tuple, Union
+
+import numpy as np
 import torch
 from torch import Tensor
-import numpy as np
-import tensors.tensors_pb2 as tensors_pb
-from tensors.tensors_pb2 import Tensor as TensorPb
-from typing import OrderedDict as OrderedDictType, Tuple, Union, BinaryIO
-from collections import OrderedDict
+
+import tensorizer.tensors_pb2 as tensors_pb
+from tensorizer.tensors_pb2 import Tensor as TensorPb
 
 DtypePbs = {
     torch.float32: tensors_pb.DT_FLOAT32,
@@ -84,7 +88,7 @@ def serialize_tensor(
         dtype=DtypePbs[t.dtype],
         shape=t.shape,
         data=t.cpu().detach().numpy().tobytes(),
-        **extra_opts
+        **extra_opts,
     )
 
 

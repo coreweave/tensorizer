@@ -1,6 +1,6 @@
 [project]
 name = "tensorizer"
-version = "1.0.1"
+version = "1.1.0"
 license = { text = "MIT License" }
 keywords = ["tensorizer", "machine learning", "serialization", "tensor", "pytorch"]
 authors = [
@@ -39,3 +39,28 @@ packages = ["tensorizer"]
 
 [tool.setuptools.package-data]
 tensorizer = ["tensors.proto"]
+
+[tool.black]
+line-length = 80
+target-version = ["py38", "py39", "py310", "py311"]
+preview = true
+force-exclude = '''
+(
+  ^/ATTIC
+  | ^/tensors
+  | .*_pb2.py
+)
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 80
+src_paths = ["tensorizer/", "tests/", "examples/"]
+extend_skip_glob = [
+    "ATTIC/*",
+    "*_pb2.py",
+    "tensors/*",
+    "examples/serialize.py",
+    "examples/deserialize.py"
+]
+use_parentheses = true

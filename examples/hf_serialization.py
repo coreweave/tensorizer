@@ -1,37 +1,32 @@
 import argparse
+import gc
 import json
-import os
-from collections import OrderedDict
-from typing import Optional, Union
-
-import tensorizer.utils as utils
-from tensorizer import TensorSerializer, TensorDeserializer
-import tensorizer.stream_io as stream_io
 import logging
-import time
-import torch
+import os
 import tempfile
+import time
+from typing import Optional, Type, Union
 
-os.environ[
-    "TRANSFORMERS_VERBOSITY"
-] = "error"  # disable missing keys and unexpected key warnings
-
-from transformers import (
-    AutoConfig,
-    CLIPTextModel,
-    CLIPTokenizer,
-    CLIPTextConfig,
-)
-from transformers.modeling_utils import PreTrainedModel
-
+import torch
 from diffusers import (
     AutoencoderKL,
-    UNet2DConditionModel,
-    StableDiffusionPipeline,
+    ConfigMixin,
     LMSDiscreteScheduler,
+    ModelMixin,
+    StableDiffusionPipeline,
+    UNet2DConditionModel,
 )
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.configuration_utils import ConfigMixin
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    CLIPTextConfig,
+    CLIPTextModel,
+    PretrainedConfig,
+    PreTrainedModel,
+)
+
+from tensorizer import TensorDeserializer, TensorSerializer, stream_io, utils
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -62,7 +57,7 @@ def serialize_model(
             models do not require this.
         model_directory: The directory to save the serialized model to.
         model_prefix: The prefix to use for the serialized model files. This
-            is purely optional and it allows for multiple models to be
+            is purely optional, and it allows for multiple models to be
             serialized to the same directory. A good example are Stable
             Diffusion models. Default is "model".
     """
@@ -76,9 +71,8 @@ def serialize_model(
         if hasattr(config, "to_json_file"):
             config.to_json_file(f"{dir_prefix}-config.json")
         if isinstance(config, dict):
-            open(f"{dir_prefix}-config.json", "w").write(
-                json.dumps(config, indent=2)
-            )
+            with open(f"{dir_prefix}-config.json", "w") as config_file:
+                config_file.write(json.dumps(config, indent=2))
 
     ts = TensorSerializer(f"{dir_prefix}.tensors")
     ts.write_module(model)
@@ -87,22 +81,27 @@ def serialize_model(
 
 def load_model(
     path_uri: str,
-    modelclass: Union[PreTrainedModel, ModelMixin, ConfigMixin] = None,
-    configclass: Optional[Union[ConfigMixin, AutoConfig]] = None,
-    model_prefix: str = "model",
+    model_class: Union[
+        Type[PreTrainedModel], Type[ModelMixin], Type[ConfigMixin]
+    ],
+    config_class: Optional[
+        Union[Type[PretrainedConfig], Type[ConfigMixin], Type[AutoConfig]]
+    ] = None,
+    model_prefix: Optional[str] = "model",
     device: torch.device = utils.get_device(),
-    dtype: str = None,
+    dtype: Optional[str] = None,
 ) -> torch.nn.Module:
     """
     Given a path prefix, load the model with a custom extension
 
     Args:
         path_uri: path to the model. Can be a local path or a URI
-        modelclass: The model class to load the tensors into.
-        configclass: The config class to load the model config into. This must be
+        model_class: The model class to load the tensors into.
+        config_class: The config class to load the model config into. This must be
             set if you are loading a model from HuggingFace Transformers.
         model_prefix: The prefix to use to distinguish between multiple serialized
             models. The default is "model".
+        device: The device onto which to load the model.
         dtype: The dtype to load the tensors into. If None, the dtype is inferred from
             the model.
     """
@@ -123,21 +122,21 @@ def load_model(
         tensor_stream, device=device, dtype=dtype, lazy_load=True
     )
 
-    if configclass is not None:
+    if config_class is not None:
         try:
-            with tempfile.TemporaryDirectory() as dir:
-                open(os.path.join(dir, "config.json"), "w").write(
-                    stream_io.open_stream(config_uri).read().decode("utf-8")
-                )
-                config = configclass.from_pretrained(dir)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_config_path = os.path.join(temp_dir, "config.json")
+                with open(temp_config_path, "wb") as temp_config:
+                    temp_config.write(stream_io.open_stream(config_uri).read())
+                config = config_class.from_pretrained(temp_dir)
                 config.gradient_checkpointing = True
         except ValueError:
-            config = configclass.from_pretrained(config_uri)
-        model = utils.no_init_or_tensor(
-            lambda: modelclass.from_pretrained(
-                None, config=config, state_dict=OrderedDict()
-            )
-        )
+            config = config_class.from_pretrained(config_uri)
+        with utils.no_init_or_tensor():
+            # AutoModels instantiate from a config via their from_config()
+            # method, while other classes can usually be instantiated directly.
+            config_loader = getattr(model_class, "from_config", model_class)
+            model = config_loader(config)
     else:
         try:
             config = json.loads(
@@ -146,7 +145,8 @@ def load_model(
         except ValueError:
             with open(config_uri, "r") as f:
                 config = json.load(f)
-        model = utils.no_init_or_tensor(lambda: modelclass(**config))
+        with utils.no_init_or_tensor():
+            model = model_class(**config)
 
     tensor_deserializer.load_into_module(model)
 
@@ -157,7 +157,7 @@ def load_model(
     tensors_sz = utils.convert_bytes(tensor_deserializer.total_bytes_read)
     logger.info(
         f"Model tensors loaded in {tensor_load_s:0.2f}s, read "
-        + f"{tensors_sz} @ {rate_str}/s, {utils.get_mem_usage()}"
+        f"{tensors_sz} @ {rate_str}/s, {utils.get_mem_usage()}"
     )
 
     return model
@@ -191,11 +191,15 @@ def df_main(args: argparse.Namespace) -> None:
     pipeline.scheduler.save_pretrained(output_prefix)
 
     if args.validate:
+        del pipeline
+        gc.collect()
         device = utils.get_device()
 
         logger.info("Validating serialization")
         vae = load_model(output_prefix, AutoencoderKL, None, "vae", device)
-        unet = load_model(output_prefix, UNet2DConditionModel, None, "unet")
+        unet = load_model(
+            output_prefix, UNet2DConditionModel, None, "unet", device
+        )
         encoder = load_model(
             output_prefix, CLIPTextModel, CLIPTextConfig, "encoder", device
         )
@@ -204,7 +208,7 @@ def df_main(args: argparse.Namespace) -> None:
             text_encoder=encoder,
             vae=vae,
             unet=unet,
-            tokenizer=CLIPTokenizer.from_pretrained(
+            tokenizer=AutoTokenizer.from_pretrained(
                 args.input_directory, subfolder="tokenizer"
             ),
             scheduler=LMSDiscreteScheduler.from_pretrained(
@@ -212,22 +216,18 @@ def df_main(args: argparse.Namespace) -> None:
             ),
             safety_checker=None,
             feature_extractor=None,
+            requires_safety_checker=False,
         ).to(device)
 
         prompt = "a photo of an astronaut riding a horse on mars"
-        with torch.autocast(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        ):  # for some reason device_type needs to be a string
-            # instead of an actual device
-            pipeline(prompt).images[0].save('test.png')
+        with torch.autocast(device.type):
+            pipeline(prompt).images[0].save("test.png")
 
 
 def hf_main(args):
     output_prefix = args.output_prefix
     print("MODEL PATH:", args.input_directory)
     print("OUTPUT PREFIX:", output_prefix)
-
-    from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
     model_config = AutoConfig.from_pretrained(args.input_directory)
     model = AutoModelForCausalLM.from_pretrained(
@@ -243,11 +243,12 @@ def hf_main(args):
 
     serialize_model(model, model_config, output_prefix)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.input_directory
-    ).save_pretrained(output_prefix)
+    tokenizer = AutoTokenizer.from_pretrained(args.input_directory)
+    tokenizer.save_pretrained(output_prefix)
 
     if args.validate:
+        del model, model_config
+        gc.collect()
         device = utils.get_device()
         logger.info("Validating serialization")
         model = load_model(
@@ -259,16 +260,17 @@ def hf_main(args):
             "float16",
         ).eval()
         # test generation
-        tokenizer = AutoTokenizer.from_pretrained(args.input_directory)
+        eos = tokenizer.eos_token_id
         input_ids = tokenizer.encode(
             "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
         ).to(device)
         with torch.no_grad():
             output = model.generate(
-                input_ids, max_new_tokens=50, do_sample=True
+                input_ids, max_new_tokens=50, do_sample=True, pad_token_id=eos
             )
         logger.info(
-            f"Test Output: {tokenizer.decode(output[0], skip_special_tokens=True)}"
+            "Test Output:"
+            f" {tokenizer.decode(output[0], skip_special_tokens=True)}"
         )
 
 
@@ -276,7 +278,10 @@ def main():
     # usage: hf_serialization.py [-h] --model_type {transformers,diffusers} [--validate] input_directory output_prefix
 
     parser = argparse.ArgumentParser(
-        description="An example script that uses Tensorizer to serialize an HF model to an output directory."
+        description=(
+            "An example script that uses Tensorizer to serialize"
+            "a HuggingFace model to an output directory."
+        )
     )
     parser.add_argument(
         "input_directory",
