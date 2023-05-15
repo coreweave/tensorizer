@@ -125,7 +125,7 @@ class CURLStreamFile:
         self._error_context = []
 
         if curl_path is None:
-            RuntimeError(
+            raise RuntimeError(
                 "cURL is a required dependency for streaming downloads"
                 " and could not be found."
             )
