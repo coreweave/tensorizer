@@ -351,6 +351,18 @@ The `state_dict` can also be used to initialize a HuggingFace Transformers
 AutoModel. But HuggingFace Transformers performs three or more copies of
 the data, so memory use will explode.
 
+### bfloat16 Support
+
+Tensorizer supports models using the `bfloat16` data type. However, tensorizer
+uses numpy to save the tensors as binary and numpy doesn't support `bfloat16`.
+This means that special conversions need to be applied which decreases the
+performance of both serialization and deserialization.
+
+To be saved, the torch tensor is cast to fp32, adding an additional 16 bits.
+This value is converted to numpy, then bit shifted and cast down to a
+`np.uint16` to save the original 16 bits from torch's `bfloat16`. The reverse
+happens during the deserialization process.
+
 ## Running Tests
 `tensorizer` uses `unittest` for testing.
 The tests have their own set of dependencies, which can be installed with

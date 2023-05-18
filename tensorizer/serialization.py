@@ -78,38 +78,43 @@ class TensorHash(typing.TypedDict):
     hash: bytes
 
 
-def _convert_dtype_to_numpy(dtype: Union[numpy.dtype, str, torch.dtype]):
-    if isinstance(dtype, numpy.dtype):
+def _convert_dtype_to_torch(dtype: Union[numpy.dtype, str, torch.dtype]) -> torch.dtype:
+    """
+    Handle different kinds of data type inputs by converting it to a torch.dtype.
+    """
+
+    if isinstance(dtype, torch.dtype):
         return dtype
-    elif isinstance(dtype, str):
-        return numpy.dtype(dtype)
-    elif isinstance(dtype, torch.dtype):
+
+    if isinstance(dtype, str):
+        dtype = numpy.dtype(dtype)
+
+    if isinstance(dtype, numpy.dtype):
         # Converted from PyTorch's own mapping used in their testing:
         # https://github.com/pytorch/pytorch/blob/v2.0.0/torch/testing/_internal/common_utils.py#L1009
-        numpy_dtype = {
-            torch.bool: numpy.bool_,
-            torch.uint8: numpy.uint8,
-            torch.int8: numpy.int8,
-            torch.int16: numpy.int16,
-            torch.int32: numpy.int32,
-            torch.int64: numpy.int64,
-            torch.float16: numpy.float16,
-            torch.float32: numpy.float32,
-            torch.float64: numpy.float64,
-            torch.complex64: numpy.complex64,
-            torch.complex128: numpy.complex128,
+        torch_dtype = {
+            numpy.bool_: torch.bool,
+            numpy.uint8: torch.uint8,
+            numpy.int8: torch.int8,
+            numpy.int16: torch.int16,
+            numpy.int32: torch.int32,
+            numpy.int64: torch.int64,
+            numpy.float16: torch.float16,
+            numpy.float32: torch.float32,
+            numpy.float64: torch.float64,
+            numpy.complex64: torch.complex64,
+            numpy.complex128: torch.complex128,
         }.get(dtype)
 
-        if numpy_dtype is None:
+        if torch_dtype is None:
             raise TypeError(
-                "The provided torch.dtype class could not be converted to a"
-                " numpy.dtype"
+                f"The numpy.dtype class ({dtype.str}) could not be converted to a"
+                " torch.dtype"
             )
-        else:
-            # Convert it from a dtype class to a dtype object instance
-            return numpy.dtype(numpy_dtype)
+
+        return torch_dtype
     else:
-        raise TypeError("Could not interpret provided dtype as a numpy.dtype")
+        raise TypeError("Could not interpret provided dtype as a torch.dtype")
 
 
 class TensorDeserializer(collections.abc.Mapping):
@@ -190,7 +195,7 @@ class TensorDeserializer(collections.abc.Mapping):
         ],
         device: Union[torch.device, str, None] = None,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-        dtype: Union[numpy.dtype, str, None] = None,
+        dtype: Union[torch.dtype, numpy.dtype, str, None] = None,
         *,
         lazy_load: bool = False,
         plaid_mode: bool = False,
@@ -212,7 +217,7 @@ class TensorDeserializer(collections.abc.Mapping):
         if dtype is None:
             self._dtype = None
         else:
-            self._dtype = _convert_dtype_to_numpy(dtype)
+            self._dtype = _convert_dtype_to_torch(dtype)
 
         self._metadata: Dict[str, TensorEntry] = {}
 
@@ -559,7 +564,7 @@ class TensorDeserializer(collections.abc.Mapping):
         self,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         num_tensors: int = -1,
-    ) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
+    ) -> Iterator[Tuple[int, int, str, torch.Tensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
         `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
@@ -609,7 +614,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 # Read the dtype of the tensor.
                 dtype_len = struct.unpack("<B", headers[idx : idx + 1])[0]
                 dtype_end = idx + dtype_len + 1
-                dtype = headers[idx + 1 : dtype_end]
+                dtype = headers[idx + 1: dtype_end].decode("utf-8")
 
                 # Read the shape amount, according to the serialized format.
                 # The shape length is 1 byte after the dtype end.
@@ -685,44 +690,76 @@ class TensorDeserializer(collections.abc.Mapping):
                     mv = memoryview(buffer)
                     self._file.readinto(mv)
 
-                # Convert the memoryview to a numpy array. We use the
-                # memmap class to avoid copying the data.
-                arr = numpy.ndarray.__new__(
-                    numpy.memmap,
-                    shape_list,
-                    dtype=dtype,
-                    buffer=mv,
-                    offset=0,
-                )
+                # Loading bfloat16 tensors requires extra conversions
+                if dtype == str(torch.bfloat16):
+                    arr = numpy.ndarray.__new__(
+                        numpy.memmap,
+                        shape_list,
+                        dtype=numpy.uint16,
+                        buffer=mv,
+                        offset=0,
+                    )
+
+                    # numpy 0-dimensional arrays cannot be cast up in size, so give it a dimension
+                    if arr.shape == ():
+                        arr = arr[numpy.newaxis]
+
+                    arr = (
+                        numpy.left_shift(
+                            arr.astype(numpy.uint32),  # Convert to 32 bit datatype so it has space to be left shifted
+                            16                         # Add the 16 extra precision bits so it can go back to fp32
+                        ).view(numpy.float32)          # Take it back to fp32 before going back to torch tensor
+                    )
+
+                    tensor = torch.from_numpy(arr).to(torch.bfloat16)
+
+                    if arr.shape != shape_list:
+                        torch.reshape(tensor, shape_list)
+
+                else:
+                    # Convert the memoryview to a numpy array. We use the
+                    # memmap class to avoid copying the data.
+                    arr = numpy.ndarray.__new__(
+                        numpy.memmap,
+                        shape_list,
+                        dtype=dtype,
+                        buffer=mv,
+                        offset=0,
+                    )
+
+                    tensor = torch.from_numpy(arr)
+
                 tensors_read += 1
-                yield module_idx, tensor_type, name, arr
+                yield module_idx, tensor_type, name, tensor
         except EOFError:
             return
 
     def _to_torch_parameter(
-        self, arr: Union[numpy.ndarray, torch.nn.Parameter]
+        self, tensor: Union[torch.Tensor, torch.nn.Parameter]
     ) -> torch.nn.Parameter:
         """
-        Convert a numpy array to a torch.nn.Parameter on a device, forcing
+        Convert a tensor to a torch.nn.Parameter on a device, forcing
         gradient when appropriate. We also handle torch.nn.Parameter objects in
         a passthrough manner.
         """
-        if isinstance(arr, torch.nn.Parameter):
-            arr.data = arr.data.to(self._device)
-            if arr.grad is not None:
-                arr.grad = arr.grad.to(self._device)
-            return arr
+        if isinstance(tensor, torch.nn.Parameter):
+            tensor.data = tensor.data.to(self._device)
+            if tensor.grad is not None:
+                tensor.grad = tensor.grad.to(self._device)
+            return tensor
 
+        # Cast the tensor if a global dtype was given to the TensorDeserializer
         if (
             self._dtype is not None
-            and arr.dtype != "bool"
-            and arr.dtype != self._dtype
+            and tensor.dtype != torch.bool
+            and torch.dtype != self._dtype
         ):
-            arr = arr.astype(self._dtype)
-        gradient = arr.dtype.kind in ("f", "c")
+            tensor = tensor.to(self._dtype)
+
+        gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
         return torch.nn.Parameter(
-            torch.from_numpy(arr).to(self._device), requires_grad=gradient
+            tensor.to(self._device), requires_grad=gradient
         )
 
     def _generate_state_dict(self) -> OrderedDict:
@@ -968,6 +1005,30 @@ class TensorSerializer:
         # field.
         self._file.seek(curr)
 
+    @staticmethod
+    def _convert_tensor_to_numpy(tensor: torch.Tensor) -> (numpy.ndarray, str):
+        tensor = tensor.cpu().detach()
+
+        # Only bfloat16 needs special conversion logic since it isn't supported by numpy
+        if tensor.dtype != torch.bfloat16:
+            np_arr = tensor.numpy()
+            return np_arr, np_arr.dtype.str
+
+        # Convert to fp32 since numpy supports it
+        # This conversion adds 16 new precision bits that'll all be 0s
+        np_fp32 = tensor.to(torch.float32).numpy()
+
+        # Convert the fp32 values to the original 16 bits to be saved
+        np_uint16 = (
+            numpy.right_shift(
+                np_fp32.view(numpy.uint32),  # numpy needs to think it's an int to do the right shift
+                16  # Gets rid of the 0 bits representing the extra precision in fp32
+            )
+            .astype(numpy.uint16)  # Convert to a 16 bit datatype so only 16 bits will be saved
+        )
+
+        return np_uint16, str(torch.bfloat16)
+
     def write_tensor(
         self,
         idx,
@@ -1010,10 +1071,12 @@ class TensorSerializer:
         """
 
         if isinstance(tensor, torch.Tensor):
-            tensor = tensor.cpu().detach().numpy()
+            tensor, dtype_name = self._convert_tensor_to_numpy(tensor)
+        else:
+            dtype_name = tensor.dtype.str
 
-        if len(str(tensor.dtype)) >= 256:
-            raise ValueError("dtype length should be less than 256")
+        if len(dtype_name) >= 256:
+            raise ValueError("dtype name length should be less than 256")
 
         # Reserve room for our tensor header size.
         ds_header_begin = self._file.tell()
@@ -1031,7 +1094,7 @@ class TensorSerializer:
         self._file.write(name_bytes)
 
         # Write out our tensor dtype
-        dtype_bytes = bytes(tensor.dtype.str, "utf-8")
+        dtype_bytes = bytes(dtype_name, "utf-8")
         dtype_len = len(dtype_bytes)
         self._file.write(struct.pack("<B", dtype_len))
         self._file.write(dtype_bytes)
