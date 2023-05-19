@@ -229,11 +229,12 @@ def hf_main(args):
     print("MODEL PATH:", args.input_directory)
     print("OUTPUT PREFIX:", output_prefix)
 
+    dtype = torch.float16
     model_config = AutoConfig.from_pretrained(args.input_directory)
     model = AutoModelForCausalLM.from_pretrained(
         args.input_directory,
         config=model_config,
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
         low_cpu_mem_usage=True,
     )
 
@@ -257,7 +258,7 @@ def hf_main(args):
             AutoConfig,
             None,
             device,
-            "float16",
+            dtype,
         ).eval()
         # test generation
         eos = tokenizer.eos_token_id

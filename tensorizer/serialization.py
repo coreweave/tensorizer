@@ -78,43 +78,6 @@ class TensorHash(typing.TypedDict):
     hash: bytes
 
 
-def _convert_dtype_to_torch(dtype: Union[numpy.dtype, str, torch.dtype]) -> torch.dtype:
-    """
-    Handle different kinds of data type inputs by converting it to a torch.dtype.
-    """
-
-    if isinstance(dtype, torch.dtype):
-        return dtype
-
-    if isinstance(dtype, str):
-        dtype = numpy.dtype(dtype)
-
-    if isinstance(dtype, numpy.dtype):
-        torch_dtype = {
-            "|b1": torch.bool,
-            "|u1": torch.uint8,
-            "|i1": torch.int8,
-            "<i2": torch.int16,
-            "<i4": torch.int32,
-            "<i8": torch.int64,
-            "<f2": torch.float16,
-            "<f4": torch.float32,
-            "<f8": torch.float64,
-            "<c8": torch.complex64,
-            "<c16": torch.complex128,
-        }.get(dtype.str)
-
-        if torch_dtype is None:
-            raise TypeError(
-                f"The numpy.dtype class ({dtype.str}) could not be converted to a"
-                " torch.dtype"
-            )
-
-        return torch_dtype
-    else:
-        raise TypeError("Could not interpret provided dtype as a torch.dtype")
-
-
 class TensorDeserializer(collections.abc.Mapping):
     """
     Given a file-like object for read, deserialize tensors to a state_dict or
@@ -193,7 +156,7 @@ class TensorDeserializer(collections.abc.Mapping):
         ],
         device: Union[torch.device, str, None] = None,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-        dtype: Union[torch.dtype, numpy.dtype, str, None] = None,
+        dtype: torch.dtype = None,
         *,
         lazy_load: bool = False,
         plaid_mode: bool = False,
@@ -211,11 +174,7 @@ class TensorDeserializer(collections.abc.Mapping):
         device = utils.get_device() if device is None else torch.device(device)
         self._device = device
 
-        # If dtype is not None, convert all tensors to this dtype if possible.
-        if dtype is None:
-            self._dtype = None
-        else:
-            self._dtype = _convert_dtype_to_torch(dtype)
+        self._dtype = dtype
 
         self._metadata: Dict[str, TensorEntry] = {}
 
