@@ -90,21 +90,19 @@ def _convert_dtype_to_torch(dtype: Union[numpy.dtype, str, torch.dtype]) -> torc
         dtype = numpy.dtype(dtype)
 
     if isinstance(dtype, numpy.dtype):
-        # Converted from PyTorch's own mapping used in their testing:
-        # https://github.com/pytorch/pytorch/blob/v2.0.0/torch/testing/_internal/common_utils.py#L1009
         torch_dtype = {
-            numpy.bool_: torch.bool,
-            numpy.uint8: torch.uint8,
-            numpy.int8: torch.int8,
-            numpy.int16: torch.int16,
-            numpy.int32: torch.int32,
-            numpy.int64: torch.int64,
-            numpy.float16: torch.float16,
-            numpy.float32: torch.float32,
-            numpy.float64: torch.float64,
-            numpy.complex64: torch.complex64,
-            numpy.complex128: torch.complex128,
-        }.get(dtype)
+            "|b1": torch.bool,
+            "|u1": torch.uint8,
+            "|i1": torch.int8,
+            "<i2": torch.int16,
+            "<i4": torch.int32,
+            "<i8": torch.int64,
+            "<f2": torch.float16,
+            "<f4": torch.float32,
+            "<f8": torch.float64,
+            "<c8": torch.complex64,
+            "<c16": torch.complex128,
+        }.get(dtype.str)
 
         if torch_dtype is None:
             raise TypeError(
