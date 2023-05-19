@@ -54,7 +54,7 @@ class TensorType(Enum):
     STATE_DICT = 2
 
 
-TENSORIZER_VERSION = 1
+TENSORIZER_VERSION = 2
 TENSORIZER_MAGIC = b"|TZR|"
 
 
