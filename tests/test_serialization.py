@@ -131,8 +131,15 @@ class TestSerialization(unittest.TestCase):
 
         try:
             with open(tensorized_file.name, "rb") as in_file:
-                deserializer = TensorDeserializer(in_file, device="cpu", lazy_load=True)
-                deserialized_tensor = [t for t in deserializer.read_tensors(num_tensors=1)][0][-1]
+                deserializer = TensorDeserializer(
+                    in_file,
+                    device="cpu",
+                    lazy_load=True
+                )
+                deserialized_tensor = [
+                    t for t in
+                    deserializer.read_tensors(num_tensors=1)
+                ][0][-1]
                 deserializer.close()
         finally:
             os.unlink(tensorized_file.name)

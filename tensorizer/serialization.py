@@ -30,6 +30,7 @@ import torch
 
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
+from tensorizer._NumpyTensor import _NumpyTensor
 
 if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
@@ -56,6 +57,8 @@ class TensorType(Enum):
 
 TENSORIZER_VERSION = 2
 TENSORIZER_MAGIC = b"|TZR|"
+
+OPAQUE_DTYPE_SEP = "\0"
 
 
 class TensorEntry(typing.TypedDict):
@@ -573,6 +576,17 @@ class TensorDeserializer(collections.abc.Mapping):
                 dtype_end = idx + dtype_len + 1
                 dtype = headers[idx + 1: dtype_end].decode("utf-8")
 
+                numpy_dtype, *torch_dtype = dtype.split(OPAQUE_DTYPE_SEP)
+                if len(torch_dtype) == 0:
+                    torch_dtype = None
+                elif len(torch_dtype) == 1:
+                    torch_dtype = torch_dtype[0]
+                else:
+                    raise ValueError("Can't deserialize a tensor with "
+                                     "multiple opaque dtype separators "
+                                     f"({OPAQUE_DTYPE_SEP}) in its dtype: "
+                                     f"{dtype}")
+
                 # Read the shape amount, according to the serialized format.
                 # The shape length is 1 byte after the dtype end.
                 shape_len = struct.unpack(
@@ -647,44 +661,12 @@ class TensorDeserializer(collections.abc.Mapping):
                     mv = memoryview(buffer)
                     self._file.readinto(mv)
 
-                # Loading bfloat16 tensors requires extra conversions
-                if dtype == str(torch.bfloat16):
-                    arr = numpy.ndarray.__new__(
-                        numpy.memmap,
-                        shape_list,
-                        dtype=numpy.uint16,
-                        buffer=mv,
-                        offset=0,
-                    )
-
-                    # numpy 0-dimensional arrays cannot be cast up in size, so give it a dimension
-                    if arr.shape == ():
-                        arr = arr[numpy.newaxis]
-
-                    arr = (
-                        numpy.left_shift(
-                            arr.astype(numpy.uint32),  # Convert to 32 bit datatype so it has space to be left shifted
-                            16                         # Add the 16 extra precision bits so it can go back to fp32
-                        ).view(numpy.float32)          # Take it back to fp32 before going back to torch tensor
-                    )
-
-                    tensor = torch.from_numpy(arr).to(torch.bfloat16)
-
-                    if arr.shape != shape_list:
-                        torch.reshape(tensor, shape_list)
-
-                else:
-                    # Convert the memoryview to a numpy array. We use the
-                    # memmap class to avoid copying the data.
-                    arr = numpy.ndarray.__new__(
-                        numpy.memmap,
-                        shape_list,
-                        dtype=dtype,
-                        buffer=mv,
-                        offset=0,
-                    )
-
-                    tensor = torch.from_numpy(arr)
+                tensor = _NumpyTensor.from_buffer(
+                    numpy_dtype,
+                    torch_dtype,
+                    shape_list,
+                    mv
+                ).to_tensor()
 
                 tensors_read += 1
                 yield module_idx, tensor_type, name, tensor
@@ -962,30 +944,6 @@ class TensorSerializer:
         # field.
         self._file.seek(curr)
 
-    @staticmethod
-    def _convert_tensor_to_numpy(tensor: torch.Tensor) -> (numpy.ndarray, str):
-        tensor = tensor.cpu().detach()
-
-        # Only bfloat16 needs special conversion logic since it isn't supported by numpy
-        if tensor.dtype != torch.bfloat16:
-            np_arr = tensor.numpy()
-            return np_arr, np_arr.dtype.str
-
-        # Convert to fp32 since numpy supports it
-        # This conversion adds 16 new precision bits that'll all be 0s
-        np_fp32 = tensor.to(torch.float32).numpy()
-
-        # Convert the fp32 values to the original 16 bits to be saved
-        np_uint16 = (
-            numpy.right_shift(
-                np_fp32.view(numpy.uint32),  # numpy needs to think it's an int to do the right shift
-                16  # Gets rid of the 0 bits representing the extra precision in fp32
-            )
-            .astype(numpy.uint16)  # Convert to a 16 bit datatype so only 16 bits will be saved
-        )
-
-        return np_uint16, str(torch.bfloat16)
-
     def write_tensor(
         self,
         idx,
@@ -1028,9 +986,15 @@ class TensorSerializer:
         """
 
         if isinstance(tensor, torch.Tensor):
-            tensor, dtype_name = self._convert_tensor_to_numpy(tensor)
+            numpy_tensor = _NumpyTensor.from_tensor(tensor)
         else:
-            dtype_name = tensor.dtype.str
+            numpy_tensor = _NumpyTensor.from_array(tensor)
+
+        dtype_name = numpy_tensor.numpy_dtype
+        if numpy_tensor.is_opaque:
+            # The datatype name needs to contain both the numpy dtype that the
+            # data is serialized as and the original torch dtype.
+            dtype_name += OPAQUE_DTYPE_SEP + numpy_tensor.torch_dtype
 
         if len(dtype_name) >= 256:
             raise ValueError("dtype name length should be less than 256")
@@ -1057,7 +1021,7 @@ class TensorSerializer:
         self._file.write(dtype_bytes)
 
         # ... and shape
-        shape_bytes = self._dump_shape(tensor.shape)
+        shape_bytes = self._dump_shape(numpy_tensor.data.shape)
         self._file.write(shape_bytes)
 
         # Reserve room for our tensor hashes.
@@ -1104,7 +1068,7 @@ class TensorSerializer:
             #       may want to do model compression.
             # Create a write buffer to compress our tensor serialization.
             tensor_buffer = tempfile.TemporaryFile()
-            tensor.tofile(tensor_buffer)
+            numpy_tensor.data.tofile(tensor_buffer)
             tensor_raw_sz = tensor_buffer.tell()
             self.total_tensor_bytes += tensor_raw_sz
             tensor_buffer.seek(0)
@@ -1117,7 +1081,7 @@ class TensorSerializer:
                 self.total_compressed_tensor_bytes += tensor_raw_sz
 
         # Serialize our tensors
-        tensor.tofile(self._file)
+        numpy_tensor.data.tofile(self._file)
         tensor_endpos = self._file.tell()
 
         # Go back and write our tensor length out
