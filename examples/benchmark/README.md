@@ -1,6 +1,6 @@
 # Tensorizer Benchmarking
 
-The files in this folder container everything needed to benchmark both the
+The files in this directory contain everything needed to benchmark both the
 serialization and deserialization process.
 
 The benchmarks will be run using tensorizer,
