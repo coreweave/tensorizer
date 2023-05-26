@@ -4,5 +4,4 @@ RUN pip install transformers tensorizer==1.1.0 accelerate safetensors==0.3.1
 
 RUN mkdir /app
 ADD deserialize_benchmark.py /app/deserialize_benchmark.py
-ADD test_s3cfg /root/.s3cfg
 ADD save_models.py /app/save_models.py
