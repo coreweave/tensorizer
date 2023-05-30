@@ -22,10 +22,6 @@ model_name = "EleutherAI/gpt-neo-125M"
 num_hellos = 400
 is_cuda_available = torch.cuda.is_available()
 default_device = "cuda" if is_cuda_available else "cpu"
-s3_credentials = stream_io._ParsedCredentials(s3_endpoint="accel-object.ord1.coreweave.com",
-                                              config_file="",
-                                              s3_access_key="",
-                                              s3_secret_key="")
 
 
 def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
@@ -243,9 +239,8 @@ class TestDeserialization(unittest.TestCase):
         check_inference(deserialized, model_name, default_device)
         deserialized.close()
 
-    @patch("tensorizer.stream_io._infer_credentials")
-    def test_s3_fp16(self, credentials_mock):
-        credentials_mock.return_value = s3_credentials
+    @patch.object(stream_io, "_s3_default_config_paths", {})
+    def test_s3_fp16(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/fp16/model.tensors",
             device=default_device,
@@ -256,9 +251,8 @@ class TestDeserialization(unittest.TestCase):
             check_inference(deserialized, model_name, default_device)
         deserialized.close()
 
-    @patch("tensorizer.stream_io._infer_credentials")
-    def test_s3_lazy_load(self, credentials_mock):
-        credentials_mock.return_value = s3_credentials
+    @patch.object(stream_io, "_s3_default_config_paths", {})
+    def test_s3_lazy_load(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/model.tensors",
             device=default_device,
