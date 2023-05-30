@@ -125,11 +125,12 @@ class TestSerialization(unittest.TestCase):
         tensorized_file = tempfile.NamedTemporaryFile("wb+", delete=False)
         shape = (50, 50)
         tensor = torch.normal(0, 0.5, shape, dtype=torch.bfloat16)
-        serializer = TensorSerializer(tensorized_file)
-        serializer.write_tensor(0, "test_tensor", TensorType.PARAM, tensor)
-        serializer.close()
 
         try:
+            serializer = TensorSerializer(tensorized_file)
+            serializer.write_tensor(0, "test_tensor", TensorType.PARAM, tensor)
+            serializer.close()
+
             with open(tensorized_file.name, "rb") as in_file:
                 deserializer = TensorDeserializer(
                     in_file,
@@ -233,10 +234,8 @@ class TestDeserialization(unittest.TestCase):
 
         deserialized.close()
 
-    @patch("tensorizer.stream_io._infer_credentials")
-    def test_s3(self, credentials_mock):
-        credentials_mock.return_value = s3_credentials
-
+    @patch.object(stream_io, "_s3_default_config_paths", {})
+    def test_s3(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/model.tensors", device=default_device
         )

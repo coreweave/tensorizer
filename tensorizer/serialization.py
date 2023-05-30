@@ -55,7 +55,12 @@ class TensorType(Enum):
     STATE_DICT = 2
 
 
+# If tensors with "opaque" dtypes (those that are not supported by numpy) are
+# saved, then a tensorizer data version of 2 is required to (de)serialize the
+# file. Otherwise, the file is compatible with tensorizer data version 1
 TENSORIZER_VERSION = 2
+NON_OPAQUE_TENSORIZER_VERSION = 1
+
 TENSORIZER_MAGIC = b"|TZR|"
 
 OPAQUE_DTYPE_SEP = "\0"
@@ -97,8 +102,8 @@ class TensorDeserializer(collections.abc.Mapping):
         filter_func: A function (tensor_name: str) -> bool that returns True
             if a tensor should be loaded, or False if it should be skipped.
             If None, all tensors are loaded.
-        dtype: The dtype to load the tensors as. If None, the dtype will be
-            inferred from the file.
+        dtype: The dtype to cast the tensors as when loading them into a torch
+            module. If None, the dtype will be inferred from the file.
         lazy_load: If True, tensors will be loaded and cached when keys are
             accessed. If False, all tensors will be loaded into memory up
             front.
@@ -159,7 +164,7 @@ class TensorDeserializer(collections.abc.Mapping):
         ],
         device: Union[torch.device, str, None] = None,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-        dtype: torch.dtype = None,
+        dtype: Optional[torch.dtype] = None,
         *,
         lazy_load: bool = False,
         plaid_mode: bool = False,
@@ -524,7 +529,8 @@ class TensorDeserializer(collections.abc.Mapping):
         self,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         num_tensors: int = -1,
-    ) -> Iterator[Tuple[int, int, str, torch.Tensor]]:
+        as_numpy: bool = False,
+    ) -> Iterator[Tuple[int, int, str, Union[torch.Tensor, numpy.ndarray]]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
         `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
@@ -547,6 +553,12 @@ class TensorDeserializer(collections.abc.Mapping):
                 will be read. If the zero-byte header is encountered before
                 `num_tensors` tensors are read, the generator will stop
                 yielding values.
+            as_numpy: If true, `read_tensors` will return a numpy ndarray,
+                otherwise it will return a torch Tensor. Defaults to False.
+                Note that if torch tensors with dtypes unsupported by numpy are
+                being loaded, then returning them as numpy arrays will result
+                in a numpy ndarray with the original data, but an int dtype of
+                the respective size.
         """
 
         try:
@@ -584,7 +596,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 else:
                     raise ValueError("Can't deserialize a tensor with "
                                      "multiple opaque dtype separators "
-                                     f"({OPAQUE_DTYPE_SEP}) in its dtype: "
+                                     f"({OPAQUE_DTYPE_SEP!r}) in its dtype: "
                                      f"{dtype}")
 
                 # Read the shape amount, according to the serialized format.
@@ -666,9 +678,15 @@ class TensorDeserializer(collections.abc.Mapping):
                     torch_dtype,
                     shape_list,
                     mv
-                ).to_tensor()
+                )
 
                 tensors_read += 1
+
+                if as_numpy:
+                    tensor = tensor.data
+                else:
+                    tensor = tensor.to_tensor()
+
                 yield module_idx, tensor_type, name, tensor
         except EOFError:
             return
@@ -844,7 +862,9 @@ class TensorSerializer:
         self._file.write(TENSORIZER_MAGIC)
 
         # Write the version number.
-        self._file.write(struct.pack("<I", TENSORIZER_VERSION))
+        self._version_loc = self._file.tell()
+        self._version = NON_OPAQUE_TENSORIZER_VERSION
+        self._file.write(struct.pack("<I", self._version))
 
         # Reserve 32 bytes for the hash. (Unused for now)
         self._hash_loc = self._file.tell()
@@ -920,16 +940,25 @@ class TensorSerializer:
             logger.info(f"Comp'd bytes: {self.total_compressed_tensor_bytes}")
             logger.info(f"Ratio: {compression_ratio:.2f}")
 
-    def _sync_prologue_state(self):
+    def _sync_prologue_state(self, update_version: bool = False):
         """
         This is called after the tensor has been written to the file, and
         ensures that the file is in a consistent state.
+
+        Args:
+            update_version: If true, the file's version will be updated to
+                `self._version`.
         """
         curr = self._file.tell()
 
         # Write our zero-length field, that indicates that this is the last
         # tensor. This will be overwritten if another tensor is written.
         self._file.write(struct.pack("<Q", 0))
+
+        if update_version:
+            self._file.seek(self._version_loc)
+            self._file.write(struct.pack("<I", self._version))
+
         # Write the total number of tensors.
         self._file.seek(self._tensor_ct_loc)
         self._file.write(struct.pack("<Q", self._tensors))
@@ -991,10 +1020,15 @@ class TensorSerializer:
             numpy_tensor = _NumpyTensor.from_array(tensor)
 
         dtype_name = numpy_tensor.numpy_dtype
+        update_version = False
         if numpy_tensor.is_opaque:
             # The datatype name needs to contain both the numpy dtype that the
             # data is serialized as and the original torch dtype.
             dtype_name += OPAQUE_DTYPE_SEP + numpy_tensor.torch_dtype
+
+            if self._version != TENSORIZER_VERSION:
+                self._version = TENSORIZER_VERSION
+                update_version = True
 
         if len(dtype_name) >= 256:
             raise ValueError("dtype name length should be less than 256")
@@ -1133,7 +1167,7 @@ class TensorSerializer:
         self._tensors += 1
 
         # Update our prolog and epilog.
-        self._sync_prologue_state()
+        self._sync_prologue_state(update_version=update_version)
 
         ds_size = self._file.tell() - ds_header_begin
         ds_bytes = f"{ds_size:,} bytes"

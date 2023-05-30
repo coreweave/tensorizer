@@ -166,14 +166,14 @@ class _NumpyTensor(NamedTuple):
         """
         if not self.is_opaque:
             return torch.from_numpy(self.data)
-        else:
-            if not self.torch_dtype:
-                raise ValueError(
-                    "Tried to decode a tensor stored as opaque data, but no"
-                    " torch dtype was specified"
-                )
-            tensor_view = torch.from_numpy(self.data)
-            return tensor_view.view(self._decode_torch_dtype())
+
+        if not self.torch_dtype:
+            raise ValueError(
+                "Tried to decode a tensor stored as opaque data, but no"
+                " torch dtype was specified"
+            )
+        tensor_view = torch.from_numpy(self.data)
+        return tensor_view.view(self._decode_torch_dtype())
 
     @property
     def is_opaque(self):
@@ -257,8 +257,8 @@ class _NumpyTensor(NamedTuple):
         """
         if cls._is_opaque(numpy_dtype):
             return numpy_dtype.replace("V", "i")
-        else:
-            return numpy_dtype
+
+        return numpy_dtype
 
     def _decode_torch_dtype(self) -> torch.dtype:
         """
@@ -277,21 +277,21 @@ class _NumpyTensor(NamedTuple):
         dtype = _DECODE_MAPPING.get(self.torch_dtype)
         if dtype is not None:
             return dtype
-        else:
-            # Long route using getattr(), any other type
-            if not self.torch_dtype:
-                raise ValueError("Cannot decode an empty dtype.")
-            if not isinstance(self.torch_dtype, str):
-                raise TypeError("torch_dtype must be a string.")
-            module, *dtype_name = self.torch_dtype.split(".", 1)
 
-            # Ensure that it's actually "torch.something"
-            if module != "torch" or len(dtype_name) != 1:
-                raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}")
+        # Long route using getattr(), any other type
+        if not self.torch_dtype:
+            raise ValueError("Cannot decode an empty dtype.")
+        if not isinstance(self.torch_dtype, str):
+            raise TypeError("torch_dtype must be a string.")
+        module, *dtype_name = self.torch_dtype.split(".", 1)
 
-            dtype = getattr(torch, dtype_name[0])
-            # Ensure that it's a real dtype
-            if dtype is None or not isinstance(dtype, torch.dtype):
-                raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}")
+        # Ensure that it's actually "torch.something"
+        if module != "torch" or len(dtype_name) != 1:
+            raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}")
 
-            return dtype
+        dtype = getattr(torch, dtype_name[0])
+        # Ensure that it's a real dtype
+        if dtype is None or not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}")
+
+        return dtype
