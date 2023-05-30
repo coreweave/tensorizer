@@ -11,7 +11,7 @@ from safetensors.torch import save_file
 
 MODEL_ID = os.environ.get("MODEL_ID", "EleutherAI/gpt-neo-125M")
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", "./models"))
-USE_FP16 = os.environ.get("USE_FP16", False)
+USE_FP16 = os.environ.get("USE_FP16", "").strip().lower() not in ("", "0", "no", "f", "false")
 NUM_TRIALS = int(os.environ.get("NUM_TRIALS", 1))
 
 if USE_FP16:

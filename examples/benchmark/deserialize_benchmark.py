@@ -2,7 +2,6 @@ import torch
 import shutil
 import os
 import time
-import subprocess
 from pathlib import Path
 from tensorizer import TensorDeserializer
 from tensorizer.utils import convert_bytes, get_mem_usage
@@ -18,15 +17,19 @@ from accelerate import init_empty_weights
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 
+def convert_to_bool(val: str) -> bool:
+    return val.strip().lower() not in ("", "0", "no", "f", "false")
+
+
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", f"./models"))
 TZR_PATH = MODEL_PATH / "model.tensors"
 HF_PATH = MODEL_PATH / "hf"
 RES_PATH = Path(os.environ.get("RES_PATH", "./results"))
 NUM_TRIALS = int(os.environ.get("NUM_TRIALS", 1))
-SKIP_HF = os.environ.get("SKIP_HF", False)
-SKIP_TZR = os.environ.get("SKIP_TZR", False)
-SKIP_ST = os.environ.get("SKIP_ST", False)
-SKIP_INFERENCE = os.environ.get("SKIP_INFERENCE", False)
+SKIP_HF = convert_to_bool(os.environ.get("SKIP_HF", ""))
+SKIP_TZR = convert_to_bool(os.environ.get("SKIP_TZR", ""))
+SKIP_ST = convert_to_bool(os.environ.get("SKIP_ST", ""))
+SKIP_INFERENCE = convert_to_bool(os.environ.get("SKIP_INFERENCE", ""))
 CURL_PATH = shutil.which("curl")
 
 
@@ -34,25 +37,6 @@ RES_PATH.mkdir(parents=True, exist_ok=True)
 config = AutoConfig.from_pretrained(HF_PATH)
 
 DEVICE = torch.device("cuda:0")
-
-
-def run_curl(output: str = "/dev/null"):
-    """
-    Used to compare pod's network speed to tensorizer's speed when using S3/HTTP
-    """
-
-    http_uri = "http://tensorized.accel-object.ord1.coreweave.com/EleutherAI/gpt-j-6B/fp16/model.tensors"
-    cmd = [CURL_PATH,
-           "--header",
-           "Accept-Encoding: identity",
-           http_uri,
-           "-o",
-           output]
-
-    start = time.time()
-    subprocess.call(cmd)
-    duration = time.time() - start
-    print("CURL duration:", duration)
 
 
 def run_inference(model):
@@ -65,6 +49,7 @@ def run_inference(model):
         "We the people, of the United States of America", return_tensors="pt"
     ).to(DEVICE)
 
+    torch.manual_seed(100)
     with torch.no_grad():
         output = model.generate(input_ids, max_new_tokens=50, do_sample=True)
 
