@@ -289,9 +289,15 @@ class _NumpyTensor(NamedTuple):
         if module != "torch" or len(dtype_name) != 1:
             raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}")
 
-        dtype = getattr(torch, dtype_name[0])
-        # Ensure that it's a real dtype
-        if dtype is None or not isinstance(dtype, torch.dtype):
-            raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}")
+        try:
+            dtype = getattr(torch, dtype_name[0])
+            # Ensure that it's a real dtype
+            if not isinstance(dtype, torch.dtype):
+                raise TypeError(
+                    "Provided torch_dtype is not an instance of torch.dtype"
+                    f" (type: {type(dtype).__name__})"
+                )
+        except (AttributeError, TypeError) as e:
+            raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}") from e
 
         return dtype

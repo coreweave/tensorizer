@@ -597,7 +597,7 @@ class TensorDeserializer(collections.abc.Mapping):
                     raise ValueError("Can't deserialize a tensor with "
                                      "multiple opaque dtype separators "
                                      f"({OPAQUE_DTYPE_SEP!r}) in its dtype: "
-                                     f"{dtype}")
+                                     f"{dtype!r}")
 
                 # Read the shape amount, according to the serialized format.
                 # The shape length is 1 byte after the dtype end.
