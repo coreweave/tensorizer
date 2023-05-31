@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyter
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: notebook
+      port: 8888
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: jupyter
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jupyter
+spec:
+  strategy:
+    type: Recreate
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jupyter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jupyter
+    spec:
+      containers:
+        - name: jupyter
+          image: tverous/pytorch-notebook:latest
+          command:
+            - "jupyter"
+            - "lab"
+            - "--ip"
+            - "0.0.0.0"
+            - "--no-browser"
+            - "--allow-root"
+            - "--notebook-dir"
+            - "/mnt/pvc"
+            - "--LabApp.token=''"
+
+          securityContext:
+            runAsUser: 0
+
+          ports:
+            - name: notebook
+              containerPort: 8888
+              protocol: TCP
+
+          readinessProbe:
+            tcpSocket:
+              port: notebook
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: notebook
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 10
+
+          volumeMounts:
+            - name: tensorizer-benchmark-nvme
+              mountPath: /mnt/pvc
+
+          env:
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-token-secret
+                  key: token
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/region
+                operator: In
+                values:
+                  - "LAS1"
+      volumes:
+        - name: tensorizer-benchmark-nvme
+          persistentVolumeClaim:
+            claimName: tensorizer-benchmark-nvme
+      restartPolicy: Always

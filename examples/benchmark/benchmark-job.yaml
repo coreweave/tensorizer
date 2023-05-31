@@ -1,0 +1,188 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tensorizer-benchmark-tzr
+spec:
+  parallelism: 1
+  completions: 100
+  template:
+    spec:
+      containers:
+        - name: benchmark
+          image: navarrepratt/tensorizer-benchmark:1.2.9
+          imagePullPolicy: IfNotPresent
+          command: [ "python", "/app/deserialize_benchmark.py" ]
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MODEL_PATH
+              value: "/mnt/tensorizer/models/opt-30b/fp16"
+            - name: MODEL_ID
+              value: "facebook/opt-30b"
+            - name: NUM_TRIALS
+              value: "1"
+            - name: RES_PATH
+              value: "/mnt/tensorizer/opt-results"
+#            - name: SKIP_INFERENCE
+#              value: "1"
+            - name: SKIP_HF
+              value: "1"
+            - name: SKIP_ST
+              value: "1"
+          volumeMounts:
+            - name: tensorizer-benchmark
+              mountPath: /mnt/tensorizer
+      volumes:
+        - name: tensorizer-benchmark
+          persistentVolumeClaim:
+            claimName: tensorizer-benchmark-nvme
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - LAS1
+                  - key: gpu.nvidia.com/model
+                    operator: In
+                    values:
+                      - A100_NVLINK_80GB
+      restartPolicy: Never
+  backoffLimit: 1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tensorizer-benchmark-st
+spec:
+  parallelism: 1
+  completions: 100
+  template:
+    spec:
+      containers:
+        - name: benchmark
+          image: navarrepratt/tensorizer-benchmark:1.2.8
+          imagePullPolicy: IfNotPresent
+          command: [ "python", "/app/deserialize_benchmark.py" ]
+          resources:
+            requests:
+              cpu: "8"
+              memory: 128Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: 128Gi
+              nvidia.com/gpu: "1"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MODEL_PATH
+              value: "/mnt/tensorizer/models/opt-30b/fp16"
+            - name: MODEL_ID
+              value: "facebook/opt-30b"
+            - name: NUM_TRIALS
+              value: "1"
+            - name: RES_PATH
+              value: "/mnt/tensorizer/opt-results"
+#            - name: SKIP_INFERENCE
+#              value: "1"
+            - name: SKIP_HF
+              value: "1"
+            - name: SKIP_TZR
+              value: "1"
+          volumeMounts:
+            - name: tensorizer-benchmark
+              mountPath: /mnt/tensorizer
+      volumes:
+        - name: tensorizer-benchmark
+          persistentVolumeClaim:
+            claimName: tensorizer-benchmark-nvme
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - LAS1
+                  - key: gpu.nvidia.com/model
+                    operator: In
+                    values:
+                      - A100_NVLINK_80GB
+      restartPolicy: Never
+  backoffLimit: 1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tensorizer-benchmark-hf
+spec:
+  parallelism: 1
+  completions: 100
+  template:
+    spec:
+      containers:
+        - name: benchmark
+          image: navarrepratt/tensorizer-benchmark:1.2.8
+          imagePullPolicy: IfNotPresent
+          command: [ "python", "/app/deserialize_benchmark.py" ]
+          resources:
+            requests:
+              cpu: "8"
+              memory: 128Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: 128Gi
+              nvidia.com/gpu: "1"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MODEL_PATH
+              value: "/mnt/tensorizer/models/opt-30b/fp16"
+            - name: MODEL_ID
+              value: "facebook/opt-30b"
+            - name: NUM_TRIALS
+              value: "1"
+            - name: RES_PATH
+              value: "/mnt/tensorizer/opt-results"
+#            - name: SKIP_INFERENCE
+#              value: "1"
+            - name: SKIP_TZR
+              value: "1"
+            - name: SKIP_ST
+              value: "1"
+          volumeMounts:
+            - name: tensorizer-benchmark
+              mountPath: /mnt/tensorizer
+      volumes:
+        - name: tensorizer-benchmark
+          persistentVolumeClaim:
+            claimName: tensorizer-benchmark-nvme
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - LAS1
+                  - key: gpu.nvidia.com/model
+                    operator: In
+                    values:
+                      - A100_NVLINK_80GB
+      restartPolicy: Never
+  backoffLimit: 1
