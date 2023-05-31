@@ -359,7 +359,7 @@ This means that special conversions need to be applied.
 
 To be saved, the torch tensor is cast to `int16` before being converted to
 numpy, which doesn't change any of the underlying data. When serialized, the
-original `blfoat16` datatype string is also saved so that it will be cast back
+original `bfloat16` datatype string is also saved so that it will be cast back
 to `bfloat16` during the deserialization process.
 
 The `complex32` datatype is supported in a similar way, by casting to `int32`.
