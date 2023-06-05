@@ -674,6 +674,8 @@ class TensorDeserializer(collections.abc.Mapping):
                     mv,
                 )
 
+                tensors_read += 1
+
                 yield module_idx, tensor_type, name, tensor
         except EOFError:
             return
@@ -707,8 +709,7 @@ class TensorDeserializer(collections.abc.Mapping):
         """
 
         data = self._read_numpytensors(
-            filter_func=filter_func,
-            num_tensors=num_tensors
+            filter_func=filter_func, num_tensors=num_tensors
         )
         for module_idx, tensor_type, name, tensor in data:
             yield module_idx, tensor_type, name, tensor.to_tensor()
@@ -748,8 +749,7 @@ class TensorDeserializer(collections.abc.Mapping):
         """
 
         data = self._read_numpytensors(
-            filter_func=filter_func,
-            num_tensors=num_tensors
+            filter_func=filter_func, num_tensors=num_tensors
         )
         for module_idx, tensor_type, name, tensor in data:
             if tensor.is_opaque and not allow_raw_data:
