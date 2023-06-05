@@ -533,8 +533,8 @@ class TensorDeserializer(collections.abc.Mapping):
     ) -> Iterator[Tuple[int, int, str, Union[torch.Tensor, numpy.ndarray]]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
-        `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
-        represents the tensor.
+        `tensor_type`, parameter/buffer `name`, and the torch or numpy `arr`
+        that represents the tensor.
 
         Note that this function does not seek to the beginning of the tensor
         data. It assumes that the file pointer is already at the beginning
@@ -553,12 +553,18 @@ class TensorDeserializer(collections.abc.Mapping):
                 will be read. If the zero-byte header is encountered before
                 `num_tensors` tensors are read, the generator will stop
                 yielding values.
-            as_numpy: If true, `read_tensors` will return a numpy ndarray,
-                otherwise it will return a torch Tensor. Defaults to False.
-                Note that if torch tensors with dtypes unsupported by numpy are
-                being loaded, then returning them as numpy arrays will result
-                in a numpy ndarray with the original data, but an int dtype of
-                the respective size.
+            as_numpy: If True, `read_tensors` returns ``numpy.ndarray``
+                objects, otherwise it returns ``torch.Tensor`` objects.
+                Defaults to False.
+                Note that deserializing a torch tensor as a numpy array
+                when its torch dtype has no numpy equivalent will result in
+                a ``numpy.ndarray`` containing the original data,
+                but its dtype replaced by a ``numpy.int`` dtype
+                of the same width.
+                For example, deserializing a tensor saved with the original
+                dtype ``torch.bfloat16`` using `as_numpy=True` will yield a
+                ``numpy.ndarray`` with the dtype ``numpy.int16``,
+                since numpy has no equivalent bfloat16 dtype.
         """
 
         try:
@@ -586,7 +592,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 # Read the dtype of the tensor.
                 dtype_len = struct.unpack("<B", headers[idx : idx + 1])[0]
                 dtype_end = idx + dtype_len + 1
-                dtype = headers[idx + 1: dtype_end].decode("utf-8")
+                dtype = headers[idx + 1 : dtype_end].decode("utf-8")
 
                 numpy_dtype, *torch_dtype = dtype.split(OPAQUE_DTYPE_SEP)
                 if len(torch_dtype) == 0:
@@ -594,10 +600,12 @@ class TensorDeserializer(collections.abc.Mapping):
                 elif len(torch_dtype) == 1:
                     torch_dtype = torch_dtype[0]
                 else:
-                    raise ValueError("Can't deserialize a tensor with "
-                                     "multiple opaque dtype separators "
-                                     f"({OPAQUE_DTYPE_SEP!r}) in its dtype: "
-                                     f"{dtype!r}")
+                    raise ValueError(
+                        "Can't deserialize a tensor with "
+                        "multiple opaque dtype separators "
+                        f"({OPAQUE_DTYPE_SEP!r}) in its dtype: "
+                        f"{dtype!r}"
+                    )
 
                 # Read the shape amount, according to the serialized format.
                 # The shape length is 1 byte after the dtype end.
@@ -677,7 +685,7 @@ class TensorDeserializer(collections.abc.Mapping):
                     numpy_dtype,
                     torch_dtype,
                     shape_list,
-                    mv
+                    mv,
                 )
 
                 tensors_read += 1
