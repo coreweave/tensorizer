@@ -753,10 +753,12 @@ class TensorDeserializer(collections.abc.Mapping):
         )
         for module_idx, tensor_type, name, tensor in data:
             if tensor.is_opaque and not allow_raw_data:
+                np_dtype = tensor.data.dtype.str
                 raise ValueError(
-                    f"{name} has an opaque datatype: {tensor.torch_dtype}. "
+                    f"{name} has an opaque datatype: "
+                    f"(Torch: {tensor.torch_dtype}, Numpy: {np_dtype}). "
                     "Set `allow_raw_data=True` to return as a numpy array "
-                    f"with a datatype of {tensor.numpy_dtype}"
+                    f"with a datatype of {np_dtype}"
                 )
 
             arr = tensor.data
