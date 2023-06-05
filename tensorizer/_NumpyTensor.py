@@ -92,7 +92,7 @@ class _NumpyTensor(NamedTuple):
         """
         Converts a torch tensor into a `_NumpyTensor`.
         May use an opaque dtype for the numpy array stored in
-        the ``data`` field if the tensor's torch dtype has no numpy equivalent.
+        the `data` field if the tensor's torch dtype has no numpy equivalent.
         See also: `_NumpyTensor.is_opaque`.
 
         Args:
