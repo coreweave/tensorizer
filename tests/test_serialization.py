@@ -15,7 +15,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = (
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from tensorizer import TensorDeserializer, TensorSerializer, utils, stream_io
+from tensorizer import TensorDeserializer, TensorSerializer, stream_io, utils
 from tensorizer.serialization import TensorType
 
 model_name = "EleutherAI/gpt-neo-125M"
@@ -118,9 +118,9 @@ class TestSerialization(unittest.TestCase):
                     os.unlink(serialized_model)
 
     def test_bfloat16(self):
-        tensorized_file = tempfile.NamedTemporaryFile("wb+", delete=False)
         shape = (50, 50)
         tensor = torch.normal(0, 0.5, shape, dtype=torch.bfloat16)
+        tensorized_file = tempfile.NamedTemporaryFile("wb+", delete=False)
 
         try:
             serializer = TensorSerializer(tensorized_file)
@@ -129,19 +129,16 @@ class TestSerialization(unittest.TestCase):
 
             with open(tensorized_file.name, "rb") as in_file:
                 deserializer = TensorDeserializer(
-                    in_file,
-                    device="cpu",
-                    lazy_load=True
+                    in_file, device="cpu", lazy_load=True
                 )
                 deserialized_tensor = [
-                    t for t in
-                    deserializer.read_tensors(num_tensors=1)
+                    t for t in deserializer.read_tensors(num_tensors=1)
                 ][0][-1]
                 deserializer.close()
         finally:
             os.unlink(tensorized_file.name)
 
-        assert(torch.equal(tensor, deserialized_tensor))
+        assert torch.equal(tensor, deserialized_tensor)
 
 
 class TestDeserialization(unittest.TestCase):
