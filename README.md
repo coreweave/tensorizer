@@ -370,29 +370,34 @@ deserialized correctly.
 ### Numpy Support
 
 Tensorizer can be used with `numpy` directly to read and write
-`numpy.ndarray`'s.
+`numpy.ndarray`s.
 
 The serializer's `write_tensor` function handles supplying both
-`torch.Tensor`'s and `numpy.ndarray`'s.
+`torch.Tensor`s and `numpy.ndarray`s.
 
 The deserializer has a separate function `read_numpy_arrays` that will return
-the data as `numpy.ndarray`'s.
+the data as `numpy.ndarray`s.
 
 As explained above in [bfloat16 support](#bfloat16-support), tensorizer uses
-special conversions to write opaque datatypes, those not supported by numpy.
-Therefore, special considerations need to be taken when loading the data as
-`numpy.ndarray`'s.
+special conversions to write "opaque" datatypes, those not supported by numpy.
+Therefore, special considerations need to be taken when loading such data as
+`numpy.ndarray`s.
 
-By default, the `read_numpy_arrays` function sets its `allow_raw_data`
-parameter to `False`. This means that if the data contains opaque datatypes,
-a `ValueError` will be raised.
+By default, the `TensorDeserializer.read_numpy_arrays` function sets its
+`allow_raw_data` parameter to `False`. This means that if a file contains
+opaque datatypes, a `ValueError` will be raised during deserialization.
 
-If you want to return the raw data regardless, set `allow_raw_data` to be
-`True`.
+If you want to return the raw data regardless, set `allow_raw_data` to `True`.
+Otherwise, the file may be read with `TensorDeserializer.read_tensors`
+instead, which yields `torch.Tensor` objects of the correct datatype.
 
-A fifth variable is returned by the `read_numpy_arrays` generator, which is a
-`bool` that indicates whether the returned data was originally an opaque
-datatype.
+A fifth and sixth variable are also returned by the `read_numpy_arrays`
+generator. The fifth is a `bool` that indicates whether the returned array
+has an opaque datatype and requires special handling (only legal when
+`allow_raw_data=True`). The sixth is a string describing the true, non-numpy
+datatype that the raw data should be interpreted as in such cases.
+For all other datatypes that require no special handling, these are returned as
+`False` and `None`, respectively.
 
 ## Running Tests
 `tensorizer` uses `unittest` for testing.
