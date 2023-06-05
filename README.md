@@ -367,6 +367,33 @@ The quantized datatypes (`qint8`, `qint32`, etc.) are not currently supported
 by tensorizer as they would require supplemental quantization parameters to be
 deserialized correctly.
 
+### Numpy Support
+
+Tensorizer can be used with `numpy` directly to read and write
+`numpy.ndarray`'s.
+
+The serializer's `write_tensor` function handles supplying both
+`torch.Tensor`'s and `numpy.ndarray`'s.
+
+The deserializer has a separate function `read_numpy_arrays` that will return
+the data as `numpy.ndarray`'s.
+
+As explained above in [bfloat16 support](#bfloat16-support), tensorizer uses
+special conversions to write opaque datatypes, those not supported by numpy.
+Therefore, special considerations need to be taken when loading the data as
+`numpy.ndarray`'s.
+
+By default, the `read_numpy_arrays` function sets its `allow_raw_data`
+parameter to `False`. This means that if the data contains opaque datatypes,
+a `ValueError` will be raised.
+
+If you want to return the raw data regardless, set `allow_raw_data` to be
+`True`.
+
+A fifth variable is returned by the `read_numpy_arrays` generator, which is a
+`bool` that indicates whether the returned data was originally an opaque
+datatype.
+
 ## Running Tests
 `tensorizer` uses `unittest` for testing.
 The tests have their own set of dependencies, which can be installed with

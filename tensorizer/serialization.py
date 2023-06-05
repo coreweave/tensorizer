@@ -525,16 +525,14 @@ class TensorDeserializer(collections.abc.Mapping):
 
         return hashes
 
-    def read_tensors(
+    def _read_numpytensors(
         self,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         num_tensors: int = -1,
-        as_numpy: bool = False,
-    ) -> Iterator[Tuple[int, int, str, Union[torch.Tensor, numpy.ndarray]]]:
+    ) -> Iterator[Tuple[int, int, str, _NumpyTensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
-        `tensor_type`, parameter/buffer `name`, and the torch or numpy `arr`
-        that represents the tensor.
+        `tensor_type`, parameter/buffer `name`, and a NumpyTensor `tensor`.
 
         Note that this function does not seek to the beginning of the tensor
         data. It assumes that the file pointer is already at the beginning
@@ -553,18 +551,6 @@ class TensorDeserializer(collections.abc.Mapping):
                 will be read. If the zero-byte header is encountered before
                 `num_tensors` tensors are read, the generator will stop
                 yielding values.
-            as_numpy: If True, `read_tensors` returns ``numpy.ndarray``
-                objects, otherwise it returns ``torch.Tensor`` objects.
-                Defaults to False.
-                Note that deserializing a torch tensor as a numpy array
-                when its torch dtype has no numpy equivalent will result in
-                a ``numpy.ndarray`` containing the original data,
-                but its dtype replaced by a ``numpy.int`` dtype
-                of the same width.
-                For example, deserializing a tensor saved with the original
-                dtype ``torch.bfloat16`` using `as_numpy=True` will yield a
-                ``numpy.ndarray`` with the dtype ``numpy.int16``,
-                since numpy has no equivalent bfloat16 dtype.
         """
 
         try:
@@ -688,16 +674,93 @@ class TensorDeserializer(collections.abc.Mapping):
                     mv,
                 )
 
-                tensors_read += 1
-
-                if as_numpy:
-                    tensor = tensor.data
-                else:
-                    tensor = tensor.to_tensor()
-
                 yield module_idx, tensor_type, name, tensor
         except EOFError:
             return
+
+    def read_tensors(
+        self,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
+    ) -> Iterator[Tuple[int, int, str, torch.Tensor]]:
+        """
+        A generator that deserializes tensors and returns the `module_idx`,
+        `tensor_type`, parameter/buffer `name`, and the torch tensor.
+
+        Note that this function does not seek to the beginning of the tensor
+        data. It assumes that the file pointer is already at the beginning
+        of the tensor data that it should read.
+
+        It will read `num_tensors` tensors from the file, or all tensors
+        if `num_tensors` is -1.
+
+        The generator yields tuples of the form:
+            (module_idx, tensor_type, name, tensor)
+
+        Args:
+            filter_func: A function that takes a tensor name and returns
+                True if the tensor should be returned, False otherwise.
+            num_tensors: The number of tensors to read. If -1, all tensors
+                will be read. If the zero-byte header is encountered before
+                `num_tensors` tensors are read, the generator will stop
+                yielding values.
+        """
+
+        data = self._read_numpytensors(
+            filter_func=filter_func,
+            num_tensors=num_tensors
+        )
+        for module_idx, tensor_type, name, tensor in data:
+            yield module_idx, tensor_type, name, tensor.to_tensor()
+
+    def read_numpy_arrays(
+        self,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
+        allow_raw_data: bool = False,
+    ) -> Iterator[Tuple[int, int, str, numpy.ndarray, bool]]:
+        """
+        A generator that deserializes tensors and returns the `module_idx`,
+        `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
+        represents the tensor.
+
+        Note that this function does not seek to the beginning of the tensor
+        data. It assumes that the file pointer is already at the beginning
+        of the tensor data that it should read.
+
+        It will read `num_tensors` tensors from the file, or all tensors
+        if `num_tensors` is -1.
+
+        The generator yields tuples of the form:
+            (module_idx, tensor_type, name, arr, is_opaque)
+
+        Args:
+            filter_func: A function that takes a tensor name and returns
+                True if the tensor should be returned, False otherwise.
+            num_tensors: The number of tensors to read. If -1, all tensors
+                will be read. If the zero-byte header is encountered before
+                `num_tensors` tensors are read, the generator will stop
+                yielding values.
+            allow_raw_data: Whether to return numpy arrays that contain
+                represent opaque datatypes. If not allowed and an opaque
+                NumpyTensor is encountered, then a `ValueError` is raised.
+                Defaults to False.
+        """
+
+        data = self._read_numpytensors(
+            filter_func=filter_func,
+            num_tensors=num_tensors
+        )
+        for module_idx, tensor_type, name, tensor in data:
+            if tensor.is_opaque and not allow_raw_data:
+                raise ValueError(
+                    f"{name} has an opaque datatype: {tensor.torch_dtype}. "
+                    "Set `allow_raw_data=True` to return as a numpy array "
+                    f"with a datatype of {tensor.numpy_dtype}"
+                )
+
+            arr = tensor.data
+            yield module_idx, tensor_type, name, arr, tensor.is_opaque
 
     def _to_torch_parameter(
         self, tensor: Union[torch.Tensor, torch.nn.Parameter]
