@@ -227,7 +227,7 @@ class TestDeserialization(unittest.TestCase):
 
         deserialized.close()
 
-    @patch.object(stream_io, "_s3_default_config_paths", {})
+    @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_s3(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/model.tensors", device=default_device
@@ -236,7 +236,7 @@ class TestDeserialization(unittest.TestCase):
         check_inference(deserialized, model_name, default_device)
         deserialized.close()
 
-    @patch.object(stream_io, "_s3_default_config_paths", {})
+    @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_s3_fp16(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/fp16/model.tensors",
@@ -248,7 +248,7 @@ class TestDeserialization(unittest.TestCase):
             check_inference(deserialized, model_name, default_device)
         deserialized.close()
 
-    @patch.object(stream_io, "_s3_default_config_paths", {})
+    @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_s3_lazy_load(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/model.tensors",
