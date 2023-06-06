@@ -532,7 +532,7 @@ class TensorDeserializer(collections.abc.Mapping):
     ) -> Iterator[Tuple[int, int, str, _NumpyTensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
-        `tensor_type`, parameter/buffer `name`, and a NumpyTensor `tensor`.
+        `tensor_type`, parameter/buffer `name`, and a _NumpyTensor `tensor`.
 
         Note that this function does not seek to the beginning of the tensor
         data. It assumes that the file pointer is already at the beginning
@@ -674,6 +674,8 @@ class TensorDeserializer(collections.abc.Mapping):
                     mv,
                 )
 
+                tensors_read += 1
+
                 yield module_idx, tensor_type, name, tensor
         except EOFError:
             return
@@ -685,7 +687,7 @@ class TensorDeserializer(collections.abc.Mapping):
     ) -> Iterator[Tuple[int, int, str, torch.Tensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
-        `tensor_type`, parameter/buffer `name`, and the torch tensor.
+        `tensor_type`, parameter/buffer `name`, and torch `tensor`.
 
         Note that this function does not seek to the beginning of the tensor
         data. It assumes that the file pointer is already at the beginning
@@ -704,11 +706,13 @@ class TensorDeserializer(collections.abc.Mapping):
                 will be read. If the zero-byte header is encountered before
                 `num_tensors` tensors are read, the generator will stop
                 yielding values.
+
+        Yields:
+            Tuples of the form (module_idx, tensor_type, name, tensor).
         """
 
         data = self._read_numpytensors(
-            filter_func=filter_func,
-            num_tensors=num_tensors
+            filter_func=filter_func, num_tensors=num_tensors
         )
         for module_idx, tensor_type, name, tensor in data:
             yield module_idx, tensor_type, name, tensor.to_tensor()
@@ -718,11 +722,38 @@ class TensorDeserializer(collections.abc.Mapping):
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         num_tensors: int = -1,
         allow_raw_data: bool = False,
-    ) -> Iterator[Tuple[int, int, str, numpy.ndarray, bool]]:
+    ) -> Iterator[Tuple[int, int, str, numpy.ndarray, bool, Optional[str]]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
-        `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
-        represents the tensor.
+        `tensor_type`, parameter/buffer `name`, the numpy `arr` that
+        represents the tensor, a boolean representing if the returned datatype
+        is opaque, and the name of the true datatype represented by the opaque
+        data, if applicable.
+
+
+        "Opaque data" refers to numpy arrays holding accurate raw binary data
+        but an invalid dtype attribute, occurring when there is no numpy dtype
+        corresponding to the original type that was serialized.
+        These are only returned if `allow_raw_data` is set to `True`,
+        otherwise, encountering such a datatype is an error,
+        and the file should instead be deserialized with
+        `TensorDeserializer.read_tensors()`.
+
+        For example, if a ``torch.Tensor`` with the dtype ``torch.bfloat16``
+        is serialized, then it can be accurately deserialized using
+        `TensorDeserializer.read_tensors()`. Since there is no numpy type
+        corresponding to ``torch.bfloat16``, attempting to deserialize the same
+        file via `TensorDeserializer.read_numpy_arrays()` will raise a
+        ``ValueError``.
+        However, if `allow_raw_data` is set to ``True``, then
+        `TensorDeserializer.read_numpy_arrays()` will return these
+        arrays regardless, and the final two values of the yielded tuple,
+        `is_opaque` and `torch_dtype`, will be ``True`` and a string
+        representing the true non-numpy datatype represented by the data,
+        respectively. Special handling is then required to use the returned
+        data accurately.
+
+
 
         Note that this function does not seek to the beginning of the tensor
         data. It assumes that the file pointer is already at the beginning
@@ -732,7 +763,9 @@ class TensorDeserializer(collections.abc.Mapping):
         if `num_tensors` is -1.
 
         The generator yields tuples of the form:
-            (module_idx, tensor_type, name, arr, is_opaque)
+            (module_idx, tensor_type, name, arr, is_opaque, torch_dtype)
+
+        See also: `TensorDeserializer.read_tensors`
 
         Args:
             filter_func: A function that takes a tensor name and returns
@@ -741,19 +774,42 @@ class TensorDeserializer(collections.abc.Mapping):
                 will be read. If the zero-byte header is encountered before
                 `num_tensors` tensors are read, the generator will stop
                 yielding values.
-            allow_raw_data: Whether to return numpy arrays that contain
-                represent opaque datatypes. If not allowed and an opaque
-                NumpyTensor is encountered, then a `ValueError` is raised.
+            allow_raw_data: Whether to return numpy arrays containing
+                uninterpretable opaque datatypes. If False and opaque
+                datatypes are encountered, then a `ValueError` is raised.
                 Defaults to False.
+
+        Yields:
+            Tuples of the form:
+            (
+                module_idx,
+                tensor_type,
+                name,
+                arr,
+                is_opaque,
+                torch_dtype
+            )
+            If the `allow_raw_data` parameter is ``False`` (the default),
+            the final two elements are always ``False`` and ``None``,
+            respectively. Otherwise, ``is_opaque`` may be ``True``, and
+            ``torch_dtype`` will then be a string representing the actual
+            non-numpy datatype represented by the data in `arr`.
+
+        Raises:
+            ValueError: If an opaque datatype is encountered in the file
+                and ``allow_raw_data=False``.
         """
 
         data = self._read_numpytensors(
-            filter_func=filter_func,
-            num_tensors=num_tensors
+            filter_func=filter_func, num_tensors=num_tensors
         )
         for module_idx, tensor_type, name, tensor in data:
-            if tensor.is_opaque and not allow_raw_data:
-                np_dtype = tensor.data.dtype.str
+            is_opaque = tensor.is_opaque
+            arr = tensor.data
+            torch_dtype = tensor.torch_dtype if is_opaque else None
+
+            if is_opaque and not allow_raw_data:
+                np_dtype = arr.dtype.str
                 raise ValueError(
                     f"{name} has an opaque datatype: "
                     f"(Torch: {tensor.torch_dtype}, Numpy: {np_dtype}). "
@@ -761,8 +817,7 @@ class TensorDeserializer(collections.abc.Mapping):
                     f"with a datatype of {np_dtype}"
                 )
 
-            arr = tensor.data
-            yield module_idx, tensor_type, name, arr, tensor.is_opaque
+            yield module_idx, tensor_type, name, arr, is_opaque, torch_dtype
 
     def _to_torch_parameter(
         self, tensor: Union[torch.Tensor, torch.nn.Parameter]
