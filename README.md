@@ -367,6 +367,13 @@ The quantized datatypes (`qint8`, `qint32`, etc.) are not currently supported
 by tensorizer as they would require supplemental quantization parameters to be
 deserialized correctly.
 
+**NOTE:** The exact choice of intermediate types as `int16` and `int32` is
+considered an implementation detail, and is subject to change,
+so they should not be relied upon.
+
+**NOTE2:** This does not interfere with storing actual `int` datatypes
+used in tensors in tensorized files.
+
 ### Numpy Support
 
 Tensorizer can be used with `numpy` directly to read and write
@@ -398,6 +405,8 @@ has an opaque datatype and requires special handling (only legal when
 datatype that the raw data should be interpreted as in such cases.
 For all other datatypes that require no special handling, these are returned as
 `False` and `None`, respectively.
+The exact numpy datatypes used by the returned opaque `numpy.ndarray` objects
+is not guaranteed, and should not be relied upon.
 
 ## Running Tests
 `tensorizer` uses `unittest` for testing.
