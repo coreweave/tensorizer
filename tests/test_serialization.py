@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 from typing import Tuple
+from unittest.mock import patch
 
 import torch
 
@@ -14,7 +15,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = (
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from tensorizer import TensorDeserializer, TensorSerializer, utils
+from tensorizer import TensorDeserializer, TensorSerializer, stream_io, utils
+from tensorizer.serialization import TensorType
 
 model_name = "EleutherAI/gpt-neo-125M"
 num_hellos = 400
@@ -115,6 +117,29 @@ class TestSerialization(unittest.TestCase):
                 finally:
                     os.unlink(serialized_model)
 
+    def test_bfloat16(self):
+        shape = (50, 50)
+        tensor = torch.normal(0, 0.5, shape, dtype=torch.bfloat16)
+        tensorized_file = tempfile.NamedTemporaryFile("wb+", delete=False)
+
+        try:
+            serializer = TensorSerializer(tensorized_file)
+            serializer.write_tensor(0, "test_tensor", TensorType.PARAM, tensor)
+            serializer.close()
+
+            with open(tensorized_file.name, "rb") as in_file:
+                deserializer = TensorDeserializer(
+                    in_file, device="cpu", lazy_load=True
+                )
+                deserialized_tensor = [
+                    t for t in deserializer.read_tensors(num_tensors=1)
+                ][0][-1]
+                deserializer.close()
+        finally:
+            os.unlink(tensorized_file.name)
+
+        assert torch.equal(tensor, deserialized_tensor)
+
 
 class TestDeserialization(unittest.TestCase):
     _serialized_model_path: str
@@ -202,6 +227,7 @@ class TestDeserialization(unittest.TestCase):
 
         deserialized.close()
 
+    @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_s3(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/model.tensors", device=default_device
@@ -210,6 +236,7 @@ class TestDeserialization(unittest.TestCase):
         check_inference(deserialized, model_name, default_device)
         deserialized.close()
 
+    @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_s3_fp16(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/fp16/model.tensors",
@@ -221,6 +248,7 @@ class TestDeserialization(unittest.TestCase):
             check_inference(deserialized, model_name, default_device)
         deserialized.close()
 
+    @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_s3_lazy_load(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/model.tensors",

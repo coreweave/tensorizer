@@ -30,6 +30,7 @@ import torch
 
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
+from tensorizer._NumpyTensor import _NumpyTensor
 
 if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
@@ -54,8 +55,15 @@ class TensorType(Enum):
     STATE_DICT = 2
 
 
-TENSORIZER_VERSION = 1
+# If tensors with "opaque" dtypes (those that are not supported by numpy) are
+# saved, then a tensorizer data version of 2 is required to (de)serialize the
+# file. Otherwise, the file is compatible with tensorizer data version 1
+TENSORIZER_VERSION = 2
+NON_OPAQUE_TENSORIZER_VERSION = 1
+
 TENSORIZER_MAGIC = b"|TZR|"
+
+OPAQUE_DTYPE_SEP = "\0"
 
 
 class TensorEntry(typing.TypedDict):
@@ -78,40 +86,6 @@ class TensorHash(typing.TypedDict):
     hash: bytes
 
 
-def _convert_dtype_to_numpy(dtype: Union[numpy.dtype, str, torch.dtype]):
-    if isinstance(dtype, numpy.dtype):
-        return dtype
-    elif isinstance(dtype, str):
-        return numpy.dtype(dtype)
-    elif isinstance(dtype, torch.dtype):
-        # Converted from PyTorch's own mapping used in their testing:
-        # https://github.com/pytorch/pytorch/blob/v2.0.0/torch/testing/_internal/common_utils.py#L1009
-        numpy_dtype = {
-            torch.bool: numpy.bool_,
-            torch.uint8: numpy.uint8,
-            torch.int8: numpy.int8,
-            torch.int16: numpy.int16,
-            torch.int32: numpy.int32,
-            torch.int64: numpy.int64,
-            torch.float16: numpy.float16,
-            torch.float32: numpy.float32,
-            torch.float64: numpy.float64,
-            torch.complex64: numpy.complex64,
-            torch.complex128: numpy.complex128,
-        }.get(dtype)
-
-        if numpy_dtype is None:
-            raise TypeError(
-                "The provided torch.dtype class could not be converted to a"
-                " numpy.dtype"
-            )
-        else:
-            # Convert it from a dtype class to a dtype object instance
-            return numpy.dtype(numpy_dtype)
-    else:
-        raise TypeError("Could not interpret provided dtype as a numpy.dtype")
-
-
 class TensorDeserializer(collections.abc.Mapping):
     """
     Given a file-like object for read, deserialize tensors to a state_dict or
@@ -128,8 +102,8 @@ class TensorDeserializer(collections.abc.Mapping):
         filter_func: A function (tensor_name: str) -> bool that returns True
             if a tensor should be loaded, or False if it should be skipped.
             If None, all tensors are loaded.
-        dtype: The dtype to load the tensors as. If None, the dtype will be
-            inferred from the file.
+        dtype: The dtype to cast the tensors as when loading them into a torch
+            module. If None, the dtype will be inferred from the file.
         lazy_load: If True, tensors will be loaded and cached when keys are
             accessed. If False, all tensors will be loaded into memory up
             front.
@@ -190,7 +164,7 @@ class TensorDeserializer(collections.abc.Mapping):
         ],
         device: Union[torch.device, str, None] = None,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-        dtype: Union[numpy.dtype, str, None] = None,
+        dtype: Optional[torch.dtype] = None,
         *,
         lazy_load: bool = False,
         plaid_mode: bool = False,
@@ -208,11 +182,7 @@ class TensorDeserializer(collections.abc.Mapping):
         device = utils.get_device() if device is None else torch.device(device)
         self._device = device
 
-        # If dtype is not None, convert all tensors to this dtype if possible.
-        if dtype is None:
-            self._dtype = None
-        else:
-            self._dtype = _convert_dtype_to_numpy(dtype)
+        self._dtype = dtype
 
         self._metadata: Dict[str, TensorEntry] = {}
 
@@ -555,15 +525,14 @@ class TensorDeserializer(collections.abc.Mapping):
 
         return hashes
 
-    def read_tensors(
+    def _read_numpytensors(
         self,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         num_tensors: int = -1,
-    ) -> Iterator[Tuple[int, int, str, numpy.ndarray]]:
+    ) -> Iterator[Tuple[int, int, str, _NumpyTensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
-        `tensor_type`, parameter/buffer `name`, and the numpy `arr` that
-        represents the tensor.
+        `tensor_type`, parameter/buffer `name`, and a _NumpyTensor `tensor`.
 
         Note that this function does not seek to the beginning of the tensor
         data. It assumes that the file pointer is already at the beginning
@@ -609,7 +578,20 @@ class TensorDeserializer(collections.abc.Mapping):
                 # Read the dtype of the tensor.
                 dtype_len = struct.unpack("<B", headers[idx : idx + 1])[0]
                 dtype_end = idx + dtype_len + 1
-                dtype = headers[idx + 1 : dtype_end]
+                dtype = headers[idx + 1 : dtype_end].decode("utf-8")
+
+                numpy_dtype, *torch_dtype = dtype.split(OPAQUE_DTYPE_SEP)
+                if len(torch_dtype) == 0:
+                    torch_dtype = None
+                elif len(torch_dtype) == 1:
+                    torch_dtype = torch_dtype[0]
+                else:
+                    raise ValueError(
+                        "Can't deserialize a tensor with "
+                        "multiple opaque dtype separators "
+                        f"({OPAQUE_DTYPE_SEP!r}) in its dtype: "
+                        f"{dtype!r}"
+                    )
 
                 # Read the shape amount, according to the serialized format.
                 # The shape length is 1 byte after the dtype end.
@@ -685,44 +667,184 @@ class TensorDeserializer(collections.abc.Mapping):
                     mv = memoryview(buffer)
                     self._file.readinto(mv)
 
-                # Convert the memoryview to a numpy array. We use the
-                # memmap class to avoid copying the data.
-                arr = numpy.ndarray.__new__(
-                    numpy.memmap,
+                tensor = _NumpyTensor.from_buffer(
+                    numpy_dtype,
+                    torch_dtype,
                     shape_list,
-                    dtype=dtype,
-                    buffer=mv,
-                    offset=0,
+                    mv,
                 )
+
                 tensors_read += 1
-                yield module_idx, tensor_type, name, arr
+
+                yield module_idx, tensor_type, name, tensor
         except EOFError:
             return
 
+    def read_tensors(
+        self,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
+    ) -> Iterator[Tuple[int, int, str, torch.Tensor]]:
+        """
+        A generator that deserializes tensors and returns the `module_idx`,
+        `tensor_type`, parameter/buffer `name`, and torch `tensor`.
+
+        Note that this function does not seek to the beginning of the tensor
+        data. It assumes that the file pointer is already at the beginning
+        of the tensor data that it should read.
+
+        It will read `num_tensors` tensors from the file, or all tensors
+        if `num_tensors` is -1.
+
+        The generator yields tuples of the form:
+            (module_idx, tensor_type, name, tensor)
+
+        Args:
+            filter_func: A function that takes a tensor name and returns
+                True if the tensor should be returned, False otherwise.
+            num_tensors: The number of tensors to read. If -1, all tensors
+                will be read. If the zero-byte header is encountered before
+                `num_tensors` tensors are read, the generator will stop
+                yielding values.
+
+        Yields:
+            Tuples of the form (module_idx, tensor_type, name, tensor).
+        """
+
+        data = self._read_numpytensors(
+            filter_func=filter_func, num_tensors=num_tensors
+        )
+        for module_idx, tensor_type, name, tensor in data:
+            yield module_idx, tensor_type, name, tensor.to_tensor()
+
+    def read_numpy_arrays(
+        self,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
+        allow_raw_data: bool = False,
+    ) -> Iterator[Tuple[int, int, str, numpy.ndarray, bool, Optional[str]]]:
+        """
+        A generator that deserializes tensors and returns the `module_idx`,
+        `tensor_type`, parameter/buffer `name`, the numpy `arr` that
+        represents the tensor, a boolean representing if the returned datatype
+        is opaque, and the name of the true datatype represented by the opaque
+        data, if applicable.
+
+
+        "Opaque data" refers to numpy arrays holding accurate raw binary data
+        but an invalid dtype attribute, occurring when there is no numpy dtype
+        corresponding to the original type that was serialized.
+        These are only returned if `allow_raw_data` is set to `True`,
+        otherwise, encountering such a datatype is an error,
+        and the file should instead be deserialized with
+        `TensorDeserializer.read_tensors()`.
+
+        For example, if a ``torch.Tensor`` with the dtype ``torch.bfloat16``
+        is serialized, then it can be accurately deserialized using
+        `TensorDeserializer.read_tensors()`. Since there is no numpy type
+        corresponding to ``torch.bfloat16``, attempting to deserialize the same
+        file via `TensorDeserializer.read_numpy_arrays()` will raise a
+        ``ValueError``.
+        However, if `allow_raw_data` is set to ``True``, then
+        `TensorDeserializer.read_numpy_arrays()` will return these
+        arrays regardless, and the final two values of the yielded tuple,
+        `is_opaque` and `torch_dtype`, will be ``True`` and a string
+        representing the true non-numpy datatype represented by the data,
+        respectively. Special handling is then required to use the returned
+        data accurately.
+
+
+
+        Note that this function does not seek to the beginning of the tensor
+        data. It assumes that the file pointer is already at the beginning
+        of the tensor data that it should read.
+
+        It will read `num_tensors` tensors from the file, or all tensors
+        if `num_tensors` is -1.
+
+        The generator yields tuples of the form:
+            (module_idx, tensor_type, name, arr, is_opaque, torch_dtype)
+
+        See also: `TensorDeserializer.read_tensors`
+
+        Args:
+            filter_func: A function that takes a tensor name and returns
+                True if the tensor should be returned, False otherwise.
+            num_tensors: The number of tensors to read. If -1, all tensors
+                will be read. If the zero-byte header is encountered before
+                `num_tensors` tensors are read, the generator will stop
+                yielding values.
+            allow_raw_data: Whether to return numpy arrays containing
+                uninterpretable opaque datatypes. If False and opaque
+                datatypes are encountered, then a `ValueError` is raised.
+                Defaults to False.
+
+        Yields:
+            Tuples of the form:
+            (
+                module_idx,
+                tensor_type,
+                name,
+                arr,
+                is_opaque,
+                torch_dtype
+            )
+            If the `allow_raw_data` parameter is ``False`` (the default),
+            the final two elements are always ``False`` and ``None``,
+            respectively. Otherwise, ``is_opaque`` may be ``True``, and
+            ``torch_dtype`` will then be a string representing the actual
+            non-numpy datatype represented by the data in `arr`.
+
+        Raises:
+            ValueError: If an opaque datatype is encountered in the file
+                and ``allow_raw_data=False``.
+        """
+
+        data = self._read_numpytensors(
+            filter_func=filter_func, num_tensors=num_tensors
+        )
+        for module_idx, tensor_type, name, tensor in data:
+            is_opaque = tensor.is_opaque
+            arr = tensor.data
+            torch_dtype = tensor.torch_dtype if is_opaque else None
+
+            if is_opaque and not allow_raw_data:
+                np_dtype = arr.dtype.str
+                raise ValueError(
+                    f"{name} has an opaque datatype: "
+                    f"(Torch: {tensor.torch_dtype}, Numpy: {np_dtype}). "
+                    "Set `allow_raw_data=True` to return as a numpy array "
+                    f"with a datatype of {np_dtype}"
+                )
+
+            yield module_idx, tensor_type, name, arr, is_opaque, torch_dtype
+
     def _to_torch_parameter(
-        self, arr: Union[numpy.ndarray, torch.nn.Parameter]
+        self, tensor: Union[torch.Tensor, torch.nn.Parameter]
     ) -> torch.nn.Parameter:
         """
-        Convert a numpy array to a torch.nn.Parameter on a device, forcing
+        Convert a tensor to a torch.nn.Parameter on a device, forcing
         gradient when appropriate. We also handle torch.nn.Parameter objects in
         a passthrough manner.
         """
-        if isinstance(arr, torch.nn.Parameter):
-            arr.data = arr.data.to(self._device)
-            if arr.grad is not None:
-                arr.grad = arr.grad.to(self._device)
-            return arr
+        if isinstance(tensor, torch.nn.Parameter):
+            tensor.data = tensor.data.to(self._device)
+            if tensor.grad is not None:
+                tensor.grad = tensor.grad.to(self._device)
+            return tensor
 
+        # Cast the tensor if a global dtype was given to the TensorDeserializer
         if (
             self._dtype is not None
-            and arr.dtype != "bool"
-            and arr.dtype != self._dtype
+            and tensor.dtype != torch.bool
+            and torch.dtype != self._dtype
         ):
-            arr = arr.astype(self._dtype)
-        gradient = arr.dtype.kind in ("f", "c")
+            tensor = tensor.to(self._dtype)
+
+        gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
         return torch.nn.Parameter(
-            torch.from_numpy(arr).to(self._device), requires_grad=gradient
+            tensor.to(self._device), requires_grad=gradient
         )
 
     def _generate_state_dict(self) -> OrderedDict:
@@ -868,7 +990,9 @@ class TensorSerializer:
         self._file.write(TENSORIZER_MAGIC)
 
         # Write the version number.
-        self._file.write(struct.pack("<I", TENSORIZER_VERSION))
+        self._version_loc = self._file.tell()
+        self._version = NON_OPAQUE_TENSORIZER_VERSION
+        self._file.write(struct.pack("<I", self._version))
 
         # Reserve 32 bytes for the hash. (Unused for now)
         self._hash_loc = self._file.tell()
@@ -944,16 +1068,25 @@ class TensorSerializer:
             logger.info(f"Comp'd bytes: {self.total_compressed_tensor_bytes}")
             logger.info(f"Ratio: {compression_ratio:.2f}")
 
-    def _sync_prologue_state(self):
+    def _sync_prologue_state(self, update_version: bool = False):
         """
         This is called after the tensor has been written to the file, and
         ensures that the file is in a consistent state.
+
+        Args:
+            update_version: If true, the file's version will be updated to
+                `self._version`.
         """
         curr = self._file.tell()
 
         # Write our zero-length field, that indicates that this is the last
         # tensor. This will be overwritten if another tensor is written.
         self._file.write(struct.pack("<Q", 0))
+
+        if update_version:
+            self._file.seek(self._version_loc)
+            self._file.write(struct.pack("<I", self._version))
+
         # Write the total number of tensors.
         self._file.seek(self._tensor_ct_loc)
         self._file.write(struct.pack("<Q", self._tensors))
@@ -1010,10 +1143,23 @@ class TensorSerializer:
         """
 
         if isinstance(tensor, torch.Tensor):
-            tensor = tensor.cpu().detach().numpy()
+            numpy_tensor = _NumpyTensor.from_tensor(tensor)
+        else:
+            numpy_tensor = _NumpyTensor.from_array(tensor)
 
-        if len(str(tensor.dtype)) >= 256:
-            raise ValueError("dtype length should be less than 256")
+        dtype_name = numpy_tensor.numpy_dtype
+        update_version = False
+        if numpy_tensor.is_opaque:
+            # The datatype name needs to contain both the numpy dtype that the
+            # data is serialized as and the original torch dtype.
+            dtype_name += OPAQUE_DTYPE_SEP + numpy_tensor.torch_dtype
+
+            if self._version != TENSORIZER_VERSION:
+                self._version = TENSORIZER_VERSION
+                update_version = True
+
+        if len(dtype_name) >= 256:
+            raise ValueError("dtype name length should be less than 256")
 
         # Reserve room for our tensor header size.
         ds_header_begin = self._file.tell()
@@ -1031,13 +1177,13 @@ class TensorSerializer:
         self._file.write(name_bytes)
 
         # Write out our tensor dtype
-        dtype_bytes = bytes(tensor.dtype.str, "utf-8")
+        dtype_bytes = bytes(dtype_name, "utf-8")
         dtype_len = len(dtype_bytes)
         self._file.write(struct.pack("<B", dtype_len))
         self._file.write(dtype_bytes)
 
         # ... and shape
-        shape_bytes = self._dump_shape(tensor.shape)
+        shape_bytes = self._dump_shape(numpy_tensor.data.shape)
         self._file.write(shape_bytes)
 
         # Reserve room for our tensor hashes.
@@ -1084,7 +1230,7 @@ class TensorSerializer:
             #       may want to do model compression.
             # Create a write buffer to compress our tensor serialization.
             tensor_buffer = tempfile.TemporaryFile()
-            tensor.tofile(tensor_buffer)
+            numpy_tensor.data.tofile(tensor_buffer)
             tensor_raw_sz = tensor_buffer.tell()
             self.total_tensor_bytes += tensor_raw_sz
             tensor_buffer.seek(0)
@@ -1097,7 +1243,7 @@ class TensorSerializer:
                 self.total_compressed_tensor_bytes += tensor_raw_sz
 
         # Serialize our tensors
-        tensor.tofile(self._file)
+        numpy_tensor.data.tofile(self._file)
         tensor_endpos = self._file.tell()
 
         # Go back and write our tensor length out
@@ -1149,7 +1295,7 @@ class TensorSerializer:
         self._tensors += 1
 
         # Update our prolog and epilog.
-        self._sync_prologue_state()
+        self._sync_prologue_state(update_version=update_version)
 
         ds_size = self._file.tell() - ds_header_begin
         ds_bytes = f"{ds_size:,} bytes"

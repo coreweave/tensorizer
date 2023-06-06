@@ -351,6 +351,63 @@ The `state_dict` can also be used to initialize a HuggingFace Transformers
 AutoModel. But HuggingFace Transformers performs three or more copies of
 the data, so memory use will explode.
 
+### `bfloat16` Support
+
+Tensorizer supports models using the `bfloat16` data type. However, tensorizer
+uses numpy to save the tensors as binary and numpy doesn't support `bfloat16`.
+This means that special conversions need to be applied.
+
+To be saved, the torch tensor is cast to `int16` before being converted to
+numpy, which doesn't change any of the underlying data. When serialized, the
+original `bfloat16` datatype string is also saved so that it will be cast back
+to `bfloat16` during the deserialization process.
+
+The `complex32` datatype is supported in a similar way, by casting to `int32`.
+The quantized datatypes (`qint8`, `qint32`, etc.) are not currently supported
+by tensorizer as they would require supplemental quantization parameters to be
+deserialized correctly.
+
+**NOTE:** The exact choice of intermediate types as `int16` and `int32` is
+considered an implementation detail, and is subject to change,
+so they should not be relied upon.
+
+**NOTE2:** This does not interfere with storing actual `int` datatypes
+used in tensors in tensorized files.
+
+### Numpy Support
+
+Tensorizer can be used with `numpy` directly to read and write
+`numpy.ndarray`s.
+
+The serializer's `write_tensor` function handles supplying both
+`torch.Tensor`s and `numpy.ndarray`s.
+
+The deserializer has a separate function `read_numpy_arrays` that will return
+the data as `numpy.ndarray`s.
+
+As explained above in [bfloat16 support](#bfloat16-support), tensorizer uses
+special conversions to write "opaque" datatypes, those not supported by numpy.
+Therefore, special considerations need to be taken when loading such data as
+`numpy.ndarray`s.
+
+By default, the `TensorDeserializer.read_numpy_arrays` function sets its
+`allow_raw_data` parameter to `False`. This means that if a file contains
+opaque datatypes, a `ValueError` will be raised during deserialization.
+
+If you want to return the raw data regardless, set `allow_raw_data` to `True`.
+Otherwise, the file may be read with `TensorDeserializer.read_tensors`
+instead, which yields `torch.Tensor` objects of the correct datatype.
+
+A fifth and sixth variable are also returned by the `read_numpy_arrays`
+generator. The fifth is a `bool` that indicates whether the returned array
+has an opaque datatype and requires special handling (only legal when
+`allow_raw_data=True`). The sixth is a string describing the true, non-numpy
+datatype that the raw data should be interpreted as in such cases.
+For all other datatypes that require no special handling, these are returned as
+`False` and `None`, respectively.
+The exact numpy datatypes used by the returned opaque `numpy.ndarray` objects
+is not guaranteed, and should not be relied upon.
+
 ## Running Tests
 `tensorizer` uses `unittest` for testing.
 The tests have their own set of dependencies, which can be installed with
