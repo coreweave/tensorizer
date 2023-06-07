@@ -180,19 +180,21 @@ class TensorDeserializer(collections.abc.Mapping):
         # If device is None, use the current device, otherwise use the given
         # device.
         device = utils.get_device() if device is None else torch.device(device)
-        self._device = device
+        self._device: torch.device = device
 
-        self._dtype = dtype
+        self._dtype: Optional[torch.dtype] = dtype
+
+        self._plaid_mode: bool = plaid_mode
+
+        # plaid_mode implies lazy_load
+        self._lazy_load: bool = lazy_load or plaid_mode
 
         self._metadata: Dict[str, TensorEntry] = {}
 
-        if plaid_mode and (
+        if self._plaid_mode and (
             not torch.cuda.is_available() or self._device.type == "cpu"
         ):
             raise ValueError("Plaid mode requires CUDA")
-
-        # plaid_mode implies lazy_load
-        self._lazy_load = lazy_load or plaid_mode
 
         # Read the magic
         magic = self._file.read(5)
@@ -227,7 +229,6 @@ class TensorDeserializer(collections.abc.Mapping):
         # all tensors are read.
         self._load_metadatas(filter_func)
 
-        self._plaid_mode: bool = plaid_mode
         self._prior_key: Optional[str] = None
 
         # We calculate the total tensor bytes here so that we can use mmap,
@@ -245,7 +246,7 @@ class TensorDeserializer(collections.abc.Mapping):
         # allocate a buffer for the largest tensor.
         self._buffer_addr = None
         self._is_memory_pinned = False
-        if not lazy_load and not plaid_mode:
+        if not self._lazy_load and not self._plaid_mode:
             start_allocate = time.time()
 
             # Check if our platform supports mmap.MAP_ANONYMOUS and
@@ -294,7 +295,7 @@ class TensorDeserializer(collections.abc.Mapping):
         # The offset in the file where the tensor data begins.
         self._tensors_begin = self._file.tell()
 
-        if not lazy_load:
+        if not self._lazy_load:
             # If we're not in lazy_load mode, we populate the cache with all
             # the tensors.
             self._cache = self._generate_state_dict()
