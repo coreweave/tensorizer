@@ -1,11 +1,16 @@
 import contextlib
 import os
+import re
 import unittest
+from unittest.mock import patch
 
 import boto3
 import moto
 
 from tensorizer import stream_io
+
+# Logging of Boto3 ops in case you need it for moto confirmation.
+#boto3.set_stream_logger(name='botocore')
 
 NEO_URL = (
     "https://raw.githubusercontent.com/EleutherAI/gpt-neo/master/README.md"
@@ -109,6 +114,7 @@ def mock_server():
 
 class TestS3(unittest.TestCase):
     endpoint: str
+    region: str
     BUCKET_NAME: str
     ACCESS_KEY: str
     SECRET_KEY: str
@@ -119,6 +125,7 @@ class TestS3(unittest.TestCase):
         # Sets up a mock S3 environment with moto.
         # Can be replaced for testing without mocks.
         cls.endpoint = "https://" + stream_io.default_s3_write_endpoint
+        cls.region = 'ord1' # must match the region for the endpoint above
         cls.BUCKET_NAME = "test-bucket"
         (
             cls.mock_s3,
@@ -137,7 +144,13 @@ class TestS3(unittest.TestCase):
         self.mock_s3.start()
         s3 = boto3.resource("s3", endpoint_url=self.endpoint)
         bucket = s3.Bucket(self.BUCKET_NAME)
-        bucket.create()
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/bucket/create.html
+        bucket.create(
+            CreateBucketConfiguration={
+                # This must match the test endpoints name
+                'LocationConstraint': self.region,
+            },
+        )
 
     def tearDown(self) -> None:
         self.mock_s3.stop()
@@ -155,6 +168,7 @@ class TestS3(unittest.TestCase):
         obj = s3.Object(self.BUCKET_NAME, key)
         obj.put(Body=content)
 
+    @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_upload(self):
         key = "model.tensors"
         s = stream_io.open_stream(
@@ -169,6 +183,49 @@ class TestS3(unittest.TestCase):
         s.close()
         self.assert_bucket_contents(key, long_string)
 
+    @patch.object(stream_io, "_s3_default_config_paths", ())
+    def test_download_url(self):
+        # s3_download_url does interesting things with passing a config, so
+        # needs specific test handling.
+        with mock_server() as endpoint:
+            key = "model.tensors"
+            url = stream_io._s3_download_url(
+                path_uri=f"s3://{self.BUCKET_NAME}/{key}",
+                s3_access_key_id="X",
+                s3_secret_access_key="X",
+                s3_endpoint=endpoint,
+            )
+            # http://127.0.0.1:5000/test-bucket/model.tensors?AWSAccessKeyId=x&Signature=x&Expires=1690783200
+            # http://127.0.0.1:5000/test-bucket/model.tensors?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=X%2F20230803%2Ford1%2Fs3%2Faws4_request&X-Amz-Date=20230803T204528Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=x
+
+            # TODO: add test for s3_access_key_id="" => unsigned
+            self.assertRegex(url, re.escape(f'{self.BUCKET_NAME}/{key}?'))
+            V4_regex = [
+                r'X-Amz-Expires=[0-9]+',
+                r'X-Amz-Credential=[A-Z]+',
+            ]
+            V2_regex = [
+                r'Expires=1[0-9]+',
+                r'AWSAccessKeyId=[A-Z]+',
+            ]
+
+            # This should be tweaked to say if it's meant to be v4 or v2
+            if 'X-Amz-Algorithm=' in url:
+                regex_present = V4_regex
+                regex_absent = V2_regex
+            elif 'AWSAccessKeyId=' in url:
+                regex_present = V2_regex
+                regex_absent = V4_regex
+            else:
+                regex_present = []
+                regex_absent = V4_regex + V2_regex
+
+            for r in regex_present:
+                self.assertRegex(url, r)
+            for r in regex_absent:
+                self.assertNotRegex(url, r)
+
+    @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_download(self):
         # CURLStreamFiles ignore moto's normal mocks, since moto still
         # generates a real URL when a real endpoint is used, so instead
