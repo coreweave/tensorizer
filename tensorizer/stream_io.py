@@ -137,6 +137,7 @@ class CURLStreamFile:
             "Accept-Encoding: identity",
             "-s",
             "-f",
+            "--raw",
             uri,
         ]
 

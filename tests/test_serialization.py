@@ -319,3 +319,41 @@ class TestDeserialization(unittest.TestCase):
             assert custom_keys == expected_custom_keys
             check_deserialized(deserialized, model_name, allow_subset=True)
             deserialized.close()
+
+class TestVerification(unittest.TestCase):
+    def test_verification(self):
+        for device in "cuda", "cpu":
+            if device == "cuda" and not is_cuda_available:
+                continue
+            with self.subTest(msg=f"Verifying hashes with device {device}"):
+                serialized_model, orig_sd = serialize_model(model_name, device)
+                del orig_sd
+                try:
+                    with open(serialized_model, "rb") as in_file:
+                        deserialized = TensorDeserializer(in_file,
+                                                          device=device,
+                                                          verify_hash=True)
+                        check_deserialized(deserialized, model_name)
+                        deserialized.close()
+                        del deserialized
+                finally:
+                    os.unlink(serialized_model)
+
+    def test_module_verification(self):
+        for device in "cuda", "cpu":
+            if device == "cuda" and not is_cuda_available:
+                continue
+            with self.subTest(msg=f"Verifying hashes with device {device}"):
+                serialized_model, orig_sd = serialize_model(model_name, device)
+                del orig_sd
+                try:
+                    with open(serialized_model, "rb") as in_file:
+                        deserialized = TensorDeserializer(in_file, device="cpu")
+                        deserialized.close()
+                        model_to_verify = AutoModelForCausalLM.from_pretrained(
+                            model_name).to(device)
+                        deserialized.verify_module(model_to_verify)
+                        del model_to_verify
+                        del deserialized
+                finally:
+                    os.unlink(serialized_model)
