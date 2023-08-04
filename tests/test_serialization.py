@@ -39,7 +39,11 @@ def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
 
 
 def check_deserialized(deserialized, model_name: str, allow_subset=False):
-    orig_sd = AutoModelForCausalLM.from_pretrained(model_name).state_dict()
+    orig_model = AutoModelForCausalLM.from_pretrained(model_name)
+    orig_sd = orig_model.state_dict()
+    # Non-persistent buffers are serialized in tensorizer,
+    # but aren't included in a state_dict() in PyTorch.
+    orig_sd.update(orig_model.named_buffers())
     if not allow_subset:
         assert orig_sd.keys() == deserialized.keys()
     for k, v in deserialized.items():
@@ -55,7 +59,7 @@ def check_deserialized(deserialized, model_name: str, allow_subset=False):
 
         assert torch.all(orig_sd[k].to(v.device) == v)
         # fmt: on
-    del orig_sd
+    del orig_model, orig_sd
     gc.collect()
 
 
