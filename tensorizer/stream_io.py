@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import boto3
+import botocore
 
 import tensorizer._wide_pipes as _wide_pipes
 
@@ -367,12 +368,10 @@ def _ensure_https_endpoint(endpoint: str):
         raise ValueError("Non-HTTPS endpoint URLs are not allowed.")
 
 
-def s3_upload(
-    path: str,
-    target_uri: str,
+def _new_s3_client(
     s3_access_key_id: str,
     s3_secret_access_key: str,
-    s3_endpoint: str = default_s3_write_endpoint,
+    s3_endpoint: str,
 ):
     if s3_secret_access_key is None:
         raise TypeError("No secret key provided")
@@ -381,16 +380,35 @@ def s3_upload(
     if s3_endpoint is None:
         raise TypeError("No S3 endpoint provided")
 
-    client = boto3.session.Session.client(
+    if s3_access_key_id == s3_secret_access_key == "":
+        auth_args = dict(
+            config=boto3.session.Config(signature_version=botocore.UNSIGNED)
+        )
+    else:
+        auth_args = dict(
+            aws_access_key_id=s3_access_key_id,
+            aws_secret_access_key=s3_secret_access_key,
+        )
+
+    return boto3.session.Session.client(
         boto3.session.Session(),
         endpoint_url=_ensure_https_endpoint(s3_endpoint),
         service_name="s3",
-        aws_access_key_id=s3_access_key_id,
-        aws_secret_access_key=s3_secret_access_key,
+        **auth_args,
     )
+
+
+def s3_upload(
+    path: str,
+    target_uri: str,
+    s3_access_key_id: str,
+    s3_secret_access_key: str,
+    s3_endpoint: str = default_s3_write_endpoint,
+):
     path_uri = urlparse(target_uri)
     bucket = path_uri.netloc
     key = path_uri.path.lstrip("/")
+    client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint)
 
     client.upload_file(path, bucket, key)
 
@@ -401,23 +419,10 @@ def s3_download(
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
 ) -> CURLStreamFile:
-    if s3_secret_access_key is None:
-        raise TypeError("No secret key provided")
-    if s3_access_key_id is None:
-        raise TypeError("No access key provided")
-    if s3_endpoint is None:
-        raise TypeError("No S3 endpoint provided")
-
-    client = boto3.session.Session.client(
-        boto3.session.Session(),
-        endpoint_url=_ensure_https_endpoint(s3_endpoint),
-        service_name="s3",
-        aws_access_key_id=s3_access_key_id,
-        aws_secret_access_key=s3_secret_access_key,
-    )
     path_uri = urlparse(path_uri)
     bucket = path_uri.netloc
     key = path_uri.path.lstrip("/")
+    client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint)
 
     url = client.generate_presigned_url(
         ClientMethod="get_object",
