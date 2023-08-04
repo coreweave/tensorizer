@@ -583,7 +583,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 if sha_digest != hash['hash']:
                     raise RuntimeError(
                         f"Tensor '{name}' failed SHA256 verification. "
-                        f"Expected {hash['hash']}, got {sha}."
+                        f"Expected {hash['hash']}, got {sha_digest}."
                     )
             else:
                 raise RuntimeError(
