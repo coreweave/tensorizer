@@ -399,6 +399,17 @@ def _new_s3_client(
     )
 
 
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    uri_components = urlparse(uri)
+
+    if uri_components.scheme.lower() != "s3":
+        raise ValueError(f"Invalid S3 URI: {uri}")
+
+    bucket = uri_components.netloc
+    key = uri_components.path.lstrip("/")
+    return bucket, key
+
+
 def s3_upload(
     path: str,
     target_uri: str,
@@ -406,11 +417,8 @@ def s3_upload(
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_write_endpoint,
 ):
-    path_uri = urlparse(target_uri)
-    bucket = path_uri.netloc
-    key = path_uri.path.lstrip("/")
+    bucket, key = _parse_s3_uri(target_uri)
     client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint)
-
     client.upload_file(path, bucket, key)
 
 
@@ -420,11 +428,8 @@ def s3_download(
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
 ) -> CURLStreamFile:
-    path_uri = urlparse(path_uri)
-    bucket = path_uri.netloc
-    key = path_uri.path.lstrip("/")
+    bucket, key = _parse_s3_uri(path_uri)
     client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint)
-
     url = client.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
