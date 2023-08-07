@@ -1023,7 +1023,7 @@ class TensorDeserializer(collections.abc.Mapping):
                     f"Module {obj_path} does not have attribute {attr}"
                 )
             if "hashes" not in entry:
-                raise RuntimeError(f"No hashes found in metadata for {name}. "
+                raise RuntimeError(f"No hashes found in metadata for {name}."
                                    " This is usually caused by a "
                                    " TensorDeserializer that was instantiated"
                                    " with lazy_load=True, and not" f" loaded"
