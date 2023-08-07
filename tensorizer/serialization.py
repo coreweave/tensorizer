@@ -690,7 +690,9 @@ class TensorDeserializer(collections.abc.Mapping):
                 hashes_end = hashes_begin + hashes_sz + 2
                 hashes_slice = headers[hashes_begin + 2: hashes_end]
                 hashes = self._decode_hashes(hashes_slice)
-                self._metadata[name]["hashes"] = hashes
+
+                if name in self.keys():
+                    self._metadata[name]["hashes"] = hashes
 
                 # Finally, get the tensor data length.
                 data_length = struct.unpack("<q", headers[header_len - 8:])[0]
@@ -704,6 +706,8 @@ class TensorDeserializer(collections.abc.Mapping):
                 ):
                     self._file.seek(data_length, io.SEEK_CUR)
                     continue
+
+
 
                 # We use memoryview to avoid copying the data.
                 mv: memoryview
