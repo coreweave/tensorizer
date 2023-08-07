@@ -992,7 +992,7 @@ class TensorDeserializer(collections.abc.Mapping):
             elif entry["type"] is TensorType.STATE_DICT:
                 raise NotImplementedError(
                     "This was serialized using the write_state_dict() method,"
-                    " and cannot be loaded using the load_into_tensors() method."
+                    " and cannot be loaded using the load_into_module() method."
                     " Use the TensorDeserializer object directly as a"
                     " state_dict mapping instead."
                 )
