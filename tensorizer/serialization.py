@@ -1022,6 +1022,12 @@ class TensorDeserializer(collections.abc.Mapping):
                 raise ValueError(
                     f"Module {obj_path} does not have attribute {attr}"
                 )
+            if "hashes" not in entry:
+                raise RuntimeError(f"No hashes found in metadata for {name}. "
+                                   " This is usually caused by a "
+                                   " TensorDeserializer that was instantiated"
+                                   " with lazy_load=True, and not" f" loaded"
+                                   " into a module before calling this.")
             numpy_tensor = _NumpyTensor.from_tensor(getattr(module, attr))
             self._verify_hashes(name,
                                 entry["hashes"],
