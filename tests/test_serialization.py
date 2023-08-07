@@ -352,12 +352,14 @@ class TestVerification(unittest.TestCase):
                 del orig_sd
                 try:
                     with open(serialized_model, "rb") as in_file:
-                        deserialized = TensorDeserializer(in_file, device="cpu")
-                        deserialized.close()
+                        deserialized = TensorDeserializer(
+                            in_file, device=device
+                        )
                         model_to_verify = AutoModelForCausalLM.from_pretrained(
-                            model_name).to(device)
+                            model_name
+                        ).to(device)
                         deserialized.verify_module(model_to_verify)
-                        del model_to_verify
-                        del deserialized
+                        deserialized.close()
+                        del model_to_verify, deserialized
                 finally:
                     os.unlink(serialized_model)
