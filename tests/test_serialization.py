@@ -358,7 +358,36 @@ class TestVerification(unittest.TestCase):
                         model_to_verify = AutoModelForCausalLM.from_pretrained(
                             model_name
                         ).to(device)
-                        deserialized.verify_module(model_to_verify)
+                        result, tensor_status = deserialized.verify_module(
+                            model_to_verify)
+                        assert result
+                        for tensor_name, status in tensor_status:
+                            assert status, f"Tensor {tensor_name} failed"
+                        deserialized.close()
+                        del model_to_verify, deserialized
+                finally:
+                    os.unlink(serialized_model)
+
+    def test_module_verification_fail(self):
+        for device in "cuda", "cpu":
+            if device == "cuda" and not is_cuda_available:
+                continue
+            with self.subTest(msg=f"Verifying hashes with device {device}"):
+                serialized_model, orig_sd = serialize_model(model_name, device)
+                del orig_sd
+                try:
+                    with open(serialized_model, "rb") as in_file:
+                        deserialized = TensorDeserializer(
+                            in_file, device=device
+                        )
+                        model_to_verify = AutoModelForCausalLM.from_pretrained(
+                            model_name
+                        ).to(device)
+                        model_to_verify.transformer.h[0].ln_2 = \
+                            torch.nn.LayerNorm(768, 768)
+                        result, tensor_status = deserialized.verify_module(
+                            model_to_verify)
+                        assert not result
                         deserialized.close()
                         del model_to_verify, deserialized
                 finally:

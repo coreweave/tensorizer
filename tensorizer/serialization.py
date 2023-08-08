@@ -87,6 +87,8 @@ class TensorEntry(typing.TypedDict):
     hashes: List[TensorHash]
     raw_headers: bytes
 
+class HashMismatchError(Exception):
+    pass
 
 class TensorDeserializer(collections.abc.Mapping):
     """
@@ -114,6 +116,9 @@ class TensorDeserializer(collections.abc.Mapping):
             buffers are going to be inconsistent due to the extreme
             naughtiness of reusing a backing buffer. This is only recommended
             for use with inference, and not training.
+        verify_hash: If True, the hashes of each tensor will be verified
+            against the hashes stored in the metadata. A HashMismatchError
+            will be raised if any of the hashes do not match.
 
     Examples:
         Deserializing a pre-serialized_ 16-bit ``transformers`` model from S3::
@@ -572,7 +577,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 crc = zlib.crc32(mv, zlib.crc32(headers))
                 hash_crc = struct.unpack("<I", hash['hash'])[0]
                 if crc != hash_crc:
-                    raise RuntimeError(
+                    raise HashMismatchError(
                         f"Tensor '{name}' failed CRC32 verification. "
                         f"Expected {hash_crc}, got {crc}."
                     )
@@ -581,12 +586,12 @@ class TensorDeserializer(collections.abc.Mapping):
                 sha.update(mv)
                 sha_digest = sha.digest()
                 if sha_digest != hash['hash']:
-                    raise RuntimeError(
+                    raise HashMismatchError(
                         f"Tensor '{name}' failed SHA256 verification. "
                         f"Expected {hash['hash']}, got {sha_digest}."
                     )
             else:
-                raise RuntimeError(
+                raise HashMismatchError(
                     f"Tensor '{name}' has an invalid hash type: "
                     f"{hash['type']}"
                 )
@@ -618,6 +623,11 @@ class TensorDeserializer(collections.abc.Mapping):
                 will be read. If the zero-byte header is encountered before
                 `num_tensors` tensors are read, the generator will stop
                 yielding values.
+            verify_hash: If True, the hashes of each tensor will be verified
+                against the hashes stored in the metadata. A
+                `HashMismatchError` will be raised if any of the hashes do
+                not match. If `None`, the value of the `verify_hash` argument
+                passed to the constructor will be used.
         """
         if verify_hash is None:
             verify_hash = self._verify_hash
@@ -706,8 +716,6 @@ class TensorDeserializer(collections.abc.Mapping):
                 ):
                     self._file.seek(data_length, io.SEEK_CUR)
                     continue
-
-
 
                 # We use memoryview to avoid copying the data.
                 mv: memoryview
@@ -812,7 +820,6 @@ class TensorDeserializer(collections.abc.Mapping):
         is opaque, and the name of the true datatype represented by the opaque
         data, if applicable.
 
-
         "Opaque data" refers to numpy arrays holding accurate raw binary data
         but an invalid dtype attribute, occurring when there is no numpy dtype
         corresponding to the original type that was serialized.
@@ -827,6 +834,7 @@ class TensorDeserializer(collections.abc.Mapping):
         corresponding to ``torch.bfloat16``, attempting to deserialize the same
         file via `TensorDeserializer.read_numpy_arrays()` will raise a
         ``ValueError``.
+
         However, if `allow_raw_data` is set to ``True``, then
         `TensorDeserializer.read_numpy_arrays()` will return these
         arrays regardless, and the final two values of the yielded tuple,
@@ -834,8 +842,6 @@ class TensorDeserializer(collections.abc.Mapping):
         representing the true non-numpy datatype represented by the data,
         respectively. Special handling is then required to use the returned
         data accurately.
-
-
 
         Note that this function does not seek to the beginning of the tensor
         data. It assumes that the file pointer is already at the beginning
@@ -1002,13 +1008,19 @@ class TensorDeserializer(collections.abc.Mapping):
         return tensor_ct
 
     def verify_module(self,
-                      m: torch.nn.Module) -> None:
+                      m: torch.nn.Module) -> Tuple[bool, List[Tuple[str, bool]]]:
         """
         Given `m`, a torch.nn.Module, verify that the tensors in this
         Tensorizer object match the tensors in the `torch.nn.Module`.
-        Mismatches will raise a ValueError.
+
+        Returns a boolean indicating whether the verification passed, and
+        a list of tuples of (tensor_name, bool) indicating whether the
+        verification passed for each tensor.
         """
         modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
+
+        passed = True
+        results: List[Tuple[str, bool]] = []
 
         for name, module in m.named_modules():
             modules[name] = module
@@ -1019,9 +1031,8 @@ class TensorDeserializer(collections.abc.Mapping):
             entry = self._metadata[name]
             # Check if the module has the attribute
             if not hasattr(module, attr):
-                raise ValueError(
-                    f"Module {obj_path} does not have attribute {attr}"
-                )
+                results.append((name, False))
+                passed = False
             if "hashes" not in entry:
                 raise RuntimeError(f"No hashes found in metadata for {name}."
                                    " This is usually caused by a "
@@ -1029,10 +1040,17 @@ class TensorDeserializer(collections.abc.Mapping):
                                    " with lazy_load=True, and not" f" loaded"
                                    " into a module before calling this.")
             numpy_tensor = _NumpyTensor.from_tensor(getattr(module, attr))
-            self._verify_hashes(name,
-                                entry["hashes"],
-                                entry["raw_headers"],
-                                numpy_tensor.data.tobytes())
+            try:
+                self._verify_hashes(name,
+                                    entry["hashes"],
+                                    entry["raw_headers"],
+                                    numpy_tensor.data.tobytes())
+                results.append((name, True))
+            except HashMismatchError:
+                results.append((name, False))
+                passed = False
+
+        return passed, results
 
 class TensorSerializer:
     """
