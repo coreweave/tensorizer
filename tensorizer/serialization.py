@@ -1017,6 +1017,8 @@ class TensorDeserializer(collections.abc.Mapping):
         a list of tuples of (tensor_name, bool) indicating whether the
         verification passed for each tensor.
         """
+        # TODO: Account for the case where the module has more tensors than
+        #  what's serialized.
         modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
 
         passed = True
