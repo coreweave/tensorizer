@@ -1,17 +1,24 @@
-import time
 import os
-from typing import Optional, Dict, List
-
-import torch
+import time
 from collections import defaultdict
 from pathlib import Path
-from tensorizer import TensorSerializer
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import Dict, List, Optional
+
+import torch
 from safetensors.torch import save_file
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from tensorizer import TensorSerializer
 
 MODEL_ID = os.environ.get("MODEL_ID", "EleutherAI/gpt-neo-125M")
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", "./models"))
-USE_FP16 = os.environ.get("USE_FP16", "").strip().lower() not in ("", "0", "no", "f", "false")
+USE_FP16 = os.environ.get("USE_FP16", "").strip().lower() not in (
+    "",
+    "0",
+    "no",
+    "f",
+    "false",
+)
 NUM_TRIALS = int(os.environ.get("NUM_TRIALS", 1))
 
 if USE_FP16:
@@ -44,8 +51,7 @@ def shared_pointers(tensors) -> List:
 
 
 def convert_shared_tensors(
-    pt_filename: Optional[str] = None,
-    state_dict=None
+    pt_filename: Optional[str] = None, state_dict=None
 ) -> Dict:
     """
     Clone data shared between tensors.
@@ -90,7 +96,10 @@ def save_tzr() -> float:
     serializer.close()
     end = time.time()
 
-    print(f"Serialized {serializer.total_tensor_bytes} btyes in {end - start:0.2f}s")
+    print(
+        f"Serialized {serializer.total_tensor_bytes} bytes in"
+        f" {end - start:0.2f}s"
+    )
     return end - start
 
 
