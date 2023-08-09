@@ -703,16 +703,15 @@ class TensorDeserializer(collections.abc.Mapping):
                     shape_len,
                 )
 
-                # Read our hashes in. We need to read the hashes size, then
-                # read the hash bytes.
-                hashes_begin = shape_end
-                hashes_sz_slice = headers[hashes_begin : hashes_begin + 2]
-                hashes_sz = struct.unpack("<H", hashes_sz_slice)[0]
-                hashes_end = hashes_begin + hashes_sz + 2
-                hashes_slice = headers[hashes_begin + 2 : hashes_end]
-                hashes = self._decode_hashes(hashes_slice)
-
                 if name in self.keys():
+                    # Read our hashes in. We need to read the hashes size, then
+                    # read the hash bytes.
+                    hashes_begin = shape_end
+                    hashes_sz_slice = headers[hashes_begin : hashes_begin + 2]
+                    hashes_sz = struct.unpack("<H", hashes_sz_slice)[0]
+                    hashes_end = hashes_begin + hashes_sz + 2
+                    hashes_slice = headers[hashes_begin + 2 : hashes_end]
+                    hashes = self._decode_hashes(hashes_slice)
                     self._metadata[name]["hashes"] = hashes
 
                 # Finally, get the tensor data length.
@@ -1087,7 +1086,6 @@ class TensorDeserializer(collections.abc.Mapping):
         #  what's serialized.
         modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
 
-        passed = True
         results: List[Tuple[str, bool]] = []
 
         for name, module in m.named_modules():
@@ -1100,7 +1098,7 @@ class TensorDeserializer(collections.abc.Mapping):
             # Check if the module has the attribute
             if not hasattr(module, attr):
                 results.append((name, False))
-                passed = False
+                continue
             if "hashes" not in entry:
                 raise RuntimeError(
                     f"No hashes found in metadata for {name}. This is usually"
@@ -1110,18 +1108,18 @@ class TensorDeserializer(collections.abc.Mapping):
                 )
             numpy_tensor = _NumpyTensor.from_tensor(getattr(module, attr))
             try:
-                self._verify_hashes(
-                    name,
-                    entry["hashes"],
-                    entry["raw_headers"],
-                    numpy_tensor.data.tobytes(),
-                )
+                with memoryview(numpy_tensor).cast("B") as mv:
+                    self._verify_hashes(
+                        name,
+                        entry["hashes"],
+                        entry["raw_headers"],
+                        mv,
+                    )
                 results.append((name, True))
             except HashMismatchError:
                 results.append((name, False))
-                passed = False
 
-        return passed, results
+        return all(result for name, result in results), results
 
 
 class TensorSerializer:
