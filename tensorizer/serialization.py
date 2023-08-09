@@ -122,6 +122,10 @@ class TensorDeserializer(collections.abc.Mapping):
             against the hashes stored in the metadata. A `HashMismatchError`
             will be raised if any of the hashes do not match.
 
+    Raises:
+        HashMismatchError: If ``verify_hash=True`` and a deserialized tensor
+            does not match its stored hash.
+
     Examples:
         Deserializing a pre-serialized_ 16-bit ``transformers`` model from S3::
 
@@ -179,8 +183,9 @@ class TensorDeserializer(collections.abc.Mapping):
         plaid_mode: bool = False,
         verify_hash: bool = False,
     ):
-        # Whether to verify the hashes of the tensors when they are loaded. This value
-        # is used when no verify_hash argument is passed to the tensor loading methods.
+        # Whether to verify the hashes of the tensors when they are loaded.
+        # This value is used when no verify_hash argument is passed to the
+        # tensor loading methods.
         self._verify_hash = verify_hash
 
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
@@ -626,10 +631,14 @@ class TensorDeserializer(collections.abc.Mapping):
                 `num_tensors` tensors are read, the generator will stop
                 yielding values.
             verify_hash: If True, the hashes of each tensor will be verified
-                against the hashes stored in the metadata. A
-                `HashMismatchError` will be raised if any of the hashes do
-                not match. If `None`, the value of the `verify_hash` argument
-                passed to the constructor will be used.
+                against the hashes stored in the metadata.
+                A `HashMismatchError` will be raised if any of the hashes do
+                not match. If ``None``, the value of the `verify_hash` argument
+                passed to the `TensorDeserializer` constructor will be used.
+
+        Raises:
+            HashMismatchError: If ``verify_hash`` resolves to True and
+            a deserialized tensor does not match its stored hash.
         """
         if verify_hash is None:
             verify_hash = self._verify_hash
@@ -870,6 +879,11 @@ class TensorDeserializer(collections.abc.Mapping):
                 uninterpretable opaque datatypes. If False and opaque
                 datatypes are encountered, then a `ValueError` is raised.
                 Defaults to False.
+            verify_hash: If True, the hashes of each tensor will be verified
+                against the hashes stored in the metadata.
+                A `HashMismatchError` will be raised if any of the hashes do
+                not match. If ``None``, the value of the `verify_hash` argument
+                passed to the `TensorDeserializer` constructor will be used.
 
         Yields:
             Tuples of the form:
@@ -890,6 +904,8 @@ class TensorDeserializer(collections.abc.Mapping):
         Raises:
             ValueError: If an opaque datatype is encountered in the file
                 and ``allow_raw_data=False``.
+            HashMismatchError: If ``verify_hash`` resolves to True and
+                a deserialized tensor does not match its stored hash.
         """
         if verify_hash is None:
             verify_hash = self._verify_hash
@@ -977,8 +993,15 @@ class TensorDeserializer(collections.abc.Mapping):
             filter_func: A function (tensor_name: str) -> bool that returns
                 True if a tensor should be loaded, or False if it should be
                 skipped.
-            verify_hash: Whether to verify the hash of the tensors as they
-                are loaded. If None, the value of the Tensorizer is used.
+            verify_hash: If True, the hashes of each tensor will be verified
+                against the hashes stored in the metadata.
+                A `HashMismatchError` will be raised if any of the hashes do
+                not match. If ``None``, the value of the `verify_hash` argument
+                passed to the `TensorDeserializer` constructor will be used.
+
+        Raises:
+            HashMismatchError: If ``verify_hash`` resolves to True and
+                a deserialized tensor does not match its stored hash.
         """
         modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
 
@@ -1017,12 +1040,34 @@ class TensorDeserializer(collections.abc.Mapping):
         self, m: torch.nn.Module
     ) -> Tuple[bool, List[Tuple[str, bool]]]:
         """
-        Given `m`, a torch.nn.Module, verify that the tensors in this
-        Tensorizer object match the tensors in the `torch.nn.Module`.
+        Given `m`, a ``torch.nn.Module``, verify that the tensors in this
+        `TensorDeserializer` match the tensors in the ``torch.nn.Module``.
 
         Returns a boolean indicating whether the verification passed, and
-        a list of tuples of (tensor_name, bool) indicating whether the
+        a list of tuples of ``(tensor_name, bool)`` indicating whether the
         verification passed for each tensor.
+
+        Args:
+            m: A ground truth module object to compare deserialized tensors
+                against. If any deserialized tensors differ from an entry
+                with the same name in `m`, this function will report that
+                verification failed.
+
+        Returns:
+             A 2-tuple ``(passed, results)`` where ``passed`` is a boolean
+             reporting if all checks passed, i.e. the overall result
+             of the verification, and ``results`` is a list of
+             ``(tensor_name, bool)`` tuples listing each tensor that was checked
+             and its individual verification result.
+             ``results`` can be used to tell which tensor failed verification
+             when ``passed`` is False.
+
+        Raises:
+            RuntimeError: If this function is called before tensor data and
+                hashes have been loaded, for instance when instantiating the
+                `TensorDeserializer` with ``lazy_load=True`` and then calling
+                this function prior to loading the tensors into a module.
+                If ``lazy_load=False``, this error case is impossible.
         """
         # TODO: Account for the case where the module has more tensors than
         #  what's serialized.
