@@ -33,6 +33,7 @@ num_hellos = 400
 is_cuda_available = torch.cuda.is_available()
 default_device = "cuda" if is_cuda_available else "cpu"
 salt = secrets.token_bytes(4)
+default_read_endpoint = "object.ord1.coreweave.com"
 
 
 def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
@@ -298,6 +299,7 @@ class TestDeserialization(unittest.TestCase):
         deserialized.close()
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
+    @patch.object(stream_io, "default_s3_read_endpoint", default_read_endpoint)
     def test_s3(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/model.tensors", device=default_device
@@ -307,6 +309,7 @@ class TestDeserialization(unittest.TestCase):
         deserialized.close()
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
+    @patch.object(stream_io, "default_s3_read_endpoint", default_read_endpoint)
     def test_s3_fp16(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/fp16/model.tensors",
@@ -319,6 +322,7 @@ class TestDeserialization(unittest.TestCase):
         deserialized.close()
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
+    @patch.object(stream_io, "default_s3_read_endpoint", default_read_endpoint)
     def test_s3_lazy_load(self):
         deserialized = TensorDeserializer(
             f"s3://tensorized/{model_name}/model.tensors",
