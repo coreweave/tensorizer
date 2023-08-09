@@ -1,11 +1,13 @@
-import torch
-import shutil
 import os
+import shutil
 import time
 from pathlib import Path
+
+import numpy as np
+import torch
+
 from tensorizer import TensorDeserializer
 from tensorizer.utils import convert_bytes, get_mem_usage
-import numpy as np
 
 # disable missing keys and unexpected key warnings
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -14,7 +16,7 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["SAFETENSORS_FAST_GPU"] = "1"
 
 from accelerate import init_empty_weights
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 def convert_to_bool(val: str) -> bool:
@@ -69,7 +71,7 @@ def hf_load() -> float:
         low_cpu_mem_usage=True,
         config=config,
         use_safetensors=False,
-        device_map="auto"
+        device_map="auto",
     )
     duration = time.time() - start
 
@@ -119,7 +121,7 @@ def st_load() -> float:
         low_cpu_mem_usage=True,
         config=config,
         use_safetensors=True,
-        device_map="auto"
+        device_map="auto",
     )
     end = time.time()
 
@@ -138,7 +140,9 @@ def st_load() -> float:
 if not SKIP_TZR:
     print("\nRunning Tensorizer...")
     tzr_times = [tzr_load() for _ in range(NUM_TRIALS)]
-    print("Average tensorizer deserialization:", sum(tzr_times) / len(tzr_times))
+    print(
+        "Average tensorizer deserialization:", sum(tzr_times) / len(tzr_times)
+    )
     with open(RES_PATH / f"tzr_times_{time.time()}.npy", "wb") as f:
         np.save(f, np.array(tzr_times))
 
