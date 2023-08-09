@@ -998,6 +998,10 @@ class TensorDeserializer(collections.abc.Mapping):
                 A `HashMismatchError` will be raised if any of the hashes do
                 not match. If ``None``, the value of the `verify_hash` argument
                 passed to the `TensorDeserializer` constructor will be used.
+                Only has an effect on tensors deserialized during this function
+                call. I.e., if ``lazy_load`` is False, all tensors will have
+                already been deserialized and checked (or not) prior to this
+                call, so the value of this parameter will affect nothing.
 
         Raises:
             HashMismatchError: If ``verify_hash`` resolves to True and
@@ -1019,7 +1023,17 @@ class TensorDeserializer(collections.abc.Mapping):
             obj_path, attr = name.rsplit(".", 1)
             module: torch.nn.Module = modules[obj_path]
             entry = self._metadata[name]
-            param = self._to_torch_parameter(self.get(name))
+
+            # Swap out self._verify_hash for our function-local
+            # verify_hash, since self.get() provides no mechanism
+            # propagate this function-local hash to its implicit loads.
+            global_verify_hash = self._verify_hash
+            try:
+                self._verify_hash = verify_hash
+                param = self._to_torch_parameter(self.get(name))
+            finally:
+                self._verify_hash = global_verify_hash
+
             if entry["type"] is TensorType.PARAM:
                 module.register_parameter(attr, param)
             elif entry["type"] is TensorType.BUFFER:
