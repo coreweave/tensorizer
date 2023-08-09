@@ -85,7 +85,7 @@ def check_deserialized(
     allow_subset: bool = False,
 ):
     orig_sd = model_digest(model_name)
-
+    
     if not allow_subset:
         test_case.assertEqual(
             orig_sd.keys(),
