@@ -604,7 +604,7 @@ class TensorDeserializer(collections.abc.Mapping):
                         f"Expected {hash_body}, got {sha_digest}."
                     )
             else:
-                raise HashMismatchError(
+                raise ValueError(
                     f"Tensor '{name}' has an invalid hash type: {hash_type}"
                 )
 
