@@ -119,7 +119,7 @@ class TensorDeserializer(collections.abc.Mapping):
             naughtiness of reusing a backing buffer. This is only recommended
             for use with inference, and not training.
         verify_hash: If True, the hashes of each tensor will be verified
-            against the hashes stored in the metadata. A HashMismatchError
+            against the hashes stored in the metadata. A `HashMismatchError`
             will be raised if any of the hashes do not match.
 
     Examples:
@@ -171,7 +171,7 @@ class TensorDeserializer(collections.abc.Mapping):
             os.PathLike,
             int,
         ],
-        device: Union[torch.device, str, None] = None,
+        device: Optional[Union[torch.device, str]] = None,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         dtype: Optional[torch.dtype] = None,
         *,
@@ -602,7 +602,7 @@ class TensorDeserializer(collections.abc.Mapping):
         self,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         num_tensors: int = -1,
-        verify_hash: Union[bool, None] = None,
+        verify_hash: Optional[bool] = None,
     ) -> Iterator[Tuple[int, int, str, _NumpyTensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
@@ -815,7 +815,7 @@ class TensorDeserializer(collections.abc.Mapping):
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         num_tensors: int = -1,
         allow_raw_data: bool = False,
-        verify_hash: Union[bool, None] = None,
+        verify_hash: Optional[bool] = None,
     ) -> Iterator[Tuple[int, int, str, numpy.ndarray, bool, Optional[str]]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
@@ -962,7 +962,7 @@ class TensorDeserializer(collections.abc.Mapping):
         self,
         m: torch.nn.Module,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-        verify_hash: Union[bool, None] = None,
+        verify_hash: Optional[bool] = None,
     ) -> int:
         """
         Given `m`, a torch.nn.Module, load the associate tensors in this
