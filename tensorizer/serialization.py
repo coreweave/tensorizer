@@ -515,26 +515,26 @@ class TensorDeserializer(collections.abc.Mapping):
         return self._metadata.keys()
 
     @staticmethod
-    def _decode_hashes(b: bytes) -> List[TensorHash]:
+    def _decode_hashes(b: memoryview) -> List[TensorHash]:
         """
         Decode the hashes from given bytes.
         """
         hashes: List[TensorHash] = []
 
         # Read the number of hashes.
-        num_hashes = struct.unpack("<B", b[0:1])[0]
+        num_hashes = b[0]
 
         hash_idx = 1
         # Read the hashes.
         for i in range(num_hashes):
             # Read the hash type.
-            hash_type = struct.unpack("<B", b[hash_idx : hash_idx + 1])[0]
+            hash_type = b[hash_idx]
             # Read the size of the hash.
-            hash_size = struct.unpack("<B", b[hash_idx + 1 : hash_idx + 2])[0]
+            hash_size = b[hash_idx + 1]
             # Read the hash.
             hash_begin = hash_idx + 2
             hash_end = hash_begin + hash_size
-            hash_bytes: bytes = b[hash_begin:hash_end]
+            hash_bytes = bytes(b[hash_begin:hash_end])
             # Add the hash to the list.
             hash_entry = TensorHash(
                 type=HashType(hash_type),
@@ -546,23 +546,26 @@ class TensorDeserializer(collections.abc.Mapping):
         return hashes
 
     @staticmethod
-    def _zero_hashes(b: bytes) -> bytes:
+    def _zero_hashes(b: memoryview) -> bytearray:
         """
-        Zero out the encoded hashes in the given bytes, and return the data structure
-        with the hashes zeroed out. This is used to prevent the hashes from being
-        part of hash computation of the entire data structure.
+        Zero out the encoded hashes in the given bytes,
+        and return the data structure with the hashes zeroed out.
+        This is used to prevent the hashes from being part of hash computation
+        of the entire data structure.
         """
         # Read the number of hashes.
-        num_hashes = struct.unpack("<B", b[0:1])[0]
-        zeroed_hashes = b[0:1]
+        num_hashes = b[0]
+        zeroed_hashes = bytearray(b)
 
         hash_idx = 1
         # Read the hashes.
         for i in range(num_hashes):
             # Read the size of the hash.
-            hash_size = struct.unpack("<B", b[hash_idx + 1 : hash_idx + 2])[0]
-            zeroed_hashes += b[hash_idx : hash_idx + 2] + b"\0" * hash_size
-            hash_idx = hash_idx + 2 + hash_size
+            hash_size = b[hash_idx + 1]
+            hash_begin = hash_idx + 2
+            hash_end = hash_begin + hash_size
+            zeroed_hashes[hash_begin:hash_end] = bytes(hash_size)
+            hash_idx = hash_end
         return zeroed_hashes
 
     @staticmethod
@@ -580,27 +583,29 @@ class TensorDeserializer(collections.abc.Mapping):
             headers: The headers of the tensor.
             mv: The memoryview of the tensor data.
         """
-        for hash in hashes:
-            if hash["type"] == HashType.CRC32:
+        for tensor_hash in hashes:
+            hash_type = tensor_hash["type"]
+            hash_body = tensor_hash["hash"]
+            if hash_type == HashType.CRC32:
                 crc = zlib.crc32(mv, zlib.crc32(headers))
-                hash_crc = struct.unpack("<I", hash["hash"])[0]
+                hash_crc = struct.unpack("<I", hash_body)[0]
                 if crc != hash_crc:
                     raise HashMismatchError(
                         f"Tensor '{name}' failed CRC32 verification. "
                         f"Expected {hash_crc}, got {crc}."
                     )
-            elif hash["type"] == HashType.SHA256:
+            elif hash_type == HashType.SHA256:
                 sha = hashlib.sha256(headers)
                 sha.update(mv)
                 sha_digest = sha.digest()
-                if sha_digest != hash["hash"]:
+                if sha_digest != hash_body:
                     raise HashMismatchError(
                         f"Tensor '{name}' failed SHA256 verification. "
-                        f"Expected {hash['hash']}, got {sha_digest}."
+                        f"Expected {hash_body}, got {sha_digest}."
                     )
             else:
                 raise HashMismatchError(
-                    f"Tensor '{name}' has an invalid hash type: {hash['type']}"
+                    f"Tensor '{name}' has an invalid hash type: {hash_type}"
                 )
 
     def _read_numpytensors(
@@ -703,16 +708,19 @@ class TensorDeserializer(collections.abc.Mapping):
                     shape_len,
                 )
 
-                if name in self.keys():
-                    # Read our hashes in. We need to read the hashes size, then
-                    # read the hash bytes.
-                    hashes_begin = shape_end
-                    hashes_sz_slice = headers[hashes_begin : hashes_begin + 2]
-                    hashes_sz = struct.unpack("<H", hashes_sz_slice)[0]
-                    hashes_end = hashes_begin + hashes_sz + 2
-                    hashes_slice = headers[hashes_begin + 2 : hashes_end]
-                    hashes = self._decode_hashes(hashes_slice)
-                    self._metadata[name]["hashes"] = hashes
+                # Read our hashes in. We need to read the hashes size,
+                # then read the hash bytes.
+                hashes_sz_begin = shape_end
+                with memoryview(headers) as hashes_mv:
+                    hashes_sz = struct.unpack_from(
+                        "<H", hashes_mv, hashes_sz_begin
+                    )[0]
+                    hashes_begin = hashes_sz_begin + 2
+                    hashes_end = hashes_begin + hashes_sz
+                    hashes_slice = hashes_mv[hashes_begin:hashes_end]
+                    if name in self.keys():
+                        hashes = self._decode_hashes(hashes_slice)
+                        self._metadata[name]["hashes"] = hashes
 
                 # Finally, get the tensor data length.
                 data_length = struct.unpack("<q", headers[header_len - 8 :])[0]
@@ -756,17 +764,27 @@ class TensorDeserializer(collections.abc.Mapping):
                     mv = memoryview(buffer)
                     self._file.readinto(mv)
 
-                # Store our raw headers with hashes zeroed out for model verification
-                headers = (
-                    struct.pack("<Q", header_sz)
-                    + headers[: hashes_begin + 2]
-                    + self._zero_hashes(hashes_slice)
-                    + headers[hashes_end:]
-                )
+                # Store our raw headers with hashes zeroed out
+                # for model verification
+                with memoryview(headers) as header_mv:
+                    headers = b"".join(
+                        (
+                            struct.pack("<Q", header_sz),
+                            header_mv[:hashes_begin],
+                            self._zero_hashes(hashes_slice),
+                            header_mv[hashes_end:],
+                        )
+                    )
+                hashes_slice.release()
                 self._metadata[name]["raw_headers"] = headers
 
                 if verify_hash:
-                    self._verify_hashes(name, hashes, headers, mv)
+                    try:
+                        self._verify_hashes(name, hashes, headers, mv)
+                    except HashMismatchError:
+                        # Necessary to prevent a BufferError on close()
+                        mv.release()
+                        raise
 
                 tensor = _NumpyTensor.from_buffer(
                     numpy_dtype,
@@ -1108,7 +1126,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 )
             numpy_tensor = _NumpyTensor.from_tensor(getattr(module, attr))
             try:
-                with memoryview(numpy_tensor).cast("B") as mv:
+                with memoryview(numpy_tensor.data).cast("B") as mv:
                     self._verify_hashes(
                         name,
                         entry["hashes"],
