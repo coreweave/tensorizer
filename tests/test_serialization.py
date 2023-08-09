@@ -324,6 +324,7 @@ class TestDeserialization(unittest.TestCase):
             check_deserialized(deserialized, model_name, allow_subset=True)
             deserialized.close()
 
+
 class TestVerification(unittest.TestCase):
     def test_verification(self):
         for device in "cuda", "cpu":
@@ -334,9 +335,9 @@ class TestVerification(unittest.TestCase):
                 del orig_sd
                 try:
                     with open(serialized_model, "rb") as in_file:
-                        deserialized = TensorDeserializer(in_file,
-                                                          device=device,
-                                                          verify_hash=True)
+                        deserialized = TensorDeserializer(
+                            in_file, device=device, verify_hash=True
+                        )
                         check_deserialized(deserialized, model_name)
                         deserialized.close()
                         del deserialized
@@ -359,7 +360,8 @@ class TestVerification(unittest.TestCase):
                             model_name
                         ).to(device)
                         result, tensor_status = deserialized.verify_module(
-                            model_to_verify)
+                            model_to_verify
+                        )
                         assert result
                         for tensor_name, status in tensor_status:
                             assert status, f"Tensor {tensor_name} failed"
@@ -383,10 +385,12 @@ class TestVerification(unittest.TestCase):
                         model_to_verify = AutoModelForCausalLM.from_pretrained(
                             model_name
                         ).to(device)
-                        model_to_verify.transformer.h[0].ln_2 = \
+                        model_to_verify.transformer.h[0].ln_2 = (
                             torch.nn.LayerNorm(768, 768)
+                        )
                         result, tensor_status = deserialized.verify_module(
-                            model_to_verify)
+                            model_to_verify
+                        )
                         assert not result
                         deserialized.close()
                         del model_to_verify, deserialized

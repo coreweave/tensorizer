@@ -87,8 +87,10 @@ class TensorEntry(typing.TypedDict):
     hashes: List[TensorHash]
     raw_headers: bytes
 
+
 class HashMismatchError(Exception):
     pass
+
 
 class TensorDeserializer(collections.abc.Mapping):
     """
@@ -159,23 +161,23 @@ class TensorDeserializer(collections.abc.Mapping):
     """
 
     def __init__(
-            self,
-            file_obj: Union[
-                io.BufferedIOBase,
-                io.RawIOBase,
-                typing.BinaryIO,
-                str,
-                bytes,
-                os.PathLike,
-                int,
-            ],
-            device: Union[torch.device, str, None] = None,
-            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-            dtype: Optional[torch.dtype] = None,
-            *,
-            lazy_load: bool = False,
-            plaid_mode: bool = False,
-            verify_hash: bool = False,
+        self,
+        file_obj: Union[
+            io.BufferedIOBase,
+            io.RawIOBase,
+            typing.BinaryIO,
+            str,
+            bytes,
+            os.PathLike,
+            int,
+        ],
+        device: Union[torch.device, str, None] = None,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        dtype: Optional[torch.dtype] = None,
+        *,
+        lazy_load: bool = False,
+        plaid_mode: bool = False,
+        verify_hash: bool = False,
     ):
         # Whether to verify the hashes of the tensors when they are loaded. This value
         # is used when no verify_hash argument is passed to the tensor loading methods.
@@ -204,7 +206,7 @@ class TensorDeserializer(collections.abc.Mapping):
         self._metadata: Dict[str, TensorEntry] = {}
 
         if self._plaid_mode and (
-                not torch.cuda.is_available() or self._device.type == "cpu"
+            not torch.cuda.is_available() or self._device.type == "cpu"
         ):
             raise ValueError("Plaid mode requires CUDA")
 
@@ -398,7 +400,7 @@ class TensorDeserializer(collections.abc.Mapping):
         )
 
     def _load_metadatas(
-            self, filter_func: Optional[Callable[[str], Union[bool, Any]]]
+        self, filter_func: Optional[Callable[[str], Union[bool, Any]]]
     ):
         """
         Read the metadata of tensors into self._metadata.
@@ -521,9 +523,9 @@ class TensorDeserializer(collections.abc.Mapping):
         # Read the hashes.
         for i in range(num_hashes):
             # Read the hash type.
-            hash_type = struct.unpack("<B", b[hash_idx: hash_idx + 1])[0]
+            hash_type = struct.unpack("<B", b[hash_idx : hash_idx + 1])[0]
             # Read the size of the hash.
-            hash_size = struct.unpack("<B", b[hash_idx + 1: hash_idx + 2])[0]
+            hash_size = struct.unpack("<B", b[hash_idx + 1 : hash_idx + 2])[0]
             # Read the hash.
             hash_begin = hash_idx + 2
             hash_end = hash_begin + hash_size
@@ -553,17 +555,18 @@ class TensorDeserializer(collections.abc.Mapping):
         # Read the hashes.
         for i in range(num_hashes):
             # Read the size of the hash.
-            hash_size = struct.unpack("<B", b[hash_idx + 1:hash_idx + 2])[0]
-            zeroed_hashes += b[hash_idx:hash_idx + 2] + \
-                             b'\0' * hash_size
+            hash_size = struct.unpack("<B", b[hash_idx + 1 : hash_idx + 2])[0]
+            zeroed_hashes += b[hash_idx : hash_idx + 2] + b"\0" * hash_size
             hash_idx = hash_idx + 2 + hash_size
         return zeroed_hashes
 
     @staticmethod
-    def _verify_hashes(name: str,
-                       hashes: List[TensorHash],
-                       headers: bytes,
-                       mv: Union[memoryview, bytes]) -> None:
+    def _verify_hashes(
+        name: str,
+        hashes: List[TensorHash],
+        headers: bytes,
+        mv: Union[memoryview, bytes],
+    ) -> None:
         """
         Verifies the hash of the tensor data.
 
@@ -573,34 +576,33 @@ class TensorDeserializer(collections.abc.Mapping):
             mv: The memoryview of the tensor data.
         """
         for hash in hashes:
-            if hash['type'] == HashType.CRC32:
+            if hash["type"] == HashType.CRC32:
                 crc = zlib.crc32(mv, zlib.crc32(headers))
-                hash_crc = struct.unpack("<I", hash['hash'])[0]
+                hash_crc = struct.unpack("<I", hash["hash"])[0]
                 if crc != hash_crc:
                     raise HashMismatchError(
                         f"Tensor '{name}' failed CRC32 verification. "
                         f"Expected {hash_crc}, got {crc}."
                     )
-            elif hash['type'] == HashType.SHA256:
+            elif hash["type"] == HashType.SHA256:
                 sha = hashlib.sha256(headers)
                 sha.update(mv)
                 sha_digest = sha.digest()
-                if sha_digest != hash['hash']:
+                if sha_digest != hash["hash"]:
                     raise HashMismatchError(
                         f"Tensor '{name}' failed SHA256 verification. "
                         f"Expected {hash['hash']}, got {sha_digest}."
                     )
             else:
                 raise HashMismatchError(
-                    f"Tensor '{name}' has an invalid hash type: "
-                    f"{hash['type']}"
+                    f"Tensor '{name}' has an invalid hash type: {hash['type']}"
                 )
 
     def _read_numpytensors(
-            self,
-            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-            num_tensors: int = -1,
-            verify_hash: Union[bool, None] = None,
+        self,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
+        verify_hash: Union[bool, None] = None,
     ) -> Iterator[Tuple[int, int, str, _NumpyTensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
@@ -655,9 +657,9 @@ class TensorDeserializer(collections.abc.Mapping):
                 name: str = name_bytes.decode("utf-8")
 
                 # Read the dtype of the tensor.
-                dtype_len = struct.unpack("<B", headers[idx: idx + 1])[0]
+                dtype_len = struct.unpack("<B", headers[idx : idx + 1])[0]
                 dtype_end = idx + dtype_len + 1
-                dtype = headers[idx + 1: dtype_end].decode("utf-8")
+                dtype = headers[idx + 1 : dtype_end].decode("utf-8")
 
                 numpy_dtype, *torch_dtype = dtype.split(OPAQUE_DTYPE_SEP)
                 if len(torch_dtype) == 0:
@@ -675,7 +677,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 # Read the shape amount, according to the serialized format.
                 # The shape length is 1 byte after the dtype end.
                 shape_len = struct.unpack(
-                    "<B", headers[dtype_end: dtype_end + 1]
+                    "<B", headers[dtype_end : dtype_end + 1]
                 )[0]
                 # The shape elements are <I, so we read 4 bytes. _read_shapes
                 # takes in the header object and the number of elements in
@@ -695,24 +697,24 @@ class TensorDeserializer(collections.abc.Mapping):
                 # Read our hashes in. We need to read the hashes size, then
                 # read the hash bytes.
                 hashes_begin = shape_end
-                hashes_sz_slice = headers[hashes_begin: hashes_begin + 2]
+                hashes_sz_slice = headers[hashes_begin : hashes_begin + 2]
                 hashes_sz = struct.unpack("<H", hashes_sz_slice)[0]
                 hashes_end = hashes_begin + hashes_sz + 2
-                hashes_slice = headers[hashes_begin + 2: hashes_end]
+                hashes_slice = headers[hashes_begin + 2 : hashes_end]
                 hashes = self._decode_hashes(hashes_slice)
 
                 if name in self.keys():
                     self._metadata[name]["hashes"] = hashes
 
                 # Finally, get the tensor data length.
-                data_length = struct.unpack("<q", headers[header_len - 8:])[0]
+                data_length = struct.unpack("<q", headers[header_len - 8 :])[0]
 
                 # Check if the name is in our pre-filtered list of keys
                 # from the class-level filter_func, and then verify
                 # that it passes the method-level filter_func.
                 # Skip it if it fails either check.
                 if name not in self.keys() or (
-                        filter_func is not None and not filter_func(name)
+                    filter_func is not None and not filter_func(name)
                 ):
                     self._file.seek(data_length, io.SEEK_CUR)
                     continue
@@ -725,8 +727,8 @@ class TensorDeserializer(collections.abc.Mapping):
                     # all the tensors. We just need to slice out the
                     # memoryview for the current tensor.
                     mv = memoryview(self._buffer)[
-                         self._allocated: self._allocated + data_length
-                         ]
+                        self._allocated : self._allocated + data_length
+                    ]
                     self._file.readinto(mv)
                     self._allocated += data_length
                 elif self._plaid_mode:
@@ -747,10 +749,12 @@ class TensorDeserializer(collections.abc.Mapping):
                     self._file.readinto(mv)
 
                 # Store our raw headers with hashes zeroed out for model verification
-                headers = struct.pack("<Q", header_sz) + \
-                          headers[:hashes_begin + 2] + \
-                          self._zero_hashes(hashes_slice) + \
-                          headers[hashes_end:]
+                headers = (
+                    struct.pack("<Q", header_sz)
+                    + headers[: hashes_begin + 2]
+                    + self._zero_hashes(hashes_slice)
+                    + headers[hashes_end:]
+                )
                 self._metadata[name]["raw_headers"] = headers
 
                 if verify_hash:
@@ -770,9 +774,9 @@ class TensorDeserializer(collections.abc.Mapping):
             return
 
     def read_tensors(
-            self,
-            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-            num_tensors: int = -1,
+        self,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
     ) -> Iterator[Tuple[int, int, str, torch.Tensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
@@ -807,11 +811,11 @@ class TensorDeserializer(collections.abc.Mapping):
             yield module_idx, tensor_type, name, tensor.to_tensor()
 
     def read_numpy_arrays(
-            self,
-            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-            num_tensors: int = -1,
-            allow_raw_data: bool = False,
-            verify_hash: Union[bool, None] = None,
+        self,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
+        allow_raw_data: bool = False,
+        verify_hash: Union[bool, None] = None,
     ) -> Iterator[Tuple[int, int, str, numpy.ndarray, bool, Optional[str]]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
@@ -891,7 +895,9 @@ class TensorDeserializer(collections.abc.Mapping):
             verify_hash = self._verify_hash
 
         data = self._read_numpytensors(
-            filter_func=filter_func, num_tensors=num_tensors, verify_hash=verify_hash
+            filter_func=filter_func,
+            num_tensors=num_tensors,
+            verify_hash=verify_hash,
         )
         for module_idx, tensor_type, name, tensor in data:
             is_opaque = tensor.is_opaque
@@ -910,7 +916,7 @@ class TensorDeserializer(collections.abc.Mapping):
             yield module_idx, tensor_type, name, arr, is_opaque, torch_dtype
 
     def _to_torch_parameter(
-            self, tensor: Union[torch.Tensor, torch.nn.Parameter]
+        self, tensor: Union[torch.Tensor, torch.nn.Parameter]
     ) -> torch.nn.Parameter:
         """
         Convert a tensor to a torch.nn.Parameter on a device, forcing
@@ -925,9 +931,9 @@ class TensorDeserializer(collections.abc.Mapping):
 
         # Cast the tensor if a global dtype was given to the TensorDeserializer
         if (
-                self._dtype is not None
-                and tensor.dtype != torch.bool
-                and torch.dtype != self._dtype
+            self._dtype is not None
+            and tensor.dtype != torch.bool
+            and torch.dtype != self._dtype
         ):
             tensor = tensor.to(self._dtype)
 
@@ -953,10 +959,10 @@ class TensorDeserializer(collections.abc.Mapping):
         return d
 
     def load_into_module(
-            self,
-            m: torch.nn.Module,
-            filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
-            verify_hash: Union[bool, None] = None,
+        self,
+        m: torch.nn.Module,
+        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        verify_hash: Union[bool, None] = None,
     ) -> int:
         """
         Given `m`, a torch.nn.Module, load the associate tensors in this
@@ -1007,8 +1013,9 @@ class TensorDeserializer(collections.abc.Mapping):
         self._file.close()
         return tensor_ct
 
-    def verify_module(self,
-                      m: torch.nn.Module) -> Tuple[bool, List[Tuple[str, bool]]]:
+    def verify_module(
+        self, m: torch.nn.Module
+    ) -> Tuple[bool, List[Tuple[str, bool]]]:
         """
         Given `m`, a torch.nn.Module, verify that the tensors in this
         Tensorizer object match the tensors in the `torch.nn.Module`.
@@ -1036,23 +1043,27 @@ class TensorDeserializer(collections.abc.Mapping):
                 results.append((name, False))
                 passed = False
             if "hashes" not in entry:
-                raise RuntimeError(f"No hashes found in metadata for {name}."
-                                   " This is usually caused by a "
-                                   " TensorDeserializer that was instantiated"
-                                   " with lazy_load=True, and not" f" loaded"
-                                   " into a module before calling this.")
+                raise RuntimeError(
+                    f"No hashes found in metadata for {name}. This is usually"
+                    " caused by a TensorDeserializer that was instantiated"
+                    " with lazy_load=True, and not loaded into a module before"
+                    " calling this."
+                )
             numpy_tensor = _NumpyTensor.from_tensor(getattr(module, attr))
             try:
-                self._verify_hashes(name,
-                                    entry["hashes"],
-                                    entry["raw_headers"],
-                                    numpy_tensor.data.tobytes())
+                self._verify_hashes(
+                    name,
+                    entry["hashes"],
+                    entry["raw_headers"],
+                    numpy_tensor.data.tobytes(),
+                )
                 results.append((name, True))
             except HashMismatchError:
                 results.append((name, False))
                 passed = False
 
         return passed, results
+
 
 class TensorSerializer:
     """
@@ -1099,17 +1110,17 @@ class TensorSerializer:
     """
 
     def __init__(
-            self,
-            file_obj: Union[
-                io.BufferedIOBase,
-                io.RawIOBase,
-                typing.BinaryIO,
-                str,
-                bytes,
-                os.PathLike,
-                int,
-            ],
-            compress_tensors: bool = False,
+        self,
+        file_obj: Union[
+            io.BufferedIOBase,
+            io.RawIOBase,
+            typing.BinaryIO,
+            str,
+            bytes,
+            os.PathLike,
+            int,
+        ],
+        compress_tensors: bool = False,
     ) -> None:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "wb+")
@@ -1204,7 +1215,7 @@ class TensorSerializer:
         logger.info(f"Tensors completed serializing to {final_sz} bytes")
         if self.compress_tensors:
             compression_ratio = (
-                    self.total_tensor_bytes / self.total_compressed_tensor_bytes
+                self.total_tensor_bytes / self.total_compressed_tensor_bytes
             )
             logger.info(f"Uncomp'd bytes: {self.total_tensor_bytes}")
             logger.info(f"Comp'd bytes: {self.total_compressed_tensor_bytes}")
@@ -1244,11 +1255,11 @@ class TensorSerializer:
         self._file.seek(curr)
 
     def write_tensor(
-            self,
-            idx,
-            name,
-            tensor_type: TensorType,
-            tensor: Union[torch.Tensor, numpy.ndarray],
+        self,
+        idx,
+        name,
+        tensor_type: TensorType,
+        tensor: Union[torch.Tensor, numpy.ndarray],
     ) -> None:
         """
         Serializes a tensor, laying things out so that it can be read in three
@@ -1450,9 +1461,9 @@ class TensorSerializer:
 
         if self.compress_tensors:
             comp_report = (
-                    f" - tensor:[raw: {tensor_raw_sz},"
-                    + f" compressed: {tensor_compressed_sz},"
-                    + f" ratio: {compression_ratio:.2f}]"
+                f" - tensor:[raw: {tensor_raw_sz},"
+                + f" compressed: {tensor_compressed_sz},"
+                + f" ratio: {compression_ratio:.2f}]"
             )
         else:
             comp_report = ""
@@ -1462,7 +1473,7 @@ class TensorSerializer:
         )
 
     def write_module(
-            self, m: torch.nn.Module, remove_tensors: bool = False
+        self, m: torch.nn.Module, remove_tensors: bool = False
     ) -> None:
         for module_name, module in m.named_modules():
             for name, param in module.named_parameters(recurse=False):
