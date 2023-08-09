@@ -1102,21 +1102,23 @@ class TensorDeserializer(collections.abc.Mapping):
         """
         # TODO: Account for the case where the module has more tensors than
         #  what's serialized.
-        modules: typing.OrderedDict[str, torch.nn.Module] = OrderedDict()
+        modules: typing.OrderedDict[str, Union[torch.nn.Module,
+                                               torch.Tensor]] = OrderedDict()
 
         results: List[Tuple[str, bool]] = []
 
-        for name, module in m.named_modules():
-            modules[name] = module
+        modules.update(m.state_dict())
+        # Non-persistent buffers are serialized in tensorizer,
+        # but aren't included in a state_dict() in PyTorch.
+        modules.update(m.named_buffers())
 
         for name in self.keys():
-            obj_path, attr = name.rsplit(".", 1)
-            module: torch.nn.Module = modules[obj_path]
-            entry = self._metadata[name]
-            # Check if the module has the attribute
-            if not hasattr(module, attr):
+            # Check if the module has this tensor.
+            if name not in modules:
                 results.append((name, False))
                 continue
+            module: torch.nn.Module = modules[name]
+            entry = self._metadata[name]
             if "hashes" not in entry:
                 raise RuntimeError(
                     f"No hashes found in metadata for {name}. This is usually"
@@ -1124,7 +1126,7 @@ class TensorDeserializer(collections.abc.Mapping):
                     " with lazy_load=True, and not loaded into a module before"
                     " calling this."
                 )
-            numpy_tensor = _NumpyTensor.from_tensor(getattr(module, attr))
+            numpy_tensor = _NumpyTensor.from_tensor(module)
             try:
                 with memoryview(numpy_tensor.data).cast("B") as mv:
                     self._verify_hashes(
@@ -1136,6 +1138,10 @@ class TensorDeserializer(collections.abc.Mapping):
                 results.append((name, True))
             except HashMismatchError:
                 results.append((name, False))
+
+        absent_keys = set(self.keys()).difference(set(modules.keys()))
+        for name in absent_keys:
+            results.append((name, False))
 
         return all(result for name, result in results), results
 

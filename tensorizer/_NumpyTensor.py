@@ -1,4 +1,4 @@
-from typing import NamedTuple, Optional, Sequence
+from typing import NamedTuple, Optional, Sequence, Union
 
 import numpy
 import torch
@@ -85,10 +85,14 @@ class _NumpyTensor(NamedTuple):
             buffer=buffer,
             offset=offset,
         )
-        return cls(data=data, numpy_dtype=numpy_dtype, torch_dtype=torch_dtype)
+        return cls(data=data,
+                   numpy_dtype=numpy_dtype,
+                   torch_dtype=torch_dtype)
 
     @classmethod
-    def from_tensor(cls, tensor: torch.Tensor) -> "_NumpyTensor":
+    def from_tensor(cls,
+                    tensor: Union[torch.Tensor,
+                                  torch.nn.Module]) -> "_NumpyTensor":
         """
         Converts a torch tensor into a `_NumpyTensor`.
         May use an opaque dtype for the numpy array stored in
