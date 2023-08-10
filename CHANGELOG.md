@@ -11,9 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `verify_hash` parameter for `TensorDeserializer.read_tensors`
   - Matches the one for `TensorDeserializer.read_numpy_arrays`
-  - Only to be used with lazy loading; has no effect on preloaded tensors
-    - Use `verify_hash` in the `TensorDeserializer` constructor if
-      not lazy-loading
 
 ## [2.1.0] - 2023-08-09
 
@@ -21,9 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Hash verification of deserialized models
   - During deserialization, specify `verify_hash=True` in either:
-    - The `TensorDeserializer` constructor, or:
-    - `TensorDeserializer.load_into_module` (during lazy loading), or
-    - `TensorDeserializer.read_numpy_arrays` (during lazy loading)
+    - The `TensorDeserializer` constructor,
+    - `TensorDeserializer.read_numpy_arrays`, or
+    - `TensorDeserializer.load_into_module` (only while lazy loading)
   - Comparing a model already in memory against its `.tensors` file:
     `TensorDeserializer.verify_module`
 
