@@ -29,6 +29,8 @@ classifiers = [
 
 [project.urls]
 "Homepage" = "https://github.com/coreweave/tensorizer"
+"Repository" = "https://github.com/coreweave/tensorizer"
+"Changelog" = "https://github.com/coreweave/tensorizer/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["setuptools"]
