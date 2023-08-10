@@ -1109,8 +1109,6 @@ class TensorDeserializer(collections.abc.Mapping):
                 this function prior to loading the tensors into a module.
                 If ``lazy_load=False``, this error case is impossible.
         """
-        # TODO: Account for the case where the module has more tensors than
-        #  what's serialized.
         modules: typing.OrderedDict[
             str, Union[torch.nn.Module, torch.Tensor]
         ] = OrderedDict()
