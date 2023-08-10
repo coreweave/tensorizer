@@ -803,6 +803,7 @@ class TensorDeserializer(collections.abc.Mapping):
         self,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         num_tensors: int = -1,
+        verify_hash: Optional[bool] = None,
     ) -> Iterator[Tuple[int, int, str, torch.Tensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
@@ -825,13 +826,24 @@ class TensorDeserializer(collections.abc.Mapping):
                 will be read. If the zero-byte header is encountered before
                 `num_tensors` tensors are read, the generator will stop
                 yielding values.
+            verify_hash: If True, the hashes of each tensor will be verified
+                against the hashes stored in the metadata.
+                A `HashMismatchError` will be raised if any of the hashes do
+                not match. If ``None``, the value of the `verify_hash` argument
+                passed to the `TensorDeserializer` constructor will be used.
 
         Yields:
             Tuples of the form (module_idx, tensor_type, name, tensor).
+
+        Raises:
+            HashMismatchError: If ``verify_hash`` resolves to True and
+                a deserialized tensor does not match its stored hash.
         """
 
         data = self._read_numpytensors(
-            filter_func=filter_func, num_tensors=num_tensors
+            filter_func=filter_func,
+            num_tensors=num_tensors,
+            verify_hash=verify_hash,
         )
         for module_idx, tensor_type, name, tensor in data:
             yield module_idx, tensor_type, name, tensor.to_tensor()
@@ -924,9 +936,6 @@ class TensorDeserializer(collections.abc.Mapping):
             HashMismatchError: If ``verify_hash`` resolves to True and
                 a deserialized tensor does not match its stored hash.
         """
-        if verify_hash is None:
-            verify_hash = self._verify_hash
-
         data = self._read_numpytensors(
             filter_func=filter_func,
             num_tensors=num_tensors,
@@ -1102,8 +1111,9 @@ class TensorDeserializer(collections.abc.Mapping):
         """
         # TODO: Account for the case where the module has more tensors than
         #  what's serialized.
-        modules: typing.OrderedDict[str, Union[torch.nn.Module,
-                                               torch.Tensor]] = OrderedDict()
+        modules: typing.OrderedDict[
+            str, Union[torch.nn.Module, torch.Tensor]
+        ] = OrderedDict()
 
         results: List[Tuple[str, bool]] = []
 
