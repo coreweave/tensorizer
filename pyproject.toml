@@ -1,6 +1,6 @@
 [project]
 name = "tensorizer"
-version = "2.1.1"
+dynamic = ["version"]
 license = { text = "MIT License" }
 keywords = ["tensorizer", "machine learning", "serialization", "tensor", "pytorch"]
 authors = [
@@ -41,6 +41,9 @@ packages = ["tensorizer"]
 
 [tool.setuptools.package-data]
 tensorizer = ["tensors.proto"]
+
+[tool.setuptools.dynamic.version]
+attr = "tensorizer_version.__version__"
 
 [tool.black]
 line-length = 80
