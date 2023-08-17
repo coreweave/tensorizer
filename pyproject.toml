@@ -43,7 +43,7 @@ packages = ["tensorizer"]
 tensorizer = ["tensors.proto"]
 
 [tool.setuptools.dynamic.version]
-attr = "tensorizer_version.__version__"
+attr = "tensorizer._version.__version__"
 
 [tool.black]
 line-length = 80
