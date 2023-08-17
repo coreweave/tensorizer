@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 import boto3
 import botocore
 
+import tensorizer._version as _version
 import tensorizer._wide_pipes as _wide_pipes
 
 __all__ = ["open_stream", "CURLStreamFile"]
@@ -25,6 +26,15 @@ curl_path = shutil.which("curl")
 
 default_s3_read_endpoint = "accel-object.ord1.coreweave.com"
 default_s3_write_endpoint = "object.ord1.coreweave.com"
+
+_BASE_USER_AGENT = f"Tensorizer/{_version.__version__}"
+
+# Curl's user agent is curl/<version>, but it's not worth
+# spawning another subprocess just to check that
+_CURL_USER_AGENT = f"{_BASE_USER_AGENT} (curl)"
+
+# Botocore appends " Botocore/<version>" to the end of the user agent on its own
+_BOTO_USER_AGENT = f"{_BASE_USER_AGENT} (Boto3/{boto3.__version__})"
 
 if sys.platform != "win32":
     _s3_default_config_paths = (os.path.expanduser("~/.s3cfg"),)
@@ -136,6 +146,8 @@ class CURLStreamFile:
             curl_path,
             "--header",
             "Accept-Encoding: identity",
+            "-A",
+            _CURL_USER_AGENT,
             "-s",
             "-f",
             uri,
@@ -209,6 +221,8 @@ class CURLStreamFile:
             curl_path,
             "-I",  # Only read headers
             "-XGET",  # Use a GET request (in case HEAD is not supported)
+            "-A",  # Set a custom user agent
+            _CURL_USER_AGENT,
             "-f",  # Don't return HTML/XML error webpages
             "-s",  # Silence most output
             "-S",  # Keep error messages
@@ -380,20 +394,24 @@ def _new_s3_client(
     if s3_endpoint is None:
         raise TypeError("No S3 endpoint provided")
 
+    config_args = dict(user_agent=_BOTO_USER_AGENT)
+    auth_args = {}
+
     if s3_access_key_id == s3_secret_access_key == "":
-        auth_args = dict(
-            config=boto3.session.Config(signature_version=botocore.UNSIGNED)
-        )
+        config_args["signature_version"] = botocore.UNSIGNED
     else:
         auth_args = dict(
             aws_access_key_id=s3_access_key_id,
             aws_secret_access_key=s3_secret_access_key,
         )
 
+    config = boto3.session.Config(**config_args)
+
     return boto3.session.Session.client(
         boto3.session.Session(),
         endpoint_url=_ensure_https_endpoint(s3_endpoint),
         service_name="s3",
+        config=config,
         **auth_args,
     )
 
