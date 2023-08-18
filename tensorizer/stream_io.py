@@ -439,18 +439,33 @@ def s3_upload(
     client.upload_file(path, bucket, key)
 
 
-def s3_download(
+def _s3_download_url(
     path_uri: str,
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
-) -> CURLStreamFile:
+) -> str:
     bucket, key = _parse_s3_uri(path_uri)
     client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint)
     url = client.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=300,
+    )
+    return url
+
+
+def s3_download(
+    path_uri: str,
+    s3_access_key_id: str,
+    s3_secret_access_key: str,
+    s3_endpoint: str = default_s3_read_endpoint,
+) -> CURLStreamFile:
+    url = _s3_download_url(
+        path_uri=path_uri,
+        s3_access_key_id=s3_access_key_id,
+        s3_secret_access_key=s3_secret_access_key,
+        s3_endpoint=s3_endpoint,
     )
     return CURLStreamFile(url)
 
