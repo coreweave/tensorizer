@@ -163,6 +163,8 @@ class TestS3(unittest.TestCase):
             s3_access_key_id=self.ACCESS_KEY,
             s3_secret_access_key=self.SECRET_KEY,
             s3_endpoint=self.endpoint,
+            s3_sse_customer_key=os.urandom(32),
+            s3_sse_customer_algorithm="AES256",
         )
         long_string = b"Hello" * 1024
         s.write(long_string)
@@ -184,5 +186,7 @@ class TestS3(unittest.TestCase):
                 s3_access_key_id="X",
                 s3_secret_access_key="X",
                 s3_endpoint=endpoint,
+                s3_sse_customer_key=os.urandom(32),
+                s3_sse_customer_algorithm="AES256",
             ) as s:
                 self.assertEqual(s.read(), long_string)
