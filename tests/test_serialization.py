@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import tempfile
+import time
 import unittest
 from typing import Mapping, NamedTuple, Tuple
 from unittest.mock import patch
@@ -41,11 +42,14 @@ def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
     sd = model.state_dict()
     out_file = tempfile.NamedTemporaryFile("wb+", delete=False)
     try:
+        start_time = time.monotonic()
         serializer = TensorSerializer(out_file)
         serializer.write_module(model)
         serializer.close()
+        end_time = time.monotonic()
+        print(f"Serialization took {end_time - start_time:.3f} seconds")
     except Exception:
-        os.unlink(out_file)
+        os.unlink(out_file.name)
         raise
     return out_file.name, sd
 
@@ -85,7 +89,7 @@ def check_deserialized(
     allow_subset: bool = False,
 ):
     orig_sd = model_digest(model_name)
-    
+
     if not allow_subset:
         test_case.assertEqual(
             orig_sd.keys(),
