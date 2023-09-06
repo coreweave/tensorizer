@@ -1,4 +1,5 @@
 import functools
+import http.client
 import io
 import logging
 import os
@@ -151,13 +152,13 @@ class CURLStreamFile:
                 " and could not be found."
             )
 
-        # NOTE: `256mb` buffer on the python IO object.
+        header_r_pipe, header_w_pipe = os.pipe()
         cmd = [
             curl_path,
             "--header",
             "Accept-Encoding: identity",
             "--dump-header",
-            "/dev/stderr", # TODO: Windows support, and maybe a temp pipe?
+            f"/dev/fd/{header_w_pipe}",  # TODO: Windows support
             "-A",
             _CURL_USER_AGENT,
             "-s",
@@ -174,46 +175,40 @@ class CURLStreamFile:
 
         self._curl = None
         with _wide_pipes.widen_new_pipes():  # Widen on Windows
-            popen_start = time.time()
+            popen_start = time.monotonic()
+            # NOTE: `256mb` buffer on the python IO object.
             self._curl = subprocess.Popen(
                 cmd,
+                pass_fds=(header_w_pipe,),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 bufsize=256 * 1024 * 1024,
             )
-        popen_end = time.time()
+        popen_end = time.monotonic()
 
         _wide_pipes.widen_pipe(self._curl.stdout.fileno())  # Widen on Linux
-        resp = self._curl.stderr.readline() # Block on the http header response
-        resp_begin = time.time()
+        self._header_pipe = open(header_r_pipe, "rb")
+        resp = self._header_pipe.readline()  # Block on the http header response
+        resp_begin = time.monotonic()
 
-        # We reinitialize this object when seeking, so we don't want to overwrite
-        # these tracking variables if they already exist.
+        # We reinitialize this object when seeking,
+        # so we don't want to overwrite these tracking variables
+        # if they already exist.
         self._init_vars()
 
         # Track the latency of the popen and http response
         self.popen_latencies.append(popen_end - popen_start)
         self.http_response_latencies.append(resp_begin - popen_end)
 
-        if not resp.startswith(b"HTTP/1.1 2") and not resp.startswith(b"HTTP/2 2"):
+        if not resp.startswith((b"HTTP/1.1 2", b"HTTP/2 2")):
             self._curl.terminate()
             self._curl.wait()
             raise IOError(f"Failed to open stream: {resp.decode('utf-8')}")
-        # Make stderr non-blocking so that we can read the rest of the header without
-        # blocking the main thread.
-        os.set_blocking(self._curl.stderr.fileno(), False)
+        # Make the header pipe non-blocking so that we can read the rest
+        # of the header without blocking the main thread.
+        os.set_blocking(header_r_pipe, False)
         # Read the rest of the header response and parse it.
-        header_lines = self._curl.stderr.readlines()
-        self.response_headers = {}
-        # FIXME: This should really be using the email.parser module, as there are
-        #        edge cases that this doesn't handle correctly, such as headers
-        #        with keys that are the same.
-        for line in header_lines:
-            line = line.decode("utf-8").strip()
-            if not line or ':' not in line:
-                continue
-            k, v = line.split(":", maxsplit=1)
-            self.response_headers[k.strip().lower()] = v.strip()
+        # noinspection PyTypeChecker
+        self.response_headers = http.client.parse_headers(self._header_pipe)
 
         self.error_buffer = ""
         self._curr = 0 if begin is None else begin
@@ -221,17 +216,13 @@ class CURLStreamFile:
         self.closed = False
 
     def _init_vars(self):
-        if not hasattr(self, "popen_latencies"):
-            self.popen_latencies: List[float] = []
-        if not hasattr(self, "http_response_latencies"):
-            self.http_response_latencies: List[float] = []
-        if not hasattr(self, "bytes_read"):
-            self.bytes_read: int = 0
-        if not hasattr(self, "bytes_skipped"):
-            self.bytes_skipped: int = 0
-        if not hasattr(self, "read_operations"):
-            self.read_operations: int = 0
-
+        self.popen_latencies: List[float] = getattr(self, "popen_latencies", [])
+        self.http_response_latencies: List[float] = getattr(
+            self, "http_response_latencies", []
+        )
+        self.bytes_read: int = getattr(self, "bytes_read", 0)
+        self.bytes_skipped: int = getattr(self, "bytes_skipped", 0)
+        self.read_operations: int = getattr(self, "read_operations", 0)
 
     def __enter__(self):
         return self
@@ -398,14 +389,14 @@ class CURLStreamFile:
         if self._curl is not None:
             if self._curl.poll() is None:
                 self._curl.stdout.close()
-                self._curl.stderr.close()
+                self._header_pipe.close()
                 self._curl.terminate()
                 self._curl.wait()
             else:
                 # stdout is normally closed by the Popen.communicate() method,
                 # which we skip in favour of Popen.stdout.read()
                 self._curl.stdout.close()
-                self._curl.stderr.close()
+                self._header_pipe.close()
             self._curl = None
 
     def readline(self):
