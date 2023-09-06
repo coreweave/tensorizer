@@ -157,7 +157,7 @@ class CURLStreamFile:
             "--header",
             "Accept-Encoding: identity",
             "--dump-header",
-            "/dev/stderr",
+            "/dev/stderr", # TODO: Windows support, and maybe a temp pipe?
             "-A",
             _CURL_USER_AGENT,
             "-s",
