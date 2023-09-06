@@ -602,7 +602,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 if sha_digest != hash_body:
                     raise HashMismatchError(
                         f"Tensor '{name}' failed SHA256 verification. "
-                        f"Expected {hash_body}, got {sha_digest}."
+                        f"Expected {hash_body.hex()}, got {sha_digest.hex()}."
                     )
             else:
                 raise ValueError(
@@ -1555,9 +1555,14 @@ class TensorSerializer:
         self._metadata_cur = self._file.tell()
 
         # Calculate the hashes.
+        # Use a barrier to restrict modifications to the header from any thread
+        # until it is done being used by all threads.
+        hash_barrier = threading.Barrier(2)
+
         def write_crc32():
             crc32 = zlib.crc32(header)
             crc32 = zlib.crc32(tensor_memory, crc32)
+            hash_barrier.wait()
             header_crc32_hash_segment.pack_into(
                 header, crc32_start, HashType.CRC32.value, 4, crc32
             )
@@ -1566,6 +1571,7 @@ class TensorSerializer:
             sha256 = hashlib.sha256(header)
             sha256.update(tensor_memory)
             sha256 = sha256.digest()
+            hash_barrier.wait()
             header_sha256_hash_segment.pack_into(
                 header, sha256_start, HashType.SHA256.value, 32, sha256
             )
