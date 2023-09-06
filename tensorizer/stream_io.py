@@ -210,7 +210,6 @@ class CURLStreamFile:
         # noinspection PyTypeChecker
         self.response_headers = http.client.parse_headers(self._header_pipe)
 
-        self.error_buffer = ""
         self._curr = 0 if begin is None else begin
         self._end = end
         self.closed = False
