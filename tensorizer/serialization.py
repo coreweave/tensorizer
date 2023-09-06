@@ -444,7 +444,7 @@ class TensorDeserializer(collections.abc.Mapping):
     @property
     def cache_status(self) -> Union[bool, str]:
         if hasattr(self._file, "response_headers"):
-            return self._file.response_headers.get("X-Cache-Status", False)
+            return self._file.response_headers.get("x-cache-status", False)
         else:
             return False
 
