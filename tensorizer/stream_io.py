@@ -189,16 +189,9 @@ class CURLStreamFile:
 
         # We reinitialize this object when seeking, so we don't want to overwrite
         # these tracking variables if they already exist.
-        if not hasattr(self, "popen_latencies"):
-            self.popen_latencies: List[float] = []
-        if not hasattr(self, "http_response_latencies"):
-            self.http_response_latencies: List[float] = []
-        if not hasattr(self, "bytes_read"):
-            self.bytes_read: int = 0
-        if not hasattr(self, "bytes_skipped"):
-            self.bytes_skipped: int = 0
-        if not hasattr(self, "read_operations"):
-            self.read_operations: int = 0
+        self._init_vars()
+
+        # Track the latency of the popen and http response
         self.popen_latencies.append(popen_end - popen_start)
         self.http_response_latencies.append(resp_begin - popen_end)
 
@@ -214,7 +207,7 @@ class CURLStreamFile:
         self.response_headers = {}
         for line in header_lines:
             line = line.decode("utf-8").strip()
-            if not line:
+            if not line or ':' not in line:
                 continue
             k, v = line.split(":", maxsplit=1)
             self.response_headers[k.strip()] = v.strip()
@@ -223,6 +216,19 @@ class CURLStreamFile:
         self._curr = 0 if begin is None else begin
         self._end = end
         self.closed = False
+
+    def _init_vars(self):
+        if not hasattr(self, "popen_latencies"):
+            self.popen_latencies: List[float] = []
+        if not hasattr(self, "http_response_latencies"):
+            self.http_response_latencies: List[float] = []
+        if not hasattr(self, "bytes_read"):
+            self.bytes_read: int = 0
+        if not hasattr(self, "bytes_skipped"):
+            self.bytes_skipped: int = 0
+        if not hasattr(self, "read_operations"):
+            self.read_operations: int = 0
+
 
     def __enter__(self):
         return self
