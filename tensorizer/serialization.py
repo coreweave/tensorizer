@@ -15,11 +15,12 @@ import collections.abc
 import ctypes
 import hashlib
 import io
+import itertools
 import logging
 import mmap
 import os
 import struct
-import tempfile
+import threading
 import time
 import typing
 import zlib
@@ -601,7 +602,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 if sha_digest != hash_body:
                     raise HashMismatchError(
                         f"Tensor '{name}' failed SHA256 verification. "
-                        f"Expected {hash_body}, got {sha_digest}."
+                        f"Expected {hash_body.hex()}, got {sha_digest.hex()}."
                     )
             else:
                 raise ValueError(
@@ -1403,134 +1404,221 @@ class TensorSerializer:
         if len(dtype_name) >= 256:
             raise ValueError("dtype name length should be less than 256")
 
-        # Reserve room for our tensor header size.
-        ds_header_begin = self._file.tell()
-        self._file.write(struct.pack("<Q", 0))
-
-        # Module index.
-        self._file.write(struct.pack("<H", idx))
-
-        # Whether this is a parameter or a buffer
-        self._file.write(struct.pack("<B", tensor_type.value))
-
-        # Parameter/buffer name
-        name_bytes = bytes(name, "utf-8")
-        self._file.write(struct.pack("<H", len(name_bytes)))
-        self._file.write(name_bytes)
-
-        # Write out our tensor dtype
-        dtype_bytes = bytes(dtype_name, "utf-8")
+        header_pos = self._file.tell()
+        tensor = numpy_tensor.data
+        tensor_memory = numpy_tensor.data.data
+        header_start_segment = struct.Struct(
+            "<"  # Little-endian
+            "Q"  # Tensor header size
+            "H"  # Module index.
+            "B"  # Whether this is a parameter or a buffer
+            "H"  # Parameter/buffer name length
+        )
+        # Variable length fields, can't be compiled into
+        # a static struct definition without calculating sizes first:
+        name_bytes = name.encode("utf-8")
+        name_len = len(name_bytes)
+        dtype_bytes = dtype_name.encode("utf-8")
         dtype_len = len(dtype_bytes)
-        self._file.write(struct.pack("<B", dtype_len))
-        self._file.write(dtype_bytes)
+        shape = tensor.shape
+        # NB: shape_len is the number of dimensions, not the encoded byte length
+        shape_len = len(shape)
 
-        # ... and shape
-        shape_bytes = self._dump_shape(numpy_tensor.data.shape)
-        self._file.write(shape_bytes)
+        header_variable_length_segment = struct.Struct(
+            "<"
+            f"{name_len}s"  # Parameter/buffer name UTF-8 bytes
+            "B"  # Tensor dtype length
+            f"{dtype_len}s"  # Tensor dtype UTF-8 bytes
+            "B"  # Tensor shape length
+            f"{shape_len}I"  # Tensor shape I array
+        )
+        header_hash_header_segment = struct.Struct(
+            "<"
+            "H"  # Hash section length
+            "B"  # Hash count (fixed for a particular tensorizer version)
+        )
+        header_crc32_hash_segment = struct.Struct(
+            "<"
+            "B"  # CRC32 hash type (HashType enum value)
+            "B"  # CRC32 hash length
+            "I"  # CRC32 hash value
+        )
+        header_sha256_hash_segment = struct.Struct(
+            "<"
+            "B"  # SHA256 hash type
+            "B"  # SHA256 hash length
+            "32s"  # SHA256 hash value
+        )
+        header_data_length_segment = struct.Struct(
+            "<q"  # Signed tensor data length
+            # We write this signed so that we can use the signedness as an
+            # indicator of possible tensor compression in the future.
+        )
+        # Followed by tensor data
 
-        # Reserve room for our tensor hashes.
-        hash_loc = self._file.tell()
-        # Reserve the length of the hash data structures.
-        self._file.write(struct.pack("<H", 0))
-        # Write the number of hashes we're going to write.
-        self._file.write(struct.pack("<B", 2))
-        # Reserve room for the hashes.
-        # ... first, CRC32.
-        self._file.write(struct.pack("<B", HashType.CRC32.value))
-        # ... length of CRC32.
-        self._file.write(struct.pack("<B", 4))
-        # ... and reserve for the actual CRC32.
-        crc32_loc = self._file.tell()
-        self._file.write(struct.pack("<I", 0))
-        # .. second, SHA256.
-        self._file.write(struct.pack("<B", HashType.SHA256.value))
-        # ... length of SHA256.
-        self._file.write(struct.pack("<B", 32))
-        # ... and reserve for the actual SHA256.
-        sha256_loc = self._file.tell()
-        self._file.write(struct.pack("<32B", *[0] * 32))
-        hash_end = self._file.tell()
-        hashes_sz = hash_end - hash_loc - 2
+        (
+            variable_length_start,
+            hash_header_start,
+            crc32_start,
+            sha256_start,
+            data_length_start,
+            data_start,
+        ) = itertools.accumulate(
+            (
+                header_start_segment.size,
+                header_variable_length_segment.size,
+                header_hash_header_segment.size,
+                header_crc32_hash_segment.size,
+                header_sha256_hash_segment.size,
+                header_data_length_segment.size,
+            )
+        )
+        header_size = data_start
 
-        # Reserve room for our 64-bit tensor length
-        tensor_size_loc = self._file.tell()
-        self._file.write(struct.pack("<Q", 0))
-        tensor_startpos = self._file.tell()
-
-        # Write the total number of bytes for our hash data structures.
-        self._file.seek(hash_loc)
-        self._file.write(struct.pack("<H", hashes_sz))
-        self._file.seek(tensor_startpos)
-
-        tensor_raw_sz = 0
-        tensor_compressed_sz = 0
-        compression_ratio = 0
-        if self.compress_tensors:
-            # NOTE: This compression feature is not complete, as we do not
-            #       yet decompress. This was judged to *not* be worthwhile.
-            #       This is left here as an example for future adventurers that
-            #       may want to do model compression.
-            # Create a write buffer to compress our tensor serialization.
-            tensor_buffer = tempfile.TemporaryFile()
-            numpy_tensor.data.tofile(tensor_buffer)
-            tensor_raw_sz = tensor_buffer.tell()
-            self.total_tensor_bytes += tensor_raw_sz
-            tensor_buffer.seek(0)
-            tensor_compressed = self.lz4_frame.compress(tensor_buffer.read())
-            tensor_compressed_sz = len(tensor_compressed)
-            compression_ratio = (tensor_raw_sz * 1.0) / tensor_compressed_sz
-            if compression_ratio > 2:
-                self.total_compressed_tensor_bytes += tensor_compressed_sz
-            else:
-                self.total_compressed_tensor_bytes += tensor_raw_sz
-
-        # Serialize our tensors
-        numpy_tensor.data.tofile(self._file)
-        tensor_endpos = self._file.tell()
-
-        # Go back and write our tensor length out
-        self._file.seek(tensor_size_loc, io.SEEK_SET)
-        # We write this signed, so that we can use the signedness as an
-        # indicator of possible tensor compression in the future.
-        tensor_size = tensor_endpos - tensor_startpos
-        self._file.write(struct.pack("<q", tensor_size))
+        header = bytearray(header_size)
+        header_start_segment.pack_into(
+            header,
+            0,  # Offset
+            header_size,  # Tensor header size
+            idx,  # Module index.
+            tensor_type.value,  # Whether this is a parameter or a buffer
+            name_len,  # Parameter/buffer name length
+        )
+        header_variable_length_segment.pack_into(
+            header,
+            variable_length_start,
+            name_bytes,  # Parameter/buffer name UTF-8 bytes
+            dtype_len,  # Tensor dtype length
+            dtype_bytes,  # Tensor dtype UTF-8 bytes
+            shape_len,  # Tensor shape length
+            *shape,  # Tensor shape I array
+        )
+        header_hash_segment_size = data_length_start - hash_header_start - 2
+        header_hash_header_segment.pack_into(
+            header,
+            hash_header_start,
+            header_hash_segment_size,  # Hash section length
+            2,  # Hash count
+        )
+        header_crc32_hash_segment.pack_into(
+            header,
+            crc32_start,
+            HashType.CRC32.value,  # Hash type
+            4,  # CRC32 hash length
+            0,  # Placeholder hash value
+        )
+        header_sha256_hash_segment.pack_into(
+            header,
+            sha256_start,
+            HashType.SHA256.value,  # Hash type
+            32,  # SHA256 hash length
+            b"",  # Placeholder hash value
+        )
+        tensor_size = tensor.nbytes
+        header_data_length_segment.pack_into(
+            header, data_length_start, tensor_size  # Signed tensor data length
+        )
         self.total_tensor_bytes += tensor_size
-
-        # Write our data structure header size.
-        self._file.seek(ds_header_begin)
-        ds_header_size = tensor_startpos - ds_header_begin
-        self._file.write(struct.pack("<Q", ds_header_size))
+        tensor_pos = header_pos + data_start
 
         # Add our tensor metadata to the index.
-        self._file.seek(self._metadata_cur)
-        self._file.write(struct.pack("<H", len(name_bytes)))
-        self._file.write(name_bytes)
-        self._file.write(struct.pack("<B", tensor_type.value))
-        self._file.write(struct.pack("<B", dtype_len))
-        self._file.write(dtype_bytes)
-        self._file.write(shape_bytes)
-        self._file.write(struct.pack("<Q", ds_header_begin))
-        self._file.write(struct.pack("<Q", tensor_startpos))
-        self._file.write(struct.pack("<Q", tensor_endpos - tensor_startpos))
-        self._metadata_cur = self._file.tell()
+        metadata = struct.pack(
+            "<"
+            "H"  # Name length
+            f"{name_len}s"  # Name
+            "B"  # Whether this is a parameter or a buffer
+            "B"  # Dtype length
+            f"{dtype_len}s"  # Dtype
+            "B"  # Shape length
+            f"{shape_len}I"  # Shape
+            "Q"  # Header start
+            "Q"  # Tensor data start
+            "Q",  # Tensor length,
+            name_len,
+            name_bytes,
+            tensor_type.value,
+            dtype_len,
+            dtype_bytes,
+            shape_len,
+            *shape,
+            header_pos,
+            tensor_pos,
+            tensor_size,
+        )
 
         # Check for overflow
-        if self._file.tell() > self._metadata_end:
+        if self._metadata_cur + len(metadata) > self._metadata_end:
             raise RuntimeError("Metadata overflow")
 
-        # Read our header and tensor back in to calculate the hashes.
-        self._file.seek(ds_header_begin)
-        bytes_to_hash = self._file.read(ds_header_size)
-        bytes_to_hash += self._file.read(tensor_endpos - tensor_startpos)
+        self._file.seek(self._metadata_cur)
+        self._file.write(metadata)
+        self._metadata_cur = self._file.tell()
 
-        # Write our hashes out.
-        crc32 = zlib.crc32(bytes_to_hash)
-        self._file.seek(crc32_loc)
-        self._file.write(struct.pack("<I", crc32))
+        # Calculate the hashes.
+        # Use a barrier to restrict modifications to the header from any thread
+        # until it is done being used by all threads.
+        hash_barrier = threading.Barrier(2)
 
-        sha256 = hashlib.sha256(bytes_to_hash).digest()
-        self._file.seek(sha256_loc)
-        self._file.write(sha256)
+        def write_crc32():
+            crc32 = zlib.crc32(header)
+            crc32 = zlib.crc32(tensor_memory, crc32)
+            hash_barrier.wait()
+            header_crc32_hash_segment.pack_into(
+                header, crc32_start, HashType.CRC32.value, 4, crc32
+            )
+
+        def write_sha256():
+            sha256 = hashlib.sha256(header)
+            sha256.update(tensor_memory)
+            sha256 = sha256.digest()
+            hash_barrier.wait()
+            header_sha256_hash_segment.pack_into(
+                header, sha256_start, HashType.SHA256.value, 32, sha256
+            )
+
+        # Multithread the hash calculations while the tensor is being serialized
+        crc32_thread = threading.Thread(target=write_crc32, daemon=True)
+        sha256_thread = threading.Thread(target=write_sha256, daemon=True)
+        crc32_thread.start()
+        sha256_thread.start()
+
+        self._file.seek(tensor_pos)
+        # tensor_raw_sz = 0
+        # tensor_compressed_sz = 0
+        # compression_ratio = 0
+        # NOTE: This compression feature is not complete, as we do not
+        #       yet decompress. This was judged to *not* be worthwhile.
+        #       This is left here as an example for future adventurers that
+        #       may want to do model compression.
+        # if self.compress_tensors:
+        #     # Create a write buffer to compress our tensor serialization.
+        #     tensor_buffer = tempfile.TemporaryFile()
+        #     numpy_tensor.data.tofile(tensor_buffer)
+        #     tensor_raw_sz = tensor_buffer.tell()
+        #     self.total_tensor_bytes += tensor_raw_sz
+        #     tensor_buffer.seek(0)
+        #     tensor_compressed = self.lz4_frame.compress(tensor_buffer.read())
+        #     tensor_compressed_sz = len(tensor_compressed)
+        #     compression_ratio = (tensor_raw_sz * 1.0) / tensor_compressed_sz
+        #     if compression_ratio > 2:
+        #         self.total_compressed_tensor_bytes += tensor_compressed_sz
+        #     else:
+        #         self.total_compressed_tensor_bytes += tensor_raw_sz
+
+        # Serialize our tensors
+        tensor.tofile(self._file)
+        tensor_endpos = self._file.tell()
+
+        # Write the header
+        # First, wait for the hash calculations to finish
+        # Timeout of an hour as a last resort; it should never take that long
+        crc32_thread.join(timeout=3600)
+        sha256_thread.join(timeout=3600)
+        if crc32_thread.is_alive() or sha256_thread.is_alive():
+            raise RuntimeError("Hash calculation timed out")
+
+        self._file.seek(header_pos)
+        self._file.write(header)
 
         # Move to the end of our serialized tensor to prepare for the next one.
         self._file.seek(tensor_endpos)
@@ -1539,7 +1627,7 @@ class TensorSerializer:
         # Update our prolog and epilog.
         self._sync_prologue_state(update_version=update_version)
 
-        ds_size = self._file.tell() - ds_header_begin
+        ds_size = self._file.tell() - header_pos
         ds_bytes = f"{ds_size:,} bytes"
 
         typ = {
@@ -1548,14 +1636,14 @@ class TensorSerializer:
             TensorType.STATE_DICT: "sd",
         }[tensor_type]
 
-        if self.compress_tensors:
-            comp_report = (
-                f" - tensor:[raw: {tensor_raw_sz},"
-                + f" compressed: {tensor_compressed_sz},"
-                + f" ratio: {compression_ratio:.2f}]"
-            )
-        else:
-            comp_report = ""
+        # if self.compress_tensors:
+        #     comp_report = (
+        #         f" - tensor:[raw: {tensor_raw_sz},"
+        #         + f" compressed: {tensor_compressed_sz},"
+        #         + f" ratio: {compression_ratio:.2f}]"
+        #     )
+        # else:
+        comp_report = ""
         logger.info(
             f"{idx}:{typ}:{name} - {dtype_bytes.decode('utf-8')} - "
             f"{tensor.shape} -> {ds_bytes}{comp_report}"
