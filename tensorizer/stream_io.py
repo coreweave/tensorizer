@@ -205,12 +205,15 @@ class CURLStreamFile:
         # Read the rest of the header response and parse it.
         header_lines = self._curl.stderr.readlines()
         self.response_headers = {}
+        # FIXME: This should really be using the email.parser module, as there are
+        #        edge cases that this doesn't handle correctly, such as headers
+        #        with keys that are the same.
         for line in header_lines:
             line = line.decode("utf-8").strip()
             if not line or ':' not in line:
                 continue
             k, v = line.split(":", maxsplit=1)
-            self.response_headers[k.strip()] = v.strip()
+            self.response_headers[k.strip().lower()] = v.strip()
 
         self.error_buffer = ""
         self._curr = 0 if begin is None else begin

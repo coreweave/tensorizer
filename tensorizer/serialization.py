@@ -439,13 +439,12 @@ class TensorDeserializer(collections.abc.Mapping):
         else:
             return self._file.tell()
 
-    # If our _file object has 'response_headers' attribute, we can use it to
-    # to get the total size of the file, in addition to whether the object
-    # was cached.
+    # If our _file object has 'response_headers' attribute, we can use it
+    # to determine if we were cached or not.
     @property
-    def is_cached(self) -> bool:
+    def cache_status(self) -> Union[bool, str]:
         if hasattr(self._file, "response_headers"):
-            return self._file.response_headers.get("X-Cache-Status", "MISS") == "HIT"
+            return self._file.response_headers.get("X-Cache-Status", False)
         else:
             return False
 
