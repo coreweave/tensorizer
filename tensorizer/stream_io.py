@@ -153,6 +153,7 @@ class CURLStreamFile:
             )
 
         header_r_pipe, header_w_pipe = os.pipe()
+        self._header_pipe = open(header_r_pipe, "rb")
         cmd = [
             curl_path,
             "--header",
@@ -186,7 +187,6 @@ class CURLStreamFile:
         popen_end = time.monotonic()
 
         _wide_pipes.widen_pipe(self._curl.stdout.fileno())  # Widen on Linux
-        self._header_pipe = open(header_r_pipe, "rb")
         resp = self._header_pipe.readline()  # Block on the http header response
         resp_begin = time.monotonic()
 
