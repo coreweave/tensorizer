@@ -432,10 +432,21 @@ class TensorDeserializer(collections.abc.Mapping):
 
     @property
     def total_bytes_read(self) -> int:
+        if hasattr(self._file, "bytes_read"):
+            return self._file.bytes_read
         if self._file.closed:
             return self.total_tensor_bytes
         else:
             return self._file.tell()
+
+    # If our _file object has 'response_headers' attribute, we can use it
+    # to determine if we were cached or not.
+    @property
+    def cache_status(self) -> Optional[str]:
+        if hasattr(self._file, "response_headers"):
+            return self._file.response_headers.get("x-cache-status", None)
+        else:
+            return None
 
     def __getitem__(self, name) -> torch.nn.Parameter:
         if self._plaid_mode:
