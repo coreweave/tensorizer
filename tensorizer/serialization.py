@@ -442,11 +442,11 @@ class TensorDeserializer(collections.abc.Mapping):
     # If our _file object has 'response_headers' attribute, we can use it
     # to determine if we were cached or not.
     @property
-    def cache_status(self) -> Union[bool, str]:
+    def cache_status(self) -> Optional[str]:
         if hasattr(self._file, "response_headers"):
-            return self._file.response_headers.get("x-cache-status", False)
+            return self._file.response_headers.get("x-cache-status", None)
         else:
-            return False
+            return None
 
     def __getitem__(self, name) -> torch.nn.Parameter:
         if self._plaid_mode:
