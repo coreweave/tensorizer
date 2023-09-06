@@ -6,10 +6,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import typing
 import weakref
 from io import SEEK_CUR, SEEK_END, SEEK_SET
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import boto3
@@ -123,6 +124,15 @@ class CURLStreamFile:
     implementing `read`, and only for the purpose of reading the entire file.
     It does support seeking to an arbitrary position, but is very inefficient
     in doing so as it requires re-opening the connection to the server.
+
+    Attributes:
+        popen_latencies: A list of the time it took to start the cURL process.
+        http_response_latencies: A list of the time it took to get the first
+            HTTP response from the server.
+        response_headers: A dictionary of the HTTP response headers.
+        bytes_read: The number of bytes read from the stream.
+        bytes_skipped: The number of bytes skipped from the stream.
+        read_operations: The number of read operations performed on the stream.
     """
 
     def __init__(
@@ -146,6 +156,8 @@ class CURLStreamFile:
             curl_path,
             "--header",
             "Accept-Encoding: identity",
+            "--dump-header",
+            "/dev/stderr",
             "-A",
             _CURL_USER_AGENT,
             "-s",
@@ -162,13 +174,52 @@ class CURLStreamFile:
 
         self._curl = None
         with _wide_pipes.widen_new_pipes():  # Widen on Windows
+            popen_start = time.time()
             self._curl = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 bufsize=256 * 1024 * 1024,
             )
+        popen_end = time.time()
 
         _wide_pipes.widen_pipe(self._curl.stdout.fileno())  # Widen on Linux
+        resp = self._curl.stderr.readline() # Block on the http header response
+        resp_begin = time.time()
+
+        # We reinitialize this object when seeking, so we don't want to overwrite
+        # these tracking variables if they already exist.
+        if not hasattr(self, "popen_latencies"):
+            self.popen_latencies: List[float] = []
+        if not hasattr(self, "http_response_latencies"):
+            self.http_response_latencies: List[float] = []
+        if not hasattr(self, "bytes_read"):
+            self.bytes_read: int = 0
+        if not hasattr(self, "bytes_skipped"):
+            self.bytes_skipped: int = 0
+        if not hasattr(self, "read_operations"):
+            self.read_operations: int = 0
+        self.popen_latencies.append(popen_end - popen_start)
+        self.http_response_latencies.append(resp_begin - popen_end)
+
+        if not resp.startswith(b"HTTP/1.1 2"):
+            self._curl.terminate()
+            self._curl.wait()
+            raise IOError(f"Failed to open stream: {resp.decode('utf-8')}")
+        # Make stderr non-blocking so that we can read the rest of the header without
+        # blocking the main thread.
+        os.set_blocking(self._curl.stderr.fileno(), False)
+        # Read the rest of the header response and parse it.
+        header_lines = self._curl.stderr.readlines()
+        self.response_headers = {}
+        for line in header_lines:
+            line = line.decode("utf-8").strip()
+            if not line:
+                continue
+            k, v = line.split(":", maxsplit=1)
+            self.response_headers[k.strip()] = v.strip()
+
+        self.error_buffer = ""
         self._curr = 0 if begin is None else begin
         self._end = end
         self.closed = False
@@ -273,6 +324,7 @@ class CURLStreamFile:
     def _read_until(
         self, goal_position: int, ba: Union[bytearray, None] = None
     ) -> Union[bytes, int]:
+        self.read_operations += 1
         try:
             if ba is None:
                 rq_sz = goal_position - self._curr
@@ -295,6 +347,7 @@ class CURLStreamFile:
                 else:
                     ret_buff_sz = self._curl.stdout.readinto(ba)
                     ret_buff = ba
+            self.bytes_read += ret_buff_sz
             if ret_buff_sz != rq_sz:
                 self.closed = True
                 self._curl.terminate()
@@ -336,12 +389,14 @@ class CURLStreamFile:
         if self._curl is not None:
             if self._curl.poll() is None:
                 self._curl.stdout.close()
+                self._curl.stderr.close()
                 self._curl.terminate()
                 self._curl.wait()
             else:
                 # stdout is normally closed by the Popen.communicate() method,
                 # which we skip in favour of Popen.stdout.read()
                 self._curl.stdout.close()
+                self._curl.stderr.close()
             self._curl = None
 
     def readline(self):
@@ -362,6 +417,7 @@ class CURLStreamFile:
         elif position > self._curr:
             # We're seeking forward, so we just read until we get there.
             self._read_until(position)
+            self.bytes_skipped += position - self._curr
         else:
             # To seek backwards, we need to close out our existing process and
             # start a new one.
