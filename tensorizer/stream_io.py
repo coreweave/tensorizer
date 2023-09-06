@@ -202,7 +202,7 @@ class CURLStreamFile:
         self.popen_latencies.append(popen_end - popen_start)
         self.http_response_latencies.append(resp_begin - popen_end)
 
-        if not resp.startswith(b"HTTP/1.1 2") or not resp.startswith(b"HTTP/2 2"):
+        if not resp.contains(b"HTTP/1.1 2") and not resp.startswith(b"HTTP/2 2"):
             self._curl.terminate()
             self._curl.wait()
             raise IOError(f"Failed to open stream: {resp.decode('utf-8')}")
