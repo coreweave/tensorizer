@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `CurlStreamFile` now tracks request headers in
-  `CurlStreamFile.response_headers`
+- `CURLStreamFile` now tracks request headers in
+  `CURLStreamFile.response_headers`
   - This can be used to track cache hits and misses during deserialization
     through the `TensorDeserializer.cache_status` property
 
