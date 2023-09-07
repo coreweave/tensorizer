@@ -152,14 +152,11 @@ class CURLStreamFile:
                 " and could not be found."
             )
 
-        header_r_pipe, header_w_pipe = os.pipe()
-        self._header_pipe = open(header_r_pipe, "rb")
         cmd = [
             curl_path,
             "--header",
             "Accept-Encoding: identity",
-            "--dump-header",
-            f"/dev/fd/{header_w_pipe}",  # TODO: Windows support
+            "--include",
             "-A",
             _CURL_USER_AGENT,
             "-s",
@@ -180,14 +177,13 @@ class CURLStreamFile:
             # NOTE: `256mb` buffer on the python IO object.
             self._curl = subprocess.Popen(
                 cmd,
-                pass_fds=(header_w_pipe,),
                 stdout=subprocess.PIPE,
                 bufsize=256 * 1024 * 1024,
             )
         popen_end = time.monotonic()
 
         _wide_pipes.widen_pipe(self._curl.stdout.fileno())  # Widen on Linux
-        resp = self._header_pipe.readline()  # Block on the http header response
+        resp = self._curl.stdout.readline()  # Block on the http response header
         resp_begin = time.monotonic()
 
         # We reinitialize this object when seeking,
@@ -200,15 +196,11 @@ class CURLStreamFile:
         self.http_response_latencies.append(resp_begin - popen_end)
 
         if not resp.startswith((b"HTTP/1.1 2", b"HTTP/2 2")):
-            self._curl.terminate()
-            self._curl.wait()
+            self.close()
             raise IOError(f"Failed to open stream: {resp.decode('utf-8')}")
-        # Make the header pipe non-blocking so that we can read the rest
-        # of the header without blocking the main thread.
-        os.set_blocking(header_r_pipe, False)
         # Read the rest of the header response and parse it.
         # noinspection PyTypeChecker
-        self.response_headers = http.client.parse_headers(self._header_pipe)
+        self.response_headers = http.client.parse_headers(self._curl.stdout)
 
         self._curr = 0 if begin is None else begin
         self._end = end
@@ -388,14 +380,12 @@ class CURLStreamFile:
         if self._curl is not None:
             if self._curl.poll() is None:
                 self._curl.stdout.close()
-                self._header_pipe.close()
                 self._curl.terminate()
                 self._curl.wait()
             else:
                 # stdout is normally closed by the Popen.communicate() method,
                 # which we skip in favour of Popen.stdout.read()
                 self._curl.stdout.close()
-                self._header_pipe.close()
             self._curl = None
 
     def readline(self):
