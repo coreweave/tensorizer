@@ -12,19 +12,35 @@ except ImportError:
     resource = None
 
 import collections.abc
+import concurrent.futures
 import ctypes
+import dataclasses
 import hashlib
 import io
 import itertools
 import logging
 import mmap
 import os
+import queue
 import struct
 import threading
 import time
 import typing
 import zlib
+from collections import OrderedDict
 from enum import Enum
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy
 import torch
@@ -37,9 +53,6 @@ if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
 else:
     cudart = None
-
-from collections import OrderedDict
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 lz4 = None
 
@@ -227,8 +240,8 @@ class TensorDeserializer(collections.abc.Mapping):
         # Check the version
         if version > TENSORIZER_VERSION:
             raise ValueError(
-                f"This {TENSORIZER_VERSION} version cannot read"
-                f"file versioned {version}."
+                f"This tensorizer version ({TENSORIZER_VERSION}) cannot read"
+                f" file versioned {version}."
             )
 
         # Skip 32-byte hash (unused)
@@ -1228,11 +1241,82 @@ class TensorSerializer:
         else:
             self._mode_check(file_obj)
             self._file = file_obj
-        self._tensors = 0
+
+        # Get information about the file object's capabilities
+        _fd_getter = getattr(self._file, "fileno", None)
+        self._fd = _fd_getter() if callable(_fd_getter) else None
+        _seekable_getter = getattr(self._file, "seekable", None)
+        self._seekable = (
+            _seekable_getter() if callable(_seekable_getter) else True
+        )
+        if not self._seekable:
+            raise ValueError("file_obj must support seeking for serialization")
+
+        # Decide on a pwrite implementation
+        if hasattr(os, "pwrite") and self._fd is not None:
+            # the os.pwrite syscall can't be used on some file-like objects
+            # like io.BytesIO, as they aren't actual operating system constructs
+            # It also may not be available, depending on the OS.
+            self._pwrite = self._pwrite_syscall
+            self._write_lock = None
+            concurrent_writes_possible = True
+        else:
+            # The fallback implementation requires a lock, as a single
+            # file offset must be shared between threads.
+            self._pwrite = self._pwrite_fallback
+            self._write_lock = threading.Lock()
+            concurrent_writes_possible = False
+
         self._idx = 0
-        self.total_tensor_bytes = 0
         self.total_compressed_tensor_bytes = 0
         self.compress_tensors = compress_tensors
+
+        # This thread pool handles CPU-bound tasks like hashing.
+        # Hashing from the Python standard library can benefit from
+        # multithreading in spite of the GIL because CPython's hash function
+        # implementations release the GIL during longer hash computations.
+        self._computation_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=os.cpu_count(),
+            thread_name_prefix="TensorizerComputation-",
+        )
+
+        # There is no use spawning many writer threads when they share a lock.
+        max_concurrent_writers = 4 if concurrent_writes_possible else 1
+
+        # This thread pool handles straightforward write tasks, such as
+        # tensor data writes.
+        self._writer_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_concurrent_writers,
+            thread_name_prefix="TensorizerWriter-",
+        )
+
+        self._tensor_count_update_lock = threading.Lock()
+
+        # This thread pool is specifically for writing tensor entry headers.
+        # It is separate because these tasks each depend on the completion of
+        # one or more hashing tasks from the _computation_pool, and may spend a
+        # significant amount of time waiting without even attempting any I/O.
+        # If it shared a worker count with the _writer_pool, these tasks could
+        # stall other I/O operations that have no prerequisites and are ready,
+        # since there is no way to yield its thread slot back to the pool.
+        self._header_writer_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_concurrent_writers,
+            thread_name_prefix="TensorizerHeaderWriter-",
+        )
+
+        # Implementation detail for CPython: ThreadPoolExecutor objects
+        # use an instance of queue.SimpleQueue as a FIFO work queue,
+        # so the order that tasks are started (but not necessarily finished)
+        # corresponds exactly to the order of ThreadPoolExecutor.submit() calls.
+        # This guarantees that, for example, the order that the
+        # _header_writer_pool waits on hashes from the _computation_pool
+        # always matches the order that the _computation_pool itself begins
+        # those hash operations, assuming corresponding tasks are submitted
+        # to each pool in the same relative order.
+
+        # Tracks work submitted to all pools to wait for pending work to finish.
+        self._jobs: List[concurrent.futures.Future] = []
+
         if self.compress_tensors:
             import lz4.frame
 
@@ -1243,36 +1327,128 @@ class TensorSerializer:
         # Write our magic bytes.
         self._file.write(TENSORIZER_MAGIC)
 
-        # Write the version number.
-        self._version_loc = self._file.tell()
-        self._version = NON_OPAQUE_TENSORIZER_VERSION
-        self._file.write(struct.pack("<I", self._version))
-
-        # Reserve 32 bytes for the hash. (Unused for now)
-        self._hash_loc = self._file.tell()
-        self._file.write(struct.pack("<Q", 0) * 4)
-
-        # Reserve 8 bytes for the total size of the file.
-        self._size_loc = self._file.tell()
-        self._file.write(struct.pack("<Q", 0))
-
-        # Reserve 8 bytes for the total size of tensor data.
-        self._tensor_size_loc = self._file.tell()
-        self._file.write(struct.pack("<Q", 0))
-
-        # Reserve the next 8 bytes for the total number of tensors.
-        self._tensor_ct_loc = self._file.tell()
-        self._file.write(struct.pack("<Q", 0))
+        # Write file header metadata
+        self._file_header_loc = self._file.tell()
+        self._file_header = self._FileHeader(
+            version_number=NON_OPAQUE_TENSORIZER_VERSION,
+            tensor_size=0,
+            tensor_count=0,
+        )
+        self._file.write(self._file_header.to_bytes())
 
         # Reserve 256kb for metadata.
         metadata_size = 256 * 1024
         self._file.write(struct.pack("<Q", metadata_size))
         self._metadata_loc = self._file.tell()
-        self._file.write(struct.pack("<Q", 0) * (metadata_size // 8))
+        self._file.write(bytes(metadata_size))
         self._metadata_cur = self._metadata_loc
         self._metadata_end = self._metadata_loc + metadata_size
 
         self._tensor_index: List[TensorEntry] = []
+
+    @dataclasses.dataclass
+    class _FileHeader:
+        format: ClassVar[struct.Struct] = struct.Struct(
+            "<"  # Little-endian
+            "I"  # Version number
+            "32x"  # File hash (unused)
+            "Q"  # Total size of tensor data (nominally, total file size)
+            "8x"  # Nominally, total size of tensor data (actually unused)
+            "Q"  # Total number of tensors
+        )
+        version_number: int
+        tensor_size: int
+        tensor_count: int
+
+        def to_bytes(self):
+            return self.format.pack(
+                self.version_number,
+                self.tensor_size,
+                self.tensor_count,
+            )
+
+    @property
+    def total_tensor_bytes(self):
+        return self._file_header.tensor_size
+
+    def _sync_prologue_state(self):
+        """
+        This is called after the tensor has been written to the file,
+        and ensures that the file is in a consistent state.
+
+        This must not be called while any I/O jobs are pending in
+        ``self._jobs``, as it is not thread-safe, and the contents of
+        ``self._file_header`` are only updated once each tensor writing job
+        finishes.
+        """
+        curr = self._file.tell()
+
+        # Write our zero-length field, that indicates that this is the last
+        # tensor. This will be overwritten if another tensor is written.
+        self._file.write(struct.pack("<Q", 0))
+
+        # Write our new file header.
+        self._file.seek(self._file_header_loc)
+        self._file.write(self._file_header.to_bytes())
+
+        # Reset our file pointer to the end of the file,
+        # minus the zero-length field.
+        self._file.seek(curr)
+
+    def _pwrite(self, data, offset: int, verify: bool = True) -> int:
+        """
+        Thread-safe file write that leaves the file offset unchanged.
+
+        Args:
+            data: The data to write.
+            offset: The position in the file at which to write.
+            verify: Whether to throw an error if the number of bytes written
+                doesn't match the length of `data`.
+
+        Returns:
+            The number of bytes written.
+        Raises:
+            OSError: ``verify=True`` and the number of bytes written
+                did not match the length of `data`.
+        """
+        # The implementation for this function must be chosen during __init__
+        # based on the capabilities of the platform and the file object used
+        raise RuntimeError("pwrite was called before being initialized")
+
+    def _pwrite_syscall(self, data, offset: int, verify: bool = True) -> int:
+        # This implementation of pwrite uses a Unix syscall, and is safe to
+        # run even between normal file writes.
+        bytes_written = os.pwrite(self._fd, data, offset)
+        if verify:
+            self._verify_bytes_written(bytes_written, data)
+        return bytes_written
+
+    def _pwrite_fallback(self, data, offset: int, verify: bool = True) -> int:
+        # This implementation of pwrite uses a lock shared with all writers
+        # for the entire file object. It is not safe to run this
+        # concurrently with any other code that could modify the file offset
+        # except other calls to _pwrite_fallback.
+        with self._write_lock:
+            old_pos = self._file.tell()
+            if old_pos != offset:
+                self._file.seek(offset)
+            bytes_written = self._file.write(data)
+            self._file.seek(old_pos)
+        if verify:
+            self._verify_bytes_written(bytes_written, data)
+        return bytes_written
+
+    @staticmethod
+    def _verify_bytes_written(bytes_written: int, data_written):
+        # For typed buffers (e.g. arrays) the len() isn't the number of bytes
+        expected_bytes_written = getattr(
+            data_written, "nbytes", len(data_written)
+        )
+        if bytes_written != expected_bytes_written:
+            raise OSError(
+                f"pwrite failed to write correctly: {bytes_written} bytes were"
+                f" written when {expected_bytes_written} bytes were requested"
+            )
 
     @staticmethod
     def _mode_check(file_obj: io.IOBase) -> None:
@@ -1292,18 +1468,22 @@ class TensorSerializer:
             )
 
     def __del__(self):
+        self._shutdown_thread_pools()
         if getattr(self, "_file", None) is not None:
             self._file.close()
 
-    @staticmethod
-    def _dump_shape(obj) -> bytes:
-        """
-        Returns shape of the tensor as an encoded byte string.
-        """
-        bstr = struct.pack("<B", len(obj))
-        for i in obj:
-            bstr += struct.pack("<I", i)
-        return bstr
+    def _shutdown_thread_pools(self):
+        for pool in "_computation_pool", "_writer_pool", "_header_writer_pool":
+            thread_pool = getattr(self, pool, None)
+            if thread_pool is not None:
+                for j in self._jobs:
+                    j.cancel()
+                thread_pool.shutdown(wait=False)
+
+    def _synchronize_pools(self):
+        for j in self._jobs:
+            j.result(timeout=3600)
+        self._jobs.clear()
 
     def close(self) -> None:
         """
@@ -1313,47 +1493,213 @@ class TensorSerializer:
 
         final_sz = self._file.tell()
         self._file.close()
+        self._shutdown_thread_pools()
         logger.info(f"Tensors completed serializing to {final_sz} bytes")
-        if self.compress_tensors:
-            compression_ratio = (
-                self.total_tensor_bytes / self.total_compressed_tensor_bytes
+        # if self.compress_tensors:
+        #     compression_ratio = (
+        #         self.total_tensor_bytes / self.total_compressed_tensor_bytes
+        #     )
+        #     logger.info(f"Uncomp'd bytes: {self.total_tensor_bytes}")
+        #     logger.info(f"Comp'd bytes: {self.total_compressed_tensor_bytes}")
+        #     logger.info(f"Ratio: {compression_ratio:.2f}")
+
+    @dataclasses.dataclass(init=False)
+    class _TensorHeader:
+        # Fields with ClassVar are shared across all instances,
+        # other fields are calculated per-instance
+        buffer: bytearray
+        size: int
+
+        start_segment: ClassVar[struct.Struct] = struct.Struct(
+            "<"  # Little-endian
+            "Q"  # Tensor header size
+            "H"  # Module index.
+            "B"  # Whether this is a parameter or a buffer
+            "H"  # Parameter/buffer name length
+        )
+
+        # Variable length fields, can't be compiled into
+        # a static struct definition without calculating sizes first
+        variable_length_segment_template: ClassVar[str] = (
+            "<"
+            "{name_len:d}s"  # Parameter/buffer name UTF-8 bytes
+            "B"  # Tensor dtype length
+            "{dtype_len:d}s"  # Tensor dtype UTF-8 bytes
+            "B"  # Tensor shape length
+            "{shape_len:d}I"  # Tensor shape I array
+        )
+        variable_length_segment: struct.Struct
+        variable_length_offset: ClassVar[int] = start_segment.size
+
+        hash_header_segment: ClassVar[struct.Struct] = struct.Struct(
+            "<"
+            "H"  # Hash section length
+            "B"  # Hash count (fixed for a particular tensorizer version)
+        )
+        hash_header_offset: int
+        hash_count: ClassVar[int] = 2
+
+        crc32_hash_segment: ClassVar[struct.Struct] = struct.Struct(
+            "<"
+            "B"  # CRC32 hash type (HashType enum value)
+            "B"  # CRC32 hash length
+            "I"  # CRC32 hash value
+        )
+        crc32_hash_offset: int
+
+        sha256_hash_segment: ClassVar[struct.Struct] = struct.Struct(
+            "<"
+            "B"  # SHA256 hash type
+            "B"  # SHA256 hash length
+            "32s"  # SHA256 hash value
+        )
+        sha256_hash_offset: int
+
+        data_length_segment: ClassVar[struct.Struct] = struct.Struct(
+            "<q"  # Signed tensor data length
+            # We write this signed so that we can use the signedness as an
+            # indicator of possible tensor compression in the future.
+        )
+        data_length_offset: int
+
+        data_offset: int
+
+        # This isn't part of the tensor header,
+        # but it shares much of the same information
+        metadata_entry_segment_template: ClassVar[str] = (
+            "<"
+            "H"  # Name length
+            "{name_len:d}s"  # Name
+            "B"  # Whether this is a parameter or a buffer
+            "B"  # Dtype length
+            "{dtype_len:d}s"  # Dtype
+            "B"  # Shape length
+            "{shape_len:d}I"  # Shape
+            "Q"  # Header start (relative to the file)
+            "Q"  # Tensor data start (relative to the file)
+            "Q"  # Tensor length
+        )
+        metadata_entry: bytes
+
+        def __init__(
+            self,
+            module_index: int,
+            tensor_type: TensorType,
+            name: bytes,
+            dtype: bytes,
+            shape: Sequence[int],
+            data_length: int,
+            file_offset: int,
+        ):
+            # Calculate the variable length segment
+            name_len = len(name)
+            dtype_len = len(dtype)
+            # NB: shape_len is the number of dimensions,
+            # not the encoded byte length
+            shape_len = len(shape)
+            self.variable_length_segment = struct.Struct(
+                self.variable_length_segment_template.format(
+                    name_len=name_len,
+                    dtype_len=dtype_len,
+                    shape_len=shape_len,
+                )
             )
-            logger.info(f"Uncomp'd bytes: {self.total_tensor_bytes}")
-            logger.info(f"Comp'd bytes: {self.total_compressed_tensor_bytes}")
-            logger.info(f"Ratio: {compression_ratio:.2f}")
 
-    def _sync_prologue_state(self, update_version: bool = False):
-        """
-        This is called after the tensor has been written to the file, and
-        ensures that the file is in a consistent state.
+            # Calculate offsets
+            (
+                self.variable_length_offset,
+                self.hash_header_offset,
+                self.crc32_hash_offset,
+                self.sha256_hash_offset,
+                self.data_length_offset,
+                self.data_offset,
+            ) = itertools.accumulate(
+                (
+                    self.start_segment.size,
+                    self.variable_length_segment.size,
+                    self.hash_header_segment.size,
+                    self.crc32_hash_segment.size,
+                    self.sha256_hash_segment.size,
+                    self.data_length_segment.size,
+                )
+            )
+            self.size = self.data_offset
 
-        Args:
-            update_version: If true, the file's version will be updated to
-                `self._version`.
-        """
-        curr = self._file.tell()
+            self.buffer = bytearray(self.size)
+            self.start_segment.pack_into(
+                self.buffer,
+                0,  # Offset
+                self.size,  # Tensor header size
+                module_index,  # Module index.
+                tensor_type.value,  # Whether this is a parameter or a buffer
+                name_len,  # Parameter/buffer name length
+            )
+            self.variable_length_segment.pack_into(
+                self.buffer,
+                self.variable_length_offset,
+                name,  # Parameter/buffer name UTF-8 bytes
+                dtype_len,  # Tensor dtype length
+                dtype,  # Tensor dtype UTF-8 bytes
+                shape_len,  # Tensor shape length
+                *shape,  # Tensor shape I array
+            )
+            self.hash_segment_size = (
+                self.data_length_offset - self.hash_header_offset - 2
+            )
+            self.hash_header_segment.pack_into(
+                self.buffer,
+                self.hash_header_offset,
+                self.hash_segment_size,  # Hash section length
+                self.hash_count,  # Hash count
+            )
 
-        # Write our zero-length field, that indicates that this is the last
-        # tensor. This will be overwritten if another tensor is written.
-        self._file.write(struct.pack("<Q", 0))
+            # Placeholders
+            self.add_crc32(0)
+            self.add_sha256(b"")
 
-        if update_version:
-            self._file.seek(self._version_loc)
-            self._file.write(struct.pack("<I", self._version))
+            self.data_length_segment.pack_into(
+                self.buffer, self.data_length_offset, data_length
+            )
 
-        # Write the total number of tensors.
-        self._file.seek(self._tensor_ct_loc)
-        self._file.write(struct.pack("<Q", self._tensors))
-        # Write our total file size.
-        self._file.seek(self._size_loc)
-        self._file.write(struct.pack("<Q", curr))
-        # Write the total bytes of tensor data written.
-        self._file.seek(self._size_loc)
-        self._file.write(struct.pack("<Q", self.total_tensor_bytes))
+            metadata_entry_segment: struct.Struct = struct.Struct(
+                self.metadata_entry_segment_template.format(
+                    name_len=name_len,
+                    dtype_len=dtype_len,
+                    shape_len=shape_len,
+                )
+            )
 
-        # Reset our file pointer to the end of the file, minus the zero-length
-        # field.
-        self._file.seek(curr)
+            self.metadata_entry = metadata_entry_segment.pack(
+                name_len,  # Name length
+                name,  # Name
+                tensor_type.value,  # Whether this is a parameter or a buffer
+                dtype_len,  # Dtype length
+                dtype,  # Dtype
+                shape_len,  # Shape length
+                *shape,  # Shape
+                file_offset,  # Header start (relative to the file)
+                # Tensor data start (relative to the file):
+                file_offset + self.data_offset,
+                data_length,  # Tensor length
+            )
+
+        def add_crc32(self, value: int):
+            self.crc32_hash_segment.pack_into(
+                self.buffer,
+                self.crc32_hash_offset,
+                HashType.CRC32.value,  # Hash type
+                4,  # CRC32 hash length
+                value,  # Hash value
+            )
+
+        def add_sha256(self, value: bytes):
+            self.sha256_hash_segment.pack_into(
+                self.buffer,
+                self.sha256_hash_offset,
+                HashType.SHA256.value,  # Hash type
+                32,  # SHA256 hash length
+                value,  # Hash value
+            )
 
     def write_tensor(
         self,
@@ -1395,250 +1741,139 @@ class TensorSerializer:
            uint64                           tensor_sz,
            []byte                           tensor }
         """
+        self._write_tensor(
+            idx=idx, name=name, tensor_type=tensor_type, tensor=tensor
+        )
 
+    def _write_tensor(
+        self,
+        idx,
+        name,
+        tensor_type: TensorType,
+        tensor: Union[torch.Tensor, numpy.ndarray],
+        *,
+        _synchronize: bool = True,
+        _start_pos: Optional[int] = None,
+    ) -> int:
+        """
+        Underlying implementation for `write_tensor()`,
+        providing additional controls for asynchronous writes
+
+        Args:
+            idx: The index of the tensor in the module.
+            name: The name of the tensor.
+            tensor_type: The type of the tensor. This is used to determine
+                how to interpret the tensor.
+            tensor: The tensor to serialize.
+            _synchronize: Whether to synchronize metadata after writing
+                and ensure that all data is written to the file before
+                the call returns. If false, data may continue to be written
+                asynchronously even after this call returns.
+            _start_pos:
+                Where in the file to write the tensor entry. If not specified,
+                writes starting at the current file offset.
+        """
         if isinstance(tensor, torch.Tensor):
             numpy_tensor = _NumpyTensor.from_tensor(tensor)
         else:
             numpy_tensor = _NumpyTensor.from_array(tensor)
 
         dtype_name = numpy_tensor.numpy_dtype
-        update_version = False
         if numpy_tensor.is_opaque:
             # The datatype name needs to contain both the numpy dtype that the
             # data is serialized as and the original torch dtype.
             dtype_name += OPAQUE_DTYPE_SEP + numpy_tensor.torch_dtype
+            self._file_header.version_number = TENSORIZER_VERSION
 
-            if self._version != TENSORIZER_VERSION:
-                self._version = TENSORIZER_VERSION
-                update_version = True
-
-        if len(dtype_name) >= 256:
-            raise ValueError("dtype name length should be less than 256")
-
-        header_pos = self._file.tell()
         tensor = numpy_tensor.data
         tensor_memory = numpy_tensor.data.data
-        header_start_segment = struct.Struct(
-            "<"  # Little-endian
-            "Q"  # Tensor header size
-            "H"  # Module index.
-            "B"  # Whether this is a parameter or a buffer
-            "H"  # Parameter/buffer name length
-        )
-        # Variable length fields, can't be compiled into
-        # a static struct definition without calculating sizes first:
-        name_bytes = name.encode("utf-8")
-        name_len = len(name_bytes)
-        dtype_bytes = dtype_name.encode("utf-8")
-        dtype_len = len(dtype_bytes)
-        shape = tensor.shape
-        # NB: shape_len is the number of dimensions, not the encoded byte length
-        shape_len = len(shape)
-
-        header_variable_length_segment = struct.Struct(
-            "<"
-            f"{name_len}s"  # Parameter/buffer name UTF-8 bytes
-            "B"  # Tensor dtype length
-            f"{dtype_len}s"  # Tensor dtype UTF-8 bytes
-            "B"  # Tensor shape length
-            f"{shape_len}I"  # Tensor shape I array
-        )
-        header_hash_header_segment = struct.Struct(
-            "<"
-            "H"  # Hash section length
-            "B"  # Hash count (fixed for a particular tensorizer version)
-        )
-        header_crc32_hash_segment = struct.Struct(
-            "<"
-            "B"  # CRC32 hash type (HashType enum value)
-            "B"  # CRC32 hash length
-            "I"  # CRC32 hash value
-        )
-        header_sha256_hash_segment = struct.Struct(
-            "<"
-            "B"  # SHA256 hash type
-            "B"  # SHA256 hash length
-            "32s"  # SHA256 hash value
-        )
-        header_data_length_segment = struct.Struct(
-            "<q"  # Signed tensor data length
-            # We write this signed so that we can use the signedness as an
-            # indicator of possible tensor compression in the future.
-        )
-        # Followed by tensor data
-
-        (
-            variable_length_start,
-            hash_header_start,
-            crc32_start,
-            sha256_start,
-            data_length_start,
-            data_start,
-        ) = itertools.accumulate(
-            (
-                header_start_segment.size,
-                header_variable_length_segment.size,
-                header_hash_header_segment.size,
-                header_crc32_hash_segment.size,
-                header_sha256_hash_segment.size,
-                header_data_length_segment.size,
-            )
-        )
-        header_size = data_start
-
-        header = bytearray(header_size)
-        header_start_segment.pack_into(
-            header,
-            0,  # Offset
-            header_size,  # Tensor header size
-            idx,  # Module index.
-            tensor_type.value,  # Whether this is a parameter or a buffer
-            name_len,  # Parameter/buffer name length
-        )
-        header_variable_length_segment.pack_into(
-            header,
-            variable_length_start,
-            name_bytes,  # Parameter/buffer name UTF-8 bytes
-            dtype_len,  # Tensor dtype length
-            dtype_bytes,  # Tensor dtype UTF-8 bytes
-            shape_len,  # Tensor shape length
-            *shape,  # Tensor shape I array
-        )
-        header_hash_segment_size = data_length_start - hash_header_start - 2
-        header_hash_header_segment.pack_into(
-            header,
-            hash_header_start,
-            header_hash_segment_size,  # Hash section length
-            2,  # Hash count
-        )
-        header_crc32_hash_segment.pack_into(
-            header,
-            crc32_start,
-            HashType.CRC32.value,  # Hash type
-            4,  # CRC32 hash length
-            0,  # Placeholder hash value
-        )
-        header_sha256_hash_segment.pack_into(
-            header,
-            sha256_start,
-            HashType.SHA256.value,  # Hash type
-            32,  # SHA256 hash length
-            b"",  # Placeholder hash value
-        )
         tensor_size = tensor.nbytes
-        header_data_length_segment.pack_into(
-            header, data_length_start, tensor_size  # Signed tensor data length
+        name_bytes = name.encode("utf-8")
+        dtype_bytes = dtype_name.encode("utf-8")
+        if len(dtype_bytes) >= 256:
+            raise ValueError("dtype name length should be less than 256")
+        shape = tensor.shape
+        header_pos = self._file.tell() if _start_pos is None else _start_pos
+        header = self._TensorHeader(
+            idx,
+            tensor_type,
+            name_bytes,
+            dtype_bytes,
+            shape,
+            tensor_size,
+            header_pos,
         )
-        self.total_tensor_bytes += tensor_size
-        tensor_pos = header_pos + data_start
+
+        tensor_pos = header_pos + header.data_offset
 
         # Add our tensor metadata to the index.
-        metadata = struct.pack(
-            "<"
-            "H"  # Name length
-            f"{name_len}s"  # Name
-            "B"  # Whether this is a parameter or a buffer
-            "B"  # Dtype length
-            f"{dtype_len}s"  # Dtype
-            "B"  # Shape length
-            f"{shape_len}I"  # Shape
-            "Q"  # Header start
-            "Q"  # Tensor data start
-            "Q",  # Tensor length,
-            name_len,
-            name_bytes,
-            tensor_type.value,
-            dtype_len,
-            dtype_bytes,
-            shape_len,
-            *shape,
-            header_pos,
-            tensor_pos,
-            tensor_size,
-        )
-
+        metadata = header.metadata_entry
         # Check for overflow
         if self._metadata_cur + len(metadata) > self._metadata_end:
             raise RuntimeError("Metadata overflow")
 
-        self._file.seek(self._metadata_cur)
-        self._file.write(metadata)
-        self._metadata_cur = self._file.tell()
+        metadata_pos = self._metadata_cur
+        self._metadata_cur += len(metadata)
+
+        # This task is I/O-bound and has no prerequisites,
+        # so it goes into the regular writer pool.
+        def write_metadata():
+            self._pwrite(metadata, metadata_pos)
+
+        self._jobs.append(self._writer_pool.submit(write_metadata))
 
         # Calculate the hashes.
-        # Use a barrier to restrict modifications to the header from any thread
-        # until it is done being used by all threads.
-        hash_barrier = threading.Barrier(2)
 
-        def write_crc32():
-            crc32 = zlib.crc32(header)
-            crc32 = zlib.crc32(tensor_memory, crc32)
-            hash_barrier.wait()
-            header_crc32_hash_segment.pack_into(
-                header, crc32_start, HashType.CRC32.value, 4, crc32
-            )
+        # These two tasks are CPU-bound and don't block the GIL,
+        # so they go into the computation thread pool.
+        def compute_crc32():
+            crc32 = zlib.crc32(header.buffer)
+            return zlib.crc32(tensor_memory, crc32)
 
-        def write_sha256():
-            sha256 = hashlib.sha256(header)
+        def compute_sha256():
+            sha256 = hashlib.sha256(header.buffer)
             sha256.update(tensor_memory)
-            sha256 = sha256.digest()
-            hash_barrier.wait()
-            header_sha256_hash_segment.pack_into(
-                header, sha256_start, HashType.SHA256.value, 32, sha256
-            )
+            return sha256.digest()
 
-        # Multithread the hash calculations while the tensor is being serialized
-        crc32_thread = threading.Thread(target=write_crc32, daemon=True)
-        sha256_thread = threading.Thread(target=write_sha256, daemon=True)
-        crc32_thread.start()
-        sha256_thread.start()
+        # This task is I/O-bound and dependent on the previous two tasks,
+        # so it goes into the header writer pool.
+        def commit_header(
+            crc32_future: concurrent.futures.Future,
+            sha256_future: concurrent.futures.Future,
+        ):
+            crc32 = crc32_future.result(3600)
+            sha256 = sha256_future.result(3600)
+            header.add_crc32(crc32)
+            header.add_sha256(sha256)
+            self._pwrite(header.buffer, header_pos)
 
-        self._file.seek(tensor_pos)
-        # tensor_raw_sz = 0
-        # tensor_compressed_sz = 0
-        # compression_ratio = 0
-        # NOTE: This compression feature is not complete, as we do not
-        #       yet decompress. This was judged to *not* be worthwhile.
-        #       This is left here as an example for future adventurers that
-        #       may want to do model compression.
-        # if self.compress_tensors:
-        #     # Create a write buffer to compress our tensor serialization.
-        #     tensor_buffer = tempfile.TemporaryFile()
-        #     numpy_tensor.data.tofile(tensor_buffer)
-        #     tensor_raw_sz = tensor_buffer.tell()
-        #     self.total_tensor_bytes += tensor_raw_sz
-        #     tensor_buffer.seek(0)
-        #     tensor_compressed = self.lz4_frame.compress(tensor_buffer.read())
-        #     tensor_compressed_sz = len(tensor_compressed)
-        #     compression_ratio = (tensor_raw_sz * 1.0) / tensor_compressed_sz
-        #     if compression_ratio > 2:
-        #         self.total_compressed_tensor_bytes += tensor_compressed_sz
-        #     else:
-        #         self.total_compressed_tensor_bytes += tensor_raw_sz
+        crc32_task = self._computation_pool.submit(compute_crc32)
+        sha256_task = self._computation_pool.submit(compute_sha256)
+        commit_header_task = self._header_writer_pool.submit(
+            commit_header, crc32_task, sha256_task
+        )
+        self._jobs.extend((crc32_task, sha256_task, commit_header_task))
 
-        # Serialize our tensors
-        tensor.tofile(self._file)
-        tensor_endpos = self._file.tell()
+        # This task is I/O-bound and has no prerequisites,
+        # so it goes into the regular writer pool.
+        def write_tensor_data():
+            bytes_written = self._pwrite(tensor_memory, tensor_pos)
+            with self._tensor_count_update_lock:
+                self._file_header.tensor_count += 1
+                self._file_header.tensor_size += bytes_written
 
-        # Write the header
-        # First, wait for the hash calculations to finish
-        # Timeout of an hour as a last resort; it should never take that long
-        crc32_thread.join(timeout=3600)
-        sha256_thread.join(timeout=3600)
-        if crc32_thread.is_alive() or sha256_thread.is_alive():
-            raise RuntimeError("Hash calculation timed out")
+        self._jobs.append(self._writer_pool.submit(write_tensor_data))
+        tensor_endpos = tensor_pos + tensor_size
 
-        self._file.seek(header_pos)
-        self._file.write(header)
+        # Update our prologue.
+        if _synchronize:
+            self._synchronize_pools()
+            # Move to the end of our serialized tensor to prepare
+            # for the next one in the synchronized case.
+            self._file.seek(tensor_endpos)
+            self._sync_prologue_state()
 
-        # Move to the end of our serialized tensor to prepare for the next one.
-        self._file.seek(tensor_endpos)
-        self._tensors += 1
-
-        # Update our prolog and epilog.
-        self._sync_prologue_state(update_version=update_version)
-
-        ds_size = self._file.tell() - header_pos
+        ds_size = tensor_endpos - header_pos
         ds_bytes = f"{ds_size:,} bytes"
 
         typ = {
@@ -1659,22 +1894,149 @@ class TensorSerializer:
             f"{idx}:{typ}:{name} - {dtype_bytes.decode('utf-8')} - "
             f"{tensor.shape} -> {ds_bytes}{comp_report}"
         )
+        return tensor_endpos
+
+    @staticmethod
+    def _async_bulk_device_to_host_transfer(
+        tensors, max_read_ahead: Optional[int] = 32
+    ) -> Tuple[Iterator[torch.Tensor], Callable]:
+        """
+        Transfers CUDA tensors to host memory asynchronously in bulk.
+
+        Args:
+            tensors: The list of tensors to transfer.
+            max_read_ahead: The maximum number of tensors to queue.
+
+        Returns:
+            A tuple containing an iterator over CPU tensors,
+            and a callback to cancel the transfer early.
+        """
+        if len(tensors) < max_read_ahead:
+            transferred = queue.SimpleQueue()
+        else:
+            transferred = queue.Queue(maxsize=max_read_ahead)
+
+        transfer_finished = False
+
+        def _transfer():
+            nonlocal transfer_finished
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                # This is in a separate CUDA stream because it shouldn't
+                # affect any other GPU operations, even though each
+                # of these transfers are synchronous
+                for t in tensors:
+                    if transfer_finished:
+                        break
+                    transferred.put(t.cpu().detach(), timeout=3600)
+                else:
+                    # Sentinel
+                    transferred.put(None)
+            transfer_finished = True
+
+        transfer_thread = threading.Thread(target=_transfer, daemon=True)
+        transfer_thread.start()
+
+        def _interrupt_transfer():
+            nonlocal transfer_finished
+            if not transfer_finished:
+                # Signal the worker thread to end on its next loop
+                transfer_finished = True
+                try:
+                    # Unstick the worker thread so that
+                    # it isn't waiting for an open spot
+                    # that will never arrive
+                    transferred.get_nowait()
+                except queue.Empty:
+                    pass
+
+        return (
+            iter(lambda: transferred.get(timeout=3600), None),
+            _interrupt_transfer,
+        )
 
     def write_module(
         self, m: torch.nn.Module, remove_tensors: bool = False
     ) -> None:
+        """
+        Serializes an entire ``torch.nn.Module`` instance at once,
+        preparing it to be deserialized later with
+        ``TensorDeserializer.load_into_module()``.
+
+        This method contains several optimizations that make it
+        much faster than serializing a module with several separate
+        calls to `write_tensor()`. Thus, whenever possible,
+        this method is preferred to serialize tensors in bulk.
+
+        Args:
+            m: The module to serialize.
+            remove_tensors: Whether to delete each tensor from `m`
+                after serializing it.
+                Deleted tensors are replaced with ``None``.
+        """
+        tensors: List[torch.Tensor] = []
+        size = 0
+        chain = itertools.chain
+        repeat = itertools.repeat
         for module_name, module in m.named_modules():
-            for name, param in module.named_parameters(recurse=False):
-                label = module_name + "." + name
-                self.write_tensor(self._idx, label, TensorType.PARAM, param)
-                if remove_tensors:
-                    setattr(module, name, None)
-            for name, buf in module.named_buffers(recurse=False):
-                label = module_name + "." + name
-                self.write_tensor(self._idx, label, TensorType.BUFFER, buf)
-                if remove_tensors:
-                    setattr(module, name, None)
-            self._idx += 1
+            parameters = module.named_parameters(recurse=False)
+            buffers = module.named_buffers(recurse=False)
+            for name, tensor in chain(parameters, buffers):
+                tensors.append(tensor)
+                size += len(module_name) + 1 + len(name)
+
+        next_pos = self._file.tell()
+
+        fallocate = getattr(os, "posix_fallocate", None)
+        if fallocate and self._fd:
+            size += sum(t.untyped_storage().size() for t in tensors)
+            # Rough underestimate of header size
+            header_min_size = 24
+            size += header_min_size * len(tensors)
+            try:
+                fallocate(self._fd, next_pos, size)
+            except OSError:
+                pass
+
+        cuda_tensors = [t for t in tensors if t.device.type == "cuda"]
+        if cuda_tensors:
+            transferred, interrupt_transfer = (
+                self._async_bulk_device_to_host_transfer(cuda_tensors)
+            )
+        else:
+            transferred = interrupt_transfer = None
+        tensors.clear()
+
+        try:
+            for module_name, module in m.named_modules():
+                parameters = module.named_parameters(recurse=False)
+                buffers = module.named_buffers(recurse=False)
+
+                for (name, tensor), tensor_type in chain(
+                    zip(parameters, repeat(TensorType.PARAM)),
+                    zip(buffers, repeat(TensorType.BUFFER)),
+                ):
+                    label = f"{module_name}.{name}"
+                    if tensor.device.type == "cuda":
+                        tensor = next(transferred)
+                    next_pos = self._write_tensor(
+                        self._idx,
+                        label,
+                        tensor_type,
+                        tensor,
+                        _synchronize=False,
+                        _start_pos=next_pos,
+                    )
+                    if remove_tensors:
+                        setattr(module, name, None)
+                self._idx += 1
+        except Exception:
+            if interrupt_transfer is not None:
+                interrupt_transfer()
+            raise
+        self._synchronize_pools()
+        self._file.seek(next_pos)
+        self._sync_prologue_state()
 
     def write_state_dict(self, state_dict: Dict):
         """
