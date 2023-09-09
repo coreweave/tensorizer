@@ -1315,7 +1315,7 @@ class TensorSerializer:
         # to each pool in the same relative order.
 
         # Tracks work submitted to all pools to wait for pending work to finish.
-        self._jobs = []
+        self._jobs: List[concurrent.futures.Future] = []
 
         if self.compress_tensors:
             import lz4.frame
@@ -1476,7 +1476,9 @@ class TensorSerializer:
         for pool in "_computation_pool", "_writer_pool", "_header_writer_pool":
             thread_pool = getattr(self, pool, None)
             if thread_pool is not None:
-                thread_pool.shutdown(wait=False, cancel_futures=True)
+                for j in self._jobs:
+                    j.cancel()
+                thread_pool.shutdown(wait=False)
 
     def _synchronize_pools(self):
         for j in self._jobs:
