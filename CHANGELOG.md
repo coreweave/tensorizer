@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `TensorSerializer.write_module` has been optimized further for a speedup of
+  ~3.6x on CUDA modules and ~3.1x faster on CPU modules
+
 ### Fixed
 
-- `CURLStreamFile.response_headers` no longer has a chance to have incomplete
+- `CURLStreamFile.response_headers` no longer has a chance to contain incomplete
   header information
 
 ## [2.3.0] - 2023-09-06

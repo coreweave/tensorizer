@@ -178,9 +178,9 @@ class TestSerialization(unittest.TestCase):
             with self.subTest(msg=f"Serializing with device {device}"):
                 gc.collect()
                 before_serialization = utils.get_mem_usage()
+                print(f"\nBefore serialization: {before_serialization}")
                 serialized_model, orig_sd = serialize_model(model_name, device)
                 after_serialization = utils.get_mem_usage()
-                print(f"Before serialization: {before_serialization}")
                 print(f"After serialization:  {after_serialization}")
                 del orig_sd
                 try:
