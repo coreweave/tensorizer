@@ -1818,7 +1818,7 @@ class TensorSerializer:
         # This task is I/O-bound and has no prerequisites,
         # so it goes into the regular writer pool.
         def write_metadata():
-            assert self._pwrite(metadata, metadata_pos)
+            self._pwrite(metadata, metadata_pos)
 
         self._jobs.append(self._writer_pool.submit(write_metadata))
 
