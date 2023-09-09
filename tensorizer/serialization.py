@@ -1988,12 +1988,15 @@ class TensorSerializer:
         next_pos = self._file.tell()
 
         fallocate = getattr(os, "posix_fallocate", None)
-        if fallocate:
+        if fallocate and self._fd:
             size += sum(t.untyped_storage().size() for t in tensors)
             # Rough underestimate of header size
             header_min_size = 24
             size += header_min_size * len(tensors)
-            fallocate(self._file.fileno(), next_pos, size)
+            try:
+                fallocate(self._fd, next_pos, size)
+            except OSError:
+                pass
 
         cuda_tensors = [t for t in tensors if t.device.type == "cuda"]
         if cuda_tensors:
