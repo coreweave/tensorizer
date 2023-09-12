@@ -269,6 +269,32 @@ The below table shows the available models and their S3 URIs.
 | [Salesforce/codegen-16B-multi](https://huggingface.co/Salesforce/codegen-16B-multi)     | `fp32`    | `s3://tensorized/Salesforce/codegen-16B-multi/model.tensors`        |
 | [Salesforce/codegen-16B-multi](https://huggingface.co/Salesforce/codegen-16B-multi)     | `fp16`    | `s3://tensorized/Salesforce/codegen-16B-multi/fp16/model.tensors`   |
 
+### Generative Diffusion Models
+
+| Model                                                                                                       | Component    | Precision | S3 URI                                                                              |
+|-------------------------------------------------------------------------------------------------------------|--------------|-----------|-------------------------------------------------------------------------------------|
+| [RunwayML/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5)                     | `VAE`        | `fp32`    | `s3://tensorized/runwayml/stable-diffusion-v1-5/vae.tensors`                        |
+| [RunwayML/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5)                     | `UNet`       | `fp32`    | `s3://tensorized/runwayml/stable-diffusion-v1-5/unet.tensors`                       |
+| [RunwayML/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5)                     | `TextEnc`    | `fp32`    | `s3://tensorized/runwayml/stable-diffusion-v1-5/text_encoder.tensors`               |
+| [RunwayML/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5)                     | `VAE`        | `fp16`    | `s3://tensorized/runwayml/stable-diffusion-v1-5/fp16/vae.tensors`                   |
+| [RunwayML/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5)                     | `UNet`       | `fp16`    | `s3://tensorized/runwayml/stable-diffusion-v1-5/fp16/unet.tensors`                  |
+| [RunwayML/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5)                     | `TextEnc`    | `fp16`    | `s3://tensorized/runwayml/stable-diffusion-v1-5/fp16/text_encoder.tensors`          |
+| [StabilityAI/stable-diffusion-2-1](https://huggingface.co/stabilityai/stable-diffusion-2-1)                 | `VAE`        | `fp32`    | `s3://tensorized/stabilityai/stable-diffusion-2-1/vae.tensors`                      |
+| [StabilityAI/stable-diffusion-2-1](https://huggingface.co/stabilityai/stable-diffusion-2-1)                 | `UNet`       | `fp32`    | `s3://tensorized/stabilityai/stable-diffusion-2-1/unet.tensors`                     |
+| [StabilityAI/stable-diffusion-2-1](https://huggingface.co/stabilityai/stable-diffusion-2-1)                 | `TextEnc`    | `fp32`    | `s3://tensorized/stabilityai/stable-diffusion-2-1/text_encoder.tensors`              |
+| [StabilityAI/stable-diffusion-2-1](https://huggingface.co/stabilityai/stable-diffusion-2-1)                 | `VAE`        | `fp16`    | `s3://tensorized/stabilityai/stable-diffusion-2-1/fp16/vae.tensors`                  |
+| [StabilityAI/stable-diffusion-2-1](https://huggingface.co/stabilityai/stable-diffusion-2-1)                 | `UNet`       | `fp16`    | `s3://tensorized/stabilityai/stable-diffusion-2-1/fp16/unet.tensors`                 |
+| [StabilityAI/stable-diffusion-2-1](https://huggingface.co/stabilityai/stable-diffusion-2-1)                 | `TextEnc`    | `fp16`    | `s3://tensorized/stabilityai/stable-diffusion-2-1/fp16/text_encoder.tensors`         |
+| [StabilityAI/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `VAE`        | `fp32`    | `s3://tensorized/stabilityai/stable-diffusion-xl-base-1.0/vae.tensors`               |
+| [StabilityAI/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `UNet`       | `fp32`    | `s3://tensorized/stabilityai/stable-diffusion-xl-base-1.0/unet.tensors`              |
+| [StabilityAI/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `TextEnc`    | `fp32`    | `s3://tensorized/stabilityai/stable-diffusion-xl-base-1.0/text_encoder.tensors`      |
+| [StabilityAI/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `TextEnc2`   | `fp32`    | `s3://tensorized/stabilityai/stable-diffusion-xl-base-1.0/text_encoder_2.tensors`    |
+| [StabilityAI/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `VAE`        | `fp16`    | `s3://tensorized/stabilityai/stable-diffusion-xl-base-1.0/fp16/vae.tensors`          |
+| [StabilityAI/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `UNet`       | `fp16`    | `s3://tensorized/stabilityai/stable-diffusion-xl-base-1.0/fp16/unet.tensors`         |
+| [StabilityAI/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `TextEnc`    | `fp16`    | `s3://tensorized/stabilityai/stable-diffusion-xl-base-1.0/fp16/text_encoder.tensors` |
+| [StabilityAI/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `TextEnc2`   | `fp16`    | `s3://tensorized/stabilityai/stable-diffusion-xl-base-1.0/fp16/text_encoder_2.tensors`|
+
+
 ## S3 Usage Notes
 `tensorizer` uses the `boto3` library to interact with S3. The easiest way
 to use `tensorizer` with S3 is to configure your S3 credentials in
