@@ -869,6 +869,8 @@ class TensorDeserializer(collections.abc.Mapping):
         if hasattr(self._file, "bytes_read"):
             return self._file.bytes_read
         if self._file.closed:
+            # Caution: This case is an underestimate because it doesn't include
+            # any metadata read, unlike the other two cases.
             return self.total_tensor_bytes
         else:
             return self._file.tell()
