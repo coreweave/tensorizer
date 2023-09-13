@@ -3,14 +3,6 @@
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
 
-# try to import UNIX only dependencies
-try:
-    import fcntl
-    import resource
-except ImportError:
-    fcntl = None
-    resource = None
-
 import collections.abc
 import concurrent.futures
 import ctypes
@@ -29,6 +21,7 @@ import typing
 import zlib
 from collections import OrderedDict
 from enum import Enum
+from functools import partial
 from typing import (
     Any,
     Callable,
@@ -85,21 +78,515 @@ class HashType(Enum):
     SHA256 = 1
 
 
-class TensorHash(typing.TypedDict):
+@dataclasses.dataclass(order=True)
+class TensorHash:
+    __slots__ = ("type", "hash")
     type: HashType
     hash: bytes
 
 
-class TensorEntry(typing.TypedDict):
+@dataclasses.dataclass(order=True)
+class TensorEntry:
+    __slots__ = (
+        "name",
+        "type",
+        "dtype",
+        "shape",
+        "offset",
+        "data_offset",
+        "data_length",
+        "hashes",
+        "raw_headers",
+    )
     name: str
     type: TensorType
+    dtype: str
+    shape: Tuple[int, ...]
     offset: int
     data_offset: int
     data_length: int
+    hashes: Optional[List[TensorHash]]
+    raw_headers: Optional[bytes]
+
+
+@dataclasses.dataclass
+class _FileHeader:
+    __slots__ = ("version_number", "tensor_size", "tensor_count")
+    version_number_format: ClassVar[struct.Struct] = struct.Struct(
+        "<I"  # Little-endian  # Version number
+    )
+    format: ClassVar[struct.Struct] = struct.Struct(
+        "<"
+        "32x"  # File hash (unused)
+        "Q"  # Total size of tensor data (nominally, total file size)
+        "8x"  # Nominally, total size of tensor data (actually unused)
+        "Q"  # Total number of tensors
+    )
+    version_number: int
+    tensor_size: int
+    tensor_count: int
+
+    def to_bytes(self) -> bytes:
+        return self.version_number_format.pack(
+            self.version_number
+        ) + self.format.pack(self.tensor_size, self.tensor_count)
+
+    @classmethod
+    def from_io(
+        cls, reader: io.BufferedIOBase, accepted_versions: Sequence[int]
+    ) -> "_FileHeader":
+        version_number = cls.version_number_format.unpack(
+            reader.read(cls.version_number_format.size)
+        )[0]
+        if version_number not in accepted_versions:
+            raise ValueError(
+                "Unsupported version: this data stream uses tensorizer"
+                f" data version {version_number}, which is not supported"
+                " in this release of tensorizer."
+                f"\nSupported data versions: {tuple(accepted_versions)}"
+            )
+        data = reader.read(cls.format.size)
+        if len(data) < cls.format.size:
+            raise ValueError(
+                "File too small: ran out of data before reading a full header"
+            )
+        return cls(version_number, *cls.format.unpack(data))
+
+
+@dataclasses.dataclass(init=False)
+class _TensorHeaderSerializer:
+    # Fields with ClassVar are shared across all instances,
+    # other fields are calculated per-instance
+    buffer: bytearray
+    size: int
+
+    start_segment: ClassVar[struct.Struct] = struct.Struct(
+        "<"  # Little-endian
+        "Q"  # Tensor header size
+        "H"  # Module index.
+        "B"  # Whether this is a parameter or a buffer
+        "H"  # Parameter/buffer name length
+    )
+
+    # Variable length fields, can't be compiled into
+    # a static struct definition without calculating sizes first
+    variable_length_segment_template: ClassVar[str] = (
+        "<"
+        "{name_len:d}s"  # Parameter/buffer name UTF-8 bytes
+        "B"  # Tensor dtype length
+        "{dtype_len:d}s"  # Tensor dtype UTF-8 bytes
+        "B"  # Tensor shape length
+        "{shape_len:d}I"  # Tensor shape I array
+    )
+    variable_length_segment: struct.Struct
+    variable_length_offset: ClassVar[int] = start_segment.size
+
+    hash_header_segment: ClassVar[struct.Struct] = struct.Struct(
+        "<"
+        "H"  # Hash section length
+        "B"  # Hash count (fixed for a particular tensorizer version)
+    )
+    hash_header_offset: int
+    hash_count: ClassVar[int] = 2
+
+    crc32_hash_segment: ClassVar[struct.Struct] = struct.Struct(
+        "<"
+        "B"  # CRC32 hash type (HashType enum value)
+        "B"  # CRC32 hash length
+        "I"  # CRC32 hash value
+    )
+    crc32_hash_offset: int
+
+    sha256_hash_segment: ClassVar[struct.Struct] = struct.Struct(
+        "<"
+        "B"  # SHA256 hash type
+        "B"  # SHA256 hash length
+        "32s"  # SHA256 hash value
+    )
+    sha256_hash_offset: int
+
+    data_length_segment: ClassVar[struct.Struct] = struct.Struct(
+        "<q"  # Signed tensor data length
+        # We write this signed so that we can use the signedness as an
+        # indicator of possible tensor compression in the future.
+    )
+    data_length_offset: int
+
+    data_offset: int
+
+    # This isn't part of the tensor header,
+    # but it shares much of the same information
+    metadata_entry_segment_template: ClassVar[str] = (
+        "<"
+        "H"  # Name length
+        "{name_len:d}s"  # Name
+        "B"  # Whether this is a parameter or a buffer
+        "B"  # Dtype length
+        "{dtype_len:d}s"  # Dtype
+        "B"  # Shape length
+        "{shape_len:d}I"  # Shape
+        "Q"  # Header start (relative to the file)
+        "Q"  # Tensor data start (relative to the file)
+        "Q"  # Tensor length
+    )
+    metadata_entry: bytes
+
+    @classmethod
+    def decode(cls):
+        pass
+
+    def __init__(
+        self,
+        module_index: int,
+        tensor_type: TensorType,
+        name: bytes,
+        dtype: bytes,
+        shape: Sequence[int],
+        data_length: int,
+        file_offset: int,
+    ):
+        # Calculate the variable length segment
+        name_len = len(name)
+        dtype_len = len(dtype)
+        # NB: shape_len is the number of dimensions,
+        # not the encoded byte length
+        shape_len = len(shape)
+        self.variable_length_segment = struct.Struct(
+            self.variable_length_segment_template.format(
+                name_len=name_len,
+                dtype_len=dtype_len,
+                shape_len=shape_len,
+            )
+        )
+
+        # Calculate offsets
+        (
+            self.variable_length_offset,
+            self.hash_header_offset,
+            self.crc32_hash_offset,
+            self.sha256_hash_offset,
+            self.data_length_offset,
+            self.data_offset,
+        ) = itertools.accumulate(
+            (
+                self.start_segment.size,
+                self.variable_length_segment.size,
+                self.hash_header_segment.size,
+                self.crc32_hash_segment.size,
+                self.sha256_hash_segment.size,
+                self.data_length_segment.size,
+            )
+        )
+        self.size = self.data_offset
+
+        self.buffer = bytearray(self.size)
+        self.start_segment.pack_into(
+            self.buffer,
+            0,  # Offset
+            self.size,  # Tensor header size
+            module_index,  # Module index.
+            tensor_type.value,  # Whether this is a parameter or a buffer
+            name_len,  # Parameter/buffer name length
+        )
+        self.variable_length_segment.pack_into(
+            self.buffer,
+            self.variable_length_offset,
+            name,  # Parameter/buffer name UTF-8 bytes
+            dtype_len,  # Tensor dtype length
+            dtype,  # Tensor dtype UTF-8 bytes
+            shape_len,  # Tensor shape length
+            *shape,  # Tensor shape I array
+        )
+        self.hash_segment_size = (
+            self.data_length_offset - self.hash_header_offset - 2
+        )
+        self.hash_header_segment.pack_into(
+            self.buffer,
+            self.hash_header_offset,
+            self.hash_segment_size,  # Hash section length
+            self.hash_count,  # Hash count
+        )
+
+        # Placeholders
+        self.add_crc32(0)
+        self.add_sha256(b"")
+
+        self.data_length_segment.pack_into(
+            self.buffer, self.data_length_offset, data_length
+        )
+
+        metadata_entry_segment: struct.Struct = struct.Struct(
+            self.metadata_entry_segment_template.format(
+                name_len=name_len,
+                dtype_len=dtype_len,
+                shape_len=shape_len,
+            )
+        )
+
+        self.metadata_entry = metadata_entry_segment.pack(
+            name_len,  # Name length
+            name,  # Name
+            tensor_type.value,  # Whether this is a parameter or a buffer
+            dtype_len,  # Dtype length
+            dtype,  # Dtype
+            shape_len,  # Shape length
+            *shape,  # Shape
+            file_offset,  # Header start (relative to the file)
+            # Tensor data start (relative to the file):
+            file_offset + self.data_offset,
+            data_length,  # Tensor length
+        )
+
+    def add_crc32(self, value: int):
+        self.crc32_hash_segment.pack_into(
+            self.buffer,
+            self.crc32_hash_offset,
+            HashType.CRC32.value,  # Hash type
+            4,  # CRC32 hash length
+            value,  # Hash value
+        )
+
+    def add_sha256(self, value: bytes):
+        self.sha256_hash_segment.pack_into(
+            self.buffer,
+            self.sha256_hash_offset,
+            HashType.SHA256.value,  # Hash type
+            32,  # SHA256 hash length
+            value,  # Hash value
+        )
+
+
+def _variable_read(
+    data: bytes, offset: int = 0, length_fmt: str = "B", data_fmt: str = "s"
+) -> Tuple[Union[memoryview, Tuple], int]:
+    """
+    Reads a variable-length field preceded by a length from a buffer.
+
+    Returns:
+        A tuple of the data read, and the offset in the buffer
+        following the end of the field.
+    """
+    assert length_fmt in ("B", "H", "I", "Q")
+    if length_fmt == "B":
+        length: int = data[offset]
+        offset += 1
+    else:
+        length_struct = struct.Struct("<" + length_fmt)
+        length: int = length_struct.unpack_from(data, offset)[0]
+        offset += length_struct.size
+    if data_fmt == "s":
+        # When the data is read as bytes, just return a memoryview
+        end = offset + length
+        with memoryview(data) as mv:
+            return mv[offset:end], end
+    else:
+        data_struct = struct.Struct(f"<{length:d}{data_fmt}")
+        data = data_struct.unpack_from(data, offset)
+        offset += data_struct.size
+        return data, offset
+
+
+@dataclasses.dataclass(init=False)
+class _TensorHeaderDeserializer:
+    buffer: bytearray
+    module_idx: int
+    tensor_type: TensorType
+    name: str
     dtype: str
-    shape: List[int]
+    shape: Tuple[int, ...]
     hashes: List[TensorHash]
-    raw_headers: bytes
+    data_length: int
+
+    header_len_segment: ClassVar[struct.Struct] = struct.Struct("<Q")
+    tensor_info_segment: ClassVar[struct.Struct] = struct.Struct(
+        "<HB"  # Module index, tensor type
+    )
+
+    read_name = partial(_variable_read, length_fmt="H", data_fmt="s")
+    read_dtype = partial(_variable_read, length_fmt="B", data_fmt="s")
+    read_shape = partial(_variable_read, length_fmt="B", data_fmt="I")
+    read_hash_block = partial(_variable_read, length_fmt="H", data_fmt="s")
+
+    data_length_segment: ClassVar[struct.Struct] = struct.Struct("<q")
+
+    @classmethod
+    def from_io(
+        cls, reader: io.BufferedIOBase, zero_hashes: bool = True
+    ) -> Optional["_TensorHeaderDeserializer"]:
+        # We read the entire header into memory rather than reading
+        # it piecewise to avoid the overhead of many small reads,
+        # especially for network streams.
+        header_len_bytes = reader.read(cls.header_len_segment.size)
+        offset = cls.header_len_segment.size
+        header_len: int = cls.header_len_segment.unpack(header_len_bytes)[0]
+        if header_len == 0:
+            return None
+        buffer = bytearray(header_len)
+        buffer[:offset] = header_len_bytes
+        with memoryview(buffer) as mv:
+            reader.readinto(mv[offset:])
+        return cls(buffer, zero_hashes=zero_hashes)
+
+    def __init__(self, buffer: bytearray, zero_hashes: bool = True):
+        self.buffer = buffer
+        offset = self.header_len_segment.size
+        self.module_idx, tensor_type = self.tensor_info_segment.unpack_from(
+            buffer, offset
+        )
+        self.tensor_type = TensorType(tensor_type)
+        offset += self.tensor_info_segment.size
+
+        # Read the name.
+        name_slice, offset = self.read_name(buffer, offset)
+        with name_slice:
+            self.name: str = str(name_slice, "utf-8")
+
+        # Read the dtype of the tensor.
+        dtype_slice, offset = self.read_dtype(buffer, offset)
+        with dtype_slice:
+            self.dtype: str = str(dtype_slice, "utf-8")
+
+        # Read the shape.
+        self.shape, offset = self.read_shape(buffer, offset)
+
+        # Read our hashes in.
+        hashes_slice, offset = self.read_hash_block(buffer, offset)
+        with hashes_slice:
+            self.hashes = self._decode_hashes(hashes_slice)
+            if zero_hashes:
+                self._zero_hashes(hashes_slice)
+
+        # Finally, get the tensor data length.
+        offset = len(buffer) - self.data_length_segment.size
+        self.data_length = self.data_length_segment.unpack_from(buffer, offset)[
+            0
+        ]
+
+    @staticmethod
+    def _decode_hashes(b: memoryview) -> List[TensorHash]:
+        """
+        Decode the hashes from given bytes.
+        """
+        hashes: List[TensorHash] = []
+
+        # Read the number of hashes.
+        num_hashes = b[0]
+
+        hash_idx = 1
+        # Read the hashes.
+        for i in range(num_hashes):
+            # Read the hash type.
+            hash_type = b[hash_idx]
+            # Read the size of the hash.
+            hash_size = b[hash_idx + 1]
+            # Read the hash.
+            hash_begin = hash_idx + 2
+            hash_end = hash_begin + hash_size
+            hash_bytes = bytes(b[hash_begin:hash_end])
+            # Add the hash to the list.
+            hash_entry = TensorHash(
+                type=HashType(hash_type),
+                hash=hash_bytes,
+            )
+            hash_idx = hash_end
+            hashes.append(hash_entry)
+
+        return hashes
+
+    @staticmethod
+    def _zero_hashes(b: memoryview) -> None:
+        """
+        Zero out the encoded hashes in the given bytes.
+        This is used to prevent the hashes from being part of hash computation
+        of the entire data structure.
+        """
+        # Read the number of hashes.
+        num_hashes = b[0]
+
+        hash_idx = 1
+        # Read the hashes.
+        for i in range(num_hashes):
+            # Read the size of the hash.
+            hash_size = b[hash_idx + 1]
+            hash_begin = hash_idx + 2
+            hash_end = hash_begin + hash_size
+            b[hash_begin:hash_end] = bytes(hash_size)
+            hash_idx = hash_end
+
+
+class _MetadataDeserializer(dict):
+    _total_len_segment: ClassVar[struct.Struct] = struct.Struct("<Q")
+    _read_name = partial(_variable_read, length_fmt="H", data_fmt="s")
+    _tensor_type_segment: ClassVar[struct.Struct] = struct.Struct("<B")
+    _read_dtype = partial(_variable_read, length_fmt="B", data_fmt="s")
+    _read_shape = partial(_variable_read, length_fmt="B", data_fmt="I")
+    _location_segment: ClassVar[struct.Struct] = struct.Struct(
+        "<"
+        "Q"  # Tensor header offset
+        "Q"  # Tensor data offset
+        "Q"  # Tensor data length
+    )
+
+    @classmethod
+    def from_io(
+        cls, reader: io.BufferedIOBase, count: int
+    ) -> "_MetadataDeserializer":
+        total_len: int = cls._total_len_segment.unpack(
+            reader.read(cls._total_len_segment.size)
+        )[0]
+        if total_len == 0:
+            return cls()
+        else:
+            encoded_metadata: bytes = reader.read(total_len)
+            return cls.from_buffer(encoded_metadata, count)
+
+    @classmethod
+    def from_buffer(cls, buffer: bytes, count: int) -> "_MetadataDeserializer":
+        offset = 0
+        entries = cls()
+        for i in range(count):
+            entry, offset = cls._read_entry(buffer, offset)
+            entries[entry.name] = entry
+        return entries
+
+    @classmethod
+    def _read_entry(cls, buffer: bytes, offset: int) -> Tuple[TensorEntry, int]:
+        # Read the name.
+        name_slice, offset = cls._read_name(buffer, offset)
+        with name_slice:
+            name: str = str(name_slice, "utf-8")
+
+        tensor_type = TensorType(buffer[offset])
+        offset += 1
+
+        # Read the dtype of the tensor.
+        dtype_slice, offset = cls._read_dtype(buffer, offset)
+        with dtype_slice:
+            dtype: str = str(dtype_slice, "utf-8")
+
+        # Read the shape.
+        shape, offset = cls._read_shape(buffer, offset)
+
+        header_offset, data_offset, data_length = (
+            cls._location_segment.unpack_from(buffer, offset)
+        )
+        offset += cls._location_segment.size
+
+        return (
+            TensorEntry(
+                name=name,
+                type=tensor_type,
+                dtype=dtype,
+                shape=shape,
+                offset=header_offset,
+                data_offset=data_offset,
+                data_length=data_length,
+                # The following fields are only available in the per-tensor headers
+                hashes=None,
+                raw_headers=None,
+            ),
+            offset,
+        )
 
 
 class HashMismatchError(Exception):
@@ -234,33 +721,35 @@ class TensorDeserializer(collections.abc.Mapping):
         if magic != TENSORIZER_MAGIC:
             raise ValueError("Not a tensorizer file")
 
-        # Read the version
-        version = struct.unpack("<I", self._file.read(4))[0]
+        # Read the file header
+        file_header = _FileHeader.from_io(
+            self._file,
+            accepted_versions=(
+                NON_OPAQUE_TENSORIZER_VERSION,
+                TENSORIZER_VERSION,
+            ),
+        )
 
-        # Check the version
-        if version > TENSORIZER_VERSION:
-            raise ValueError(
-                f"This tensorizer version ({TENSORIZER_VERSION}) cannot read"
-                f" file versioned {version}."
-            )
-
-        # Skip 32-byte hash (unused)
-        self._file.read(32)
-
-        # Read the total size of the file
-        self.total_file_bytes = struct.unpack("<Q", self._file.read(8))[0]
-
-        # Read total size of tensor data
-        self.total_tensor_bytes = struct.unpack("<Q", self._file.read(8))[0]
-
-        # Read the number of tensors
-        self._tensors = struct.unpack("<Q", self._file.read(8))[0]
+        # The total size of the file.
+        # WARNING: this is not accurate. This field isn't used in the
+        # deserializer, but has been available as a public attribute,
+        # so it is kept how it was for compatibility until the next
+        # major version.
+        self.total_file_bytes = file_header.tensor_size
 
         # Read the metadata index of tensors. This is a list of offsets into the
-        # file where the per-tensor data is stored. filter_func is a test that
-        # determines the tensor names to read. If filter_func is None,
-        # all tensors are read.
-        self._load_metadatas(filter_func)
+        # file where the per-tensor data is stored.
+        self._metadata = _MetadataDeserializer.from_io(
+            self._file, file_header.tensor_count
+        )
+        # filter_func is a test that determines the tensor names to read.
+        # If filter_func is None, all tensors are read.
+        if filter_func is not None:
+            self._metadata = {
+                name: entry
+                for name, entry in self._metadata.items()
+                if filter_func(name)
+            }
 
         self._prior_key: Optional[str] = None
 
@@ -270,9 +759,9 @@ class TensorDeserializer(collections.abc.Mapping):
         self.total_tensor_bytes = 0
         self._largest_tensor_bytes = 0
         for name, metadata in self._metadata.items():
-            self.total_tensor_bytes += metadata["data_length"]
-            if metadata["data_length"] > self._largest_tensor_bytes:
-                self._largest_tensor_bytes = metadata["data_length"]
+            self.total_tensor_bytes += metadata.data_length
+            if metadata.data_length > self._largest_tensor_bytes:
+                self._largest_tensor_bytes = metadata.data_length
 
         # Allocate the buffer for the tensors. If we're not in lazy_load mode,
         # we'll allocate a single buffer for all the tensors. Otherwise, we'll
@@ -375,74 +864,6 @@ class TensorDeserializer(collections.abc.Mapping):
         if getattr(self, "_file", None) is not None:
             self._file.close()
 
-    def _read_string(self, io_obj=None):
-        """
-        Read a string from the file.
-        """
-        if io_obj is None:
-            io_obj = self._file
-
-        length = struct.unpack("<H", io_obj.read(2))[0]
-        return io_obj.read(length).decode("utf-8")
-
-    def _read_dtype(self, io_obj=None):
-        """
-        Read a dtype from the file.
-        """
-        if io_obj is None:
-            io_obj = self._file
-
-        length = struct.unpack("<B", io_obj.read(1))[0]
-        return io_obj.read(length).decode("utf-8")
-
-    def _read_metadata(self, metadata_stream: io.BytesIO) -> TensorEntry:
-        name = self._read_string(metadata_stream)
-        tensor_type = TensorType(
-            struct.unpack("<B", metadata_stream.read(1))[0]
-        )
-        dtype = self._read_dtype(metadata_stream)
-        shape_len = struct.unpack("<B", metadata_stream.read(1))[0]
-        shape = self._read_shapes(
-            metadata_stream.read(shape_len * 4), shape_len
-        )
-        offset = struct.unpack("<Q", metadata_stream.read(8))[0]
-        data_offset = struct.unpack("<Q", metadata_stream.read(8))[0]
-        data_length = struct.unpack("<Q", metadata_stream.read(8))[0]
-        return TensorEntry(
-            name=name,
-            type=tensor_type,
-            offset=offset,
-            data_offset=data_offset,
-            data_length=data_length,
-            dtype=dtype,
-            shape=shape,
-        )
-
-    def _load_metadatas(
-        self, filter_func: Optional[Callable[[str], Union[bool, Any]]]
-    ):
-        """
-        Read the metadata of tensors into self._metadata.
-        """
-
-        # Read metadata size.
-        self._metadata_size = struct.unpack("<Q", self._file.read(8))[0]
-        metadata_encoded = self._file.read(self._metadata_size)
-        # Turn the metadata into a stream.
-        metadata_stream = io.BytesIO(metadata_encoded)
-
-        for i in range(self._tensors):
-            metadata = self._read_metadata(metadata_stream)
-            if filter_func is None or filter_func(metadata["name"]):
-                self._metadata[metadata["name"]] = metadata
-
-    @staticmethod
-    def _read_shapes(obj, num_elems) -> List[int]:
-        """
-        Read the tensor shapes.
-        """
-        return list(struct.unpack(f"<{num_elems}I", obj))
-
     @property
     def total_bytes_read(self) -> int:
         if hasattr(self._file, "bytes_read"):
@@ -481,7 +902,7 @@ class TensorDeserializer(collections.abc.Mapping):
         # of the time, access patterns are front to back, so seeking
         # forward in a stream works well even for HTTP/HTTPS streams.
         if name in self._metadata:
-            self._file.seek(self._metadata[name]["offset"])
+            self._file.seek(self._metadata[name].offset)
             tensor_arr = next(self.read_tensors(num_tensors=1))[3]
             self._cache[name] = self._to_torch_parameter(tensor_arr)
             return self._cache[name]
@@ -540,60 +961,6 @@ class TensorDeserializer(collections.abc.Mapping):
         return self._metadata.keys()
 
     @staticmethod
-    def _decode_hashes(b: memoryview) -> List[TensorHash]:
-        """
-        Decode the hashes from given bytes.
-        """
-        hashes: List[TensorHash] = []
-
-        # Read the number of hashes.
-        num_hashes = b[0]
-
-        hash_idx = 1
-        # Read the hashes.
-        for i in range(num_hashes):
-            # Read the hash type.
-            hash_type = b[hash_idx]
-            # Read the size of the hash.
-            hash_size = b[hash_idx + 1]
-            # Read the hash.
-            hash_begin = hash_idx + 2
-            hash_end = hash_begin + hash_size
-            hash_bytes = bytes(b[hash_begin:hash_end])
-            # Add the hash to the list.
-            hash_entry = TensorHash(
-                type=HashType(hash_type),
-                hash=hash_bytes,
-            )
-            hash_idx = hash_end
-            hashes.append(hash_entry)
-
-        return hashes
-
-    @staticmethod
-    def _zero_hashes(b: memoryview) -> bytearray:
-        """
-        Zero out the encoded hashes in the given bytes,
-        and return the data structure with the hashes zeroed out.
-        This is used to prevent the hashes from being part of hash computation
-        of the entire data structure.
-        """
-        # Read the number of hashes.
-        num_hashes = b[0]
-        zeroed_hashes = bytearray(b)
-
-        hash_idx = 1
-        # Read the hashes.
-        for i in range(num_hashes):
-            # Read the size of the hash.
-            hash_size = b[hash_idx + 1]
-            hash_begin = hash_idx + 2
-            hash_end = hash_begin + hash_size
-            zeroed_hashes[hash_begin:hash_end] = bytes(hash_size)
-            hash_idx = hash_end
-        return zeroed_hashes
-
-    @staticmethod
     def _verify_hashes(
         name: str,
         hashes: List[TensorHash],
@@ -609,8 +976,8 @@ class TensorDeserializer(collections.abc.Mapping):
             mv: The memoryview of the tensor data.
         """
         for tensor_hash in hashes:
-            hash_type = tensor_hash["type"]
-            hash_body = tensor_hash["hash"]
+            hash_type = tensor_hash.type
+            hash_body = tensor_hash.hash
             if hash_type == HashType.CRC32:
                 crc = zlib.crc32(mv, zlib.crc32(headers))
                 hash_crc = struct.unpack("<I", hash_body)[0]
@@ -672,36 +1039,28 @@ class TensorDeserializer(collections.abc.Mapping):
         """
         if verify_hash is None:
             verify_hash = self._verify_hash
-
         try:
             tensors_read = 0
             while num_tensors == -1 or tensors_read < num_tensors:
-                header_sz = struct.unpack("<Q", self._file.read(8))[0]
-                if header_sz == 0:
+                header = _TensorHeaderDeserializer.from_io(
+                    self._file, zero_hashes=True
+                )
+
+                if header is None:
                     break
-                # We read the entire header into memory rather than reading
-                # it piecewise to avoid the overhead of many small reads,
-                # especially for network streams.
-                headers = self._file.read(header_sz - 8)
-                header_len = len(headers)
 
-                module_idx = struct.unpack("<H", headers[0:2])[0]
+                # Check if the name is in our pre-filtered list of keys
+                # from the class-level filter_func, and then verify
+                # that it passes the method-level filter_func.
+                # Skip it if it fails either check.
+                if header.name not in self.keys() or (
+                    filter_func is not None and not filter_func(header.name)
+                ):
+                    self._file.seek(header.data_length, io.SEEK_CUR)
+                    continue
 
-                tensor_type = TensorType(struct.unpack("<B", headers[2:3])[0])
-
-                # Read the name.
-                name_sz = struct.unpack("<H", headers[3:5])[0]
-                idx = name_sz + 5
-                name_bytes = headers[5:idx]
-                name: str = name_bytes.decode("utf-8")
-
-                # Read the dtype of the tensor.
-                dtype_len = struct.unpack("<B", headers[idx : idx + 1])[0]
-                dtype_end = idx + dtype_len + 1
-                dtype = headers[idx + 1 : dtype_end].decode("utf-8")
-
-                numpy_dtype, *torch_dtype = dtype.split(OPAQUE_DTYPE_SEP)
-                if len(torch_dtype) == 0:
+                numpy_dtype, *torch_dtype = header.dtype.split(OPAQUE_DTYPE_SEP)
+                if not torch_dtype:
                     torch_dtype = None
                 elif len(torch_dtype) == 1:
                     torch_dtype = torch_dtype[0]
@@ -710,55 +1069,14 @@ class TensorDeserializer(collections.abc.Mapping):
                         "Can't deserialize a tensor with "
                         "multiple opaque dtype separators "
                         f"({OPAQUE_DTYPE_SEP!r}) in its dtype: "
-                        f"{dtype!r}"
+                        f"{header.dtype!r}"
                     )
 
-                # Read the shape amount, according to the serialized format.
-                # The shape length is 1 byte after the dtype end.
-                shape_len = struct.unpack(
-                    "<B", headers[dtype_end : dtype_end + 1]
-                )[0]
-                # The shape elements are <I, so we read 4 bytes. _read_shapes
-                # takes in the header object and the number of elements in
-                # the shape.
-                #
-                # The amount of bytes for the shape is 4 * number of elements
-                # in the shape. so, we need to read 4 * shape_len bytes after
-                # the dtype end + 1 byte for the shape length. sort of
-                # convoluted, but it works.
-                shape_begin = dtype_end + 1
-                shape_end = shape_begin + (4 * shape_len)
-                shape_list = self._read_shapes(
-                    headers[shape_begin:shape_end],
-                    shape_len,
-                )
+                self._metadata[header.name].hashes = header.hashes
 
-                # Read our hashes in. We need to read the hashes size,
-                # then read the hash bytes.
-                hashes_sz_begin = shape_end
-                with memoryview(headers) as hashes_mv:
-                    hashes_sz = struct.unpack_from(
-                        "<H", hashes_mv, hashes_sz_begin
-                    )[0]
-                    hashes_begin = hashes_sz_begin + 2
-                    hashes_end = hashes_begin + hashes_sz
-                    hashes_slice = hashes_mv[hashes_begin:hashes_end]
-                    if name in self.keys():
-                        hashes = self._decode_hashes(hashes_slice)
-                        self._metadata[name]["hashes"] = hashes
-
-                # Finally, get the tensor data length.
-                data_length = struct.unpack("<q", headers[header_len - 8 :])[0]
-
-                # Check if the name is in our pre-filtered list of keys
-                # from the class-level filter_func, and then verify
-                # that it passes the method-level filter_func.
-                # Skip it if it fails either check.
-                if name not in self.keys() or (
-                    filter_func is not None and not filter_func(name)
-                ):
-                    self._file.seek(data_length, io.SEEK_CUR)
-                    continue
+                # Store our raw headers with hashes zeroed out
+                # for model verification
+                self._metadata[header.name].raw_headers = header.buffer
 
                 # We use memoryview to avoid copying the data.
                 mv: memoryview
@@ -768,10 +1086,10 @@ class TensorDeserializer(collections.abc.Mapping):
                     # all the tensors. We just need to slice out the
                     # memoryview for the current tensor.
                     mv = memoryview(self._buffer)[
-                        self._allocated : self._allocated + data_length
+                        self._allocated : self._allocated + header.data_length
                     ]
                     self._file.readinto(mv)
-                    self._allocated += data_length
+                    self._allocated += header.data_length
                 elif self._plaid_mode:
                     # In plaid_mode, we don't allocate a buffer, we just
                     # reuse the same one. This is a filthy hack, as we're
@@ -780,32 +1098,20 @@ class TensorDeserializer(collections.abc.Mapping):
                     # the buffer contents after we yield the tensor, which
                     # is loaded straight into the GPU memory.
                     mv = memoryview(self._buffer)
-                    self._file.readinto(mv[:data_length])
+                    self._file.readinto(mv[: header.data_length])
                 else:
                     # In lazy_load mode, we allocate a new buffer for each
                     # tensor. This is a bit slower, but it's the only way
                     # to support lazy loading.
-                    buffer = bytearray(data_length)
+                    buffer = bytearray(header.data_length)
                     mv = memoryview(buffer)
                     self._file.readinto(mv)
 
-                # Store our raw headers with hashes zeroed out
-                # for model verification
-                with memoryview(headers) as header_mv:
-                    headers = b"".join(
-                        (
-                            struct.pack("<Q", header_sz),
-                            header_mv[:hashes_begin],
-                            self._zero_hashes(hashes_slice),
-                            header_mv[hashes_end:],
-                        )
-                    )
-                hashes_slice.release()
-                self._metadata[name]["raw_headers"] = headers
-
                 if verify_hash:
                     try:
-                        self._verify_hashes(name, hashes, headers, mv)
+                        self._verify_hashes(
+                            header.name, header.hashes, header.buffer, mv
+                        )
                     except HashMismatchError:
                         # Necessary to prevent a BufferError on close()
                         mv.release()
@@ -814,13 +1120,13 @@ class TensorDeserializer(collections.abc.Mapping):
                 tensor = _NumpyTensor.from_buffer(
                     numpy_dtype,
                     torch_dtype,
-                    shape_list,
+                    header.shape,
                     mv,
                 )
 
                 tensors_read += 1
 
-                yield module_idx, tensor_type, name, tensor
+                yield header.module_idx, header.tensor_type, header.name, tensor
         except EOFError:
             return
 
@@ -1085,11 +1391,11 @@ class TensorDeserializer(collections.abc.Mapping):
             finally:
                 self._verify_hash = global_verify_hash
 
-            if entry["type"] is TensorType.PARAM:
+            if entry.type is TensorType.PARAM:
                 module.register_parameter(attr, param)
-            elif entry["type"] is TensorType.BUFFER:
+            elif entry.type is TensorType.BUFFER:
                 module.register_buffer(attr, param)
-            elif entry["type"] is TensorType.STATE_DICT:
+            elif entry.type is TensorType.STATE_DICT:
                 raise NotImplementedError(
                     "This was serialized using the write_state_dict() method,"
                     " and cannot be loaded using the load_into_module() method."
@@ -1152,7 +1458,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 continue
             module: torch.nn.Module = modules[name]
             entry = self._metadata[name]
-            if "hashes" not in entry:
+            if entry.hashes is None:
                 raise RuntimeError(
                     f"No hashes found in metadata for {name}. This is usually"
                     " caused by a TensorDeserializer that was instantiated"
@@ -1164,8 +1470,8 @@ class TensorDeserializer(collections.abc.Mapping):
                 with memoryview(numpy_tensor.data).cast("B") as mv:
                     self._verify_hashes(
                         name,
-                        entry["hashes"],
-                        entry["raw_headers"],
+                        entry.hashes,
+                        entry.raw_headers,
                         mv,
                     )
                 results.append((name, True))
@@ -1329,7 +1635,7 @@ class TensorSerializer:
 
         # Write file header metadata
         self._file_header_loc = self._file.tell()
-        self._file_header = self._FileHeader(
+        self._file_header = _FileHeader(
             version_number=NON_OPAQUE_TENSORIZER_VERSION,
             tensor_size=0,
             tensor_count=0,
@@ -1343,29 +1649,6 @@ class TensorSerializer:
         self._file.write(bytes(metadata_size))
         self._metadata_cur = self._metadata_loc
         self._metadata_end = self._metadata_loc + metadata_size
-
-        self._tensor_index: List[TensorEntry] = []
-
-    @dataclasses.dataclass
-    class _FileHeader:
-        format: ClassVar[struct.Struct] = struct.Struct(
-            "<"  # Little-endian
-            "I"  # Version number
-            "32x"  # File hash (unused)
-            "Q"  # Total size of tensor data (nominally, total file size)
-            "8x"  # Nominally, total size of tensor data (actually unused)
-            "Q"  # Total number of tensors
-        )
-        version_number: int
-        tensor_size: int
-        tensor_count: int
-
-        def to_bytes(self):
-            return self.format.pack(
-                self.version_number,
-                self.tensor_size,
-                self.tensor_count,
-            )
 
     @property
     def total_tensor_bytes(self):
@@ -1503,204 +1786,6 @@ class TensorSerializer:
         #     logger.info(f"Comp'd bytes: {self.total_compressed_tensor_bytes}")
         #     logger.info(f"Ratio: {compression_ratio:.2f}")
 
-    @dataclasses.dataclass(init=False)
-    class _TensorHeader:
-        # Fields with ClassVar are shared across all instances,
-        # other fields are calculated per-instance
-        buffer: bytearray
-        size: int
-
-        start_segment: ClassVar[struct.Struct] = struct.Struct(
-            "<"  # Little-endian
-            "Q"  # Tensor header size
-            "H"  # Module index.
-            "B"  # Whether this is a parameter or a buffer
-            "H"  # Parameter/buffer name length
-        )
-
-        # Variable length fields, can't be compiled into
-        # a static struct definition without calculating sizes first
-        variable_length_segment_template: ClassVar[str] = (
-            "<"
-            "{name_len:d}s"  # Parameter/buffer name UTF-8 bytes
-            "B"  # Tensor dtype length
-            "{dtype_len:d}s"  # Tensor dtype UTF-8 bytes
-            "B"  # Tensor shape length
-            "{shape_len:d}I"  # Tensor shape I array
-        )
-        variable_length_segment: struct.Struct
-        variable_length_offset: ClassVar[int] = start_segment.size
-
-        hash_header_segment: ClassVar[struct.Struct] = struct.Struct(
-            "<"
-            "H"  # Hash section length
-            "B"  # Hash count (fixed for a particular tensorizer version)
-        )
-        hash_header_offset: int
-        hash_count: ClassVar[int] = 2
-
-        crc32_hash_segment: ClassVar[struct.Struct] = struct.Struct(
-            "<"
-            "B"  # CRC32 hash type (HashType enum value)
-            "B"  # CRC32 hash length
-            "I"  # CRC32 hash value
-        )
-        crc32_hash_offset: int
-
-        sha256_hash_segment: ClassVar[struct.Struct] = struct.Struct(
-            "<"
-            "B"  # SHA256 hash type
-            "B"  # SHA256 hash length
-            "32s"  # SHA256 hash value
-        )
-        sha256_hash_offset: int
-
-        data_length_segment: ClassVar[struct.Struct] = struct.Struct(
-            "<q"  # Signed tensor data length
-            # We write this signed so that we can use the signedness as an
-            # indicator of possible tensor compression in the future.
-        )
-        data_length_offset: int
-
-        data_offset: int
-
-        # This isn't part of the tensor header,
-        # but it shares much of the same information
-        metadata_entry_segment_template: ClassVar[str] = (
-            "<"
-            "H"  # Name length
-            "{name_len:d}s"  # Name
-            "B"  # Whether this is a parameter or a buffer
-            "B"  # Dtype length
-            "{dtype_len:d}s"  # Dtype
-            "B"  # Shape length
-            "{shape_len:d}I"  # Shape
-            "Q"  # Header start (relative to the file)
-            "Q"  # Tensor data start (relative to the file)
-            "Q"  # Tensor length
-        )
-        metadata_entry: bytes
-
-        def __init__(
-            self,
-            module_index: int,
-            tensor_type: TensorType,
-            name: bytes,
-            dtype: bytes,
-            shape: Sequence[int],
-            data_length: int,
-            file_offset: int,
-        ):
-            # Calculate the variable length segment
-            name_len = len(name)
-            dtype_len = len(dtype)
-            # NB: shape_len is the number of dimensions,
-            # not the encoded byte length
-            shape_len = len(shape)
-            self.variable_length_segment = struct.Struct(
-                self.variable_length_segment_template.format(
-                    name_len=name_len,
-                    dtype_len=dtype_len,
-                    shape_len=shape_len,
-                )
-            )
-
-            # Calculate offsets
-            (
-                self.variable_length_offset,
-                self.hash_header_offset,
-                self.crc32_hash_offset,
-                self.sha256_hash_offset,
-                self.data_length_offset,
-                self.data_offset,
-            ) = itertools.accumulate(
-                (
-                    self.start_segment.size,
-                    self.variable_length_segment.size,
-                    self.hash_header_segment.size,
-                    self.crc32_hash_segment.size,
-                    self.sha256_hash_segment.size,
-                    self.data_length_segment.size,
-                )
-            )
-            self.size = self.data_offset
-
-            self.buffer = bytearray(self.size)
-            self.start_segment.pack_into(
-                self.buffer,
-                0,  # Offset
-                self.size,  # Tensor header size
-                module_index,  # Module index.
-                tensor_type.value,  # Whether this is a parameter or a buffer
-                name_len,  # Parameter/buffer name length
-            )
-            self.variable_length_segment.pack_into(
-                self.buffer,
-                self.variable_length_offset,
-                name,  # Parameter/buffer name UTF-8 bytes
-                dtype_len,  # Tensor dtype length
-                dtype,  # Tensor dtype UTF-8 bytes
-                shape_len,  # Tensor shape length
-                *shape,  # Tensor shape I array
-            )
-            self.hash_segment_size = (
-                self.data_length_offset - self.hash_header_offset - 2
-            )
-            self.hash_header_segment.pack_into(
-                self.buffer,
-                self.hash_header_offset,
-                self.hash_segment_size,  # Hash section length
-                self.hash_count,  # Hash count
-            )
-
-            # Placeholders
-            self.add_crc32(0)
-            self.add_sha256(b"")
-
-            self.data_length_segment.pack_into(
-                self.buffer, self.data_length_offset, data_length
-            )
-
-            metadata_entry_segment: struct.Struct = struct.Struct(
-                self.metadata_entry_segment_template.format(
-                    name_len=name_len,
-                    dtype_len=dtype_len,
-                    shape_len=shape_len,
-                )
-            )
-
-            self.metadata_entry = metadata_entry_segment.pack(
-                name_len,  # Name length
-                name,  # Name
-                tensor_type.value,  # Whether this is a parameter or a buffer
-                dtype_len,  # Dtype length
-                dtype,  # Dtype
-                shape_len,  # Shape length
-                *shape,  # Shape
-                file_offset,  # Header start (relative to the file)
-                # Tensor data start (relative to the file):
-                file_offset + self.data_offset,
-                data_length,  # Tensor length
-            )
-
-        def add_crc32(self, value: int):
-            self.crc32_hash_segment.pack_into(
-                self.buffer,
-                self.crc32_hash_offset,
-                HashType.CRC32.value,  # Hash type
-                4,  # CRC32 hash length
-                value,  # Hash value
-            )
-
-        def add_sha256(self, value: bytes):
-            self.sha256_hash_segment.pack_into(
-                self.buffer,
-                self.sha256_hash_offset,
-                HashType.SHA256.value,  # Hash type
-                32,  # SHA256 hash length
-                value,  # Hash value
-            )
-
     def write_tensor(
         self,
         idx,
@@ -1794,7 +1879,7 @@ class TensorSerializer:
             raise ValueError("dtype name length should be less than 256")
         shape = tensor.shape
         header_pos = self._file.tell() if _start_pos is None else _start_pos
-        header = self._TensorHeader(
+        header = _TensorHeaderSerializer(
             idx,
             tensor_type,
             name_bytes,
