@@ -407,7 +407,7 @@ class TestDeserialization(unittest.TestCase):
 
 def mock_invalid_tensor_hash(*args, **kwargs):
     tensor_hash = TensorHash(*args, **kwargs)
-    tensor_hash["hash"] = bytes(len(tensor_hash["hash"]))
+    tensor_hash.hash = bytes(len(tensor_hash.hash))
     return tensor_hash
 
 
