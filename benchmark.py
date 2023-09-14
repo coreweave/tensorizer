@@ -1,10 +1,12 @@
 import gc
-import torch
-import time
-from tensorizer.serialization import TensorDeserializer
-from tensorizer.stream_io import CURLStreamFile
 import os
 import sys
+import time
+
+import torch
+
+from tensorizer.serialization import TensorDeserializer
+from tensorizer.stream_io import CURLStreamFile
 
 # Read in model name from command line, or env var, or default
 # to gpt-j-6b
