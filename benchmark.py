@@ -27,8 +27,10 @@ args = parser.parse_args()
 
 model_name: str = args.model
 
-output_dir = model_name.split("/")[-1]
-http_uri = f"http://tensorized.accel-object.ord1.coreweave.com/{model_name}/model.tensors"
+http_uri = (
+    "http://tensorized.accel-object.ord1.coreweave.com"
+    f"/{model_name}/model.tensors"
+)
 
 kibibyte = 1 << 10
 mebibyte = 1 << 20
