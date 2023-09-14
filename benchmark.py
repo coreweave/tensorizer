@@ -40,7 +40,7 @@ def io_test(
     # Read the stream `read_size` at a time.
     buffer = bytearray(read_size)
     total_sz = 0
-    start = time.time()
+    start = time.monotonic()
     io = CURLStreamFile(source, buffer_size=buffer_size)
     while True:
         try:
@@ -51,7 +51,7 @@ def io_test(
 
         if sz == 0:
             break
-    end = time.time()
+    end = time.monotonic()
 
     resp_headers = getattr(io, "response_headers", {})
     cached_by = resp_headers.get("x-cache-trace", None)
