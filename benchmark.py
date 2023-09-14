@@ -1,6 +1,6 @@
+import argparse
 import gc
 import os
-import sys
 import time
 
 import torch
@@ -8,22 +8,37 @@ import torch
 from tensorizer.serialization import TensorDeserializer
 from tensorizer.stream_io import CURLStreamFile
 
-# Read in model name from command line, or env var, or default
-# to gpt-j-6b
-model_name = os.getenv("MODEL_NAME", "EleutherAI/gpt-j-6b/fp16")
-if len(sys.argv) > 1:
-    model_name = sys.argv[1]
+# Read in model name from command line, or env var, or default to gpt-j-6B
+model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-j-6B/fp16"
+parser = argparse.ArgumentParser(
+    description="Test CURLStreamFile download speeds"
+)
+parser.add_argument(
+    "model",
+    nargs="?",
+    type=str,
+    default=model_name_default,
+    help=(
+        "Model from the s3://tensorized bucket"
+        f" with which to test deserialization (default: {model_name_default})"
+    ),
+)
+args = parser.parse_args()
+
+model_name: str = args.model
 
 output_dir = model_name.split("/")[-1]
-s3_uri = f"s3://tensorized/{model_name}.tensors"
 http_uri = f"http://tensorized.accel-object.ord1.coreweave.com/{model_name}/model.tensors"
+
+kibibyte = 1 << 10
+mebibyte = 1 << 20
 
 
 def io_test(
-    source=http_uri, read_size=256 * 1024, buffer_size=256 * 1024 * 1024
+    source=http_uri, read_size=256 * kibibyte, buffer_size=256 * mebibyte
 ):
     # Read the stream `read_size` at a time.
-    buffer = memoryview(bytearray(read_size))
+    buffer = bytearray(read_size)
     total_sz = 0
     start = time.time()
     io = CURLStreamFile(source, buffer_size=buffer_size)
@@ -38,18 +53,16 @@ def io_test(
             break
     end = time.time()
 
-    resp_headers = {}
-    if hasattr(io, "response_headers"):
-        resp_headers = io.response_headers
+    resp_headers = getattr(io, "response_headers", {})
     cached_by = resp_headers.get("x-cache-trace", None)
     cached = resp_headers.get("x-cache-status", False)
 
     # Print the total size of the stream, and the speed at which it was read.
     print(
-        f"Read {total_sz / 1024 / 1024:0.2f}mb at "
-        f"{total_sz / 1024 / 1024 / (end - start):0.2f} mb/s, "
-        f"{read_size / 1024}kb read size, "
-        f"{buffer_size / 1024}kb stream buffer size, "
+        f"Read {total_sz / mebibyte:0.2f} MiB at "
+        f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
+        f"{read_size / kibibyte} KiB read size, "
+        f"{buffer_size / kibibyte} KiB stream buffer size, "
         f"cached: {cached} by {cached_by}"
     )
 
@@ -59,9 +72,9 @@ def deserialize_test(
     plaid_mode=False,
     verify_hash=False,
     lazy_load=False,
-    buffer_size=2**18,  # 256kb
+    buffer_size=256 * kibibyte,
 ):
-    start = time.time()
+    start = time.monotonic()
     test_dict = TensorDeserializer(
         CURLStreamFile(source, buffer_size=buffer_size),
         verify_hash=verify_hash,
@@ -73,19 +86,17 @@ def deserialize_test(
         for name in test_dict:
             test_dict[name]
 
-    end = time.time()
+    end = time.monotonic()
 
-    resp_headers = {}
-    if hasattr(test_dict._file, "response_headers"):
-        resp_headers = test_dict._file.response_headers
+    resp_headers = getattr(test_dict._file, "response_headers", {})
     cached_by = resp_headers.get("x-cache-trace", None)
     cached = resp_headers.get("x-cache-status", False)
     total_sz = test_dict.total_bytes_read
 
     print(
-        f"Deserialized {total_sz / 1024 / 1024:0.2f}mb at "
-        f"{total_sz / 1024 / 1024 / (end - start):0.2f} mb/s, "
-        f"{buffer_size / 1024}kb stream buffer size, "
+        f"Deserialized {total_sz / mebibyte:0.2f} MiB at "
+        f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
+        f"{buffer_size / kibibyte} KiB stream buffer size, "
         f"plaid: {plaid_mode}, "
         f"verify_hash: {verify_hash}, "
         f"lazy_load: {lazy_load or plaid_mode}, "
@@ -98,12 +109,13 @@ def deserialize_test(
     gc.collect()
 
 
-# Test the speed of reading from a stream, with different buffer sizes ranging from
-# 128kb to 256mb.
-for buffer_size in range(17, 28):
+# Test the speed of reading from a stream,
+# with different buffer sizes ranging from 128 KiB to 256 MiB.
+for buffer_size_power in range(17, 28):
+    buffer_size = 1 << buffer_size_power
     for sample in range(10):
-        io_test(read_size=2**15, buffer_size=2**buffer_size)
-        deserialize_test(source=http_uri, buffer_size=2**buffer_size)
+        io_test(read_size=32 * kibibyte, buffer_size=buffer_size)
+        deserialize_test(source=http_uri, buffer_size=buffer_size)
         deserialize_test(
-            source=http_uri, plaid_mode=True, buffer_size=2**buffer_size
+            source=http_uri, plaid_mode=True, buffer_size=buffer_size
         )
