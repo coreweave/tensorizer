@@ -142,7 +142,8 @@ class CURLStreamFile:
         begin: Optional[int] = None,
         end: Optional[int] = None,
         headers: Dict[str, Any] = None,
-        buffer_size: int = 2**21,  # `2mb` buffer on the python IO object
+        *,
+        buffer_size: int = 2 << 20,  # 2 MiB buffer on the Python IO object
     ) -> None:
         self._uri = uri
         self._error_context = []
