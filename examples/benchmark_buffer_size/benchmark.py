@@ -1,5 +1,6 @@
 import argparse
 import gc
+import logging
 import os
 import time
 
@@ -7,6 +8,12 @@ import torch
 
 from tensorizer.serialization import TensorDeserializer
 from tensorizer.stream_io import CURLStreamFile
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    level=logging.INFO,
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 # Read in model name from command line, or env var, or default to gpt-neo-2.7B
 model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-neo-2.7B/fp16"
@@ -69,8 +76,8 @@ def io_test(
     cached = resp_headers.get("x-cache-status", False)
 
     # Print the total size of the stream, and the speed at which it was read.
-    print(
-        f"node: {nodename}, "
+    logging.info(
+        f"{nodename} -- "
         f"gpu: {gpu_name} ({gpu_gb} GiB), streamed "
         f"{total_sz / mebibyte:0.2f} MiB at "
         f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
@@ -106,8 +113,8 @@ def deserialize_test(
     cached = resp_headers.get("x-cache-status", False)
     total_sz = test_dict.total_bytes_read
 
-    print(
-        f"node: {nodename}, "
+    logging.info(
+        f"{nodename} -- "
         f"gpu: {gpu_name} ({gpu_gb} GiB), loaded  "
         f" {total_sz / mebibyte:0.2f} MiB at"
         f" {total_sz / mebibyte / (end - start):0.2f} MiB/s,"
