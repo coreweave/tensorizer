@@ -9,7 +9,7 @@ from tensorizer.serialization import TensorDeserializer
 from tensorizer.stream_io import CURLStreamFile
 
 # Read in model name from command line, or env var, or default to gpt-neo-2.7B
-model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-neo-2.7B"
+model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-neo-2.7B/fp16"
 parser = argparse.ArgumentParser(
     description="Test CURLStreamFile download speeds"
 )
@@ -34,6 +34,12 @@ http_uri = (
 
 kibibyte = 1 << 10
 mebibyte = 1 << 20
+gibibyte = 1 << 30
+
+# Collect GPU data
+cudadev = torch.cuda.current_device()
+gpu_gb = int(torch.cuda.get_device_properties(0).total_memory / gibibyte)
+gpu_name = torch.cuda.get_device_name(cudadev)
 
 
 def io_test(
@@ -61,10 +67,11 @@ def io_test(
 
     # Print the total size of the stream, and the speed at which it was read.
     print(
-        f"Read {total_sz / mebibyte:0.2f} MiB at "
+        f"gpu: {gpu_name} ({gpu_gb} GiB), streamed "
+        f"{total_sz / mebibyte:0.2f} MiB at "
         f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
-        f"{read_size / kibibyte} KiB read size, "
         f"{buffer_size / kibibyte} KiB stream buffer size, "
+        f"{read_size / kibibyte} KiB read size, "
         f"cached: {cached} by {cached_by}"
     )
 
@@ -96,13 +103,12 @@ def deserialize_test(
     total_sz = test_dict.total_bytes_read
 
     print(
-        f"Deserialized {total_sz / mebibyte:0.2f} MiB at "
-        f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
-        f"{buffer_size / kibibyte} KiB stream buffer size, "
-        f"plaid: {plaid_mode}, "
-        f"verify_hash: {verify_hash}, "
-        f"lazy_load: {lazy_load or plaid_mode}, "
-        f"cached: {cached} by {cached_by}"
+        f"gpu: {gpu_name} ({gpu_gb} GiB), loaded  "
+        f" {total_sz / mebibyte:0.2f} MiB at"
+        f" {total_sz / mebibyte / (end - start):0.2f} MiB/s,"
+        f" {buffer_size / kibibyte} KiB stream buffer size, plaid:"
+        f" {plaid_mode}, verify_hash: {verify_hash}, lazy_load:"
+        f" {lazy_load or plaid_mode}, cached: {cached} by {cached_by}"
     )
 
     test_dict.close()
