@@ -37,7 +37,7 @@ mebibyte = 1 << 20
 gibibyte = 1 << 30
 
 # Get nodename from environment, or default to os.uname().nodename
-nodename = os.getenv("NODE_NAME") or os.uname().nodename
+nodename = os.getenv("K8S_NODE_NAME") or os.uname().nodename
 
 # Collect GPU data
 cudadev = torch.cuda.current_device()

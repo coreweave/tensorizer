@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tensorizer-benchmark-read-size
+spec:
+  parallelism: 10
+  completions: 100
+  template:
+    spec:
+      containers:
+        - name: benchmark
+          image: ghcr.io/coreweave/tensorizer:benchmark-5dda83c
+          imagePullPolicy: IfNotPresent
+          command: [ "python", "/app/benchmark.py" ]
+          resources:
+            requests:
+              cpu: "4"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+      restartPolicy: Always
