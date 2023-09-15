@@ -2,11 +2,6 @@ on:
   push:
     branches:
       - '*'
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-  pull_request:
-    branches:
-      - '*'
 
 env:
   REGISTRY: ghcr.io
@@ -32,6 +27,8 @@ jobs:
         uses: docker/metadata-action@v5.0.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags:
+            type=sha,enable=true,priority=100,prefix=benchmark-,suffix=,format=short
 
       - name: Build and push Docker image
         uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
