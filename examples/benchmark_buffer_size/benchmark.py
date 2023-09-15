@@ -8,8 +8,8 @@ import torch
 from tensorizer.serialization import TensorDeserializer
 from tensorizer.stream_io import CURLStreamFile
 
-# Read in model name from command line, or env var, or default to gpt-j-6B
-model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-j-6B/fp16"
+# Read in model name from command line, or env var, or default to gpt-neo-2.7B
+model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-neo-2.7B"
 parser = argparse.ArgumentParser(
     description="Test CURLStreamFile download speeds"
 )
