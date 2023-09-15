@@ -36,6 +36,9 @@ kibibyte = 1 << 10
 mebibyte = 1 << 20
 gibibyte = 1 << 30
 
+# Get nodename from environment, or default to os.uname().nodename
+nodename = os.getenv("NODE_NAME") or os.uname().nodename
+
 # Collect GPU data
 cudadev = torch.cuda.current_device()
 gpu_gb = int(torch.cuda.get_device_properties(0).total_memory / gibibyte)
@@ -67,6 +70,7 @@ def io_test(
 
     # Print the total size of the stream, and the speed at which it was read.
     print(
+        f"node: {nodename}, "
         f"gpu: {gpu_name} ({gpu_gb} GiB), streamed "
         f"{total_sz / mebibyte:0.2f} MiB at "
         f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
@@ -103,6 +107,7 @@ def deserialize_test(
     total_sz = test_dict.total_bytes_read
 
     print(
+        f"node: {nodename}, "
         f"gpu: {gpu_name} ({gpu_gb} GiB), loaded  "
         f" {total_sz / mebibyte:0.2f} MiB at"
         f" {total_sz / mebibyte / (end - start):0.2f} MiB/s,"
