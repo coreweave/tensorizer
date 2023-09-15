@@ -2,5 +2,7 @@ FROM ghcr.io/coreweave/ml-containers/torch:9faf4d7-base-cuda12.0.1-torch2.0.1-vi
 
 RUN mkdir /app
 COPY tensorizer /app/tensorizer
+COPY requirements.txt /app/tensorizer
+RUN pip3 install -r /app/tensorizer/requirements.txt
 ADD examples/benchmark_buffer_size/benchmark.py /app/benchmark.py
 ENTRYPOINT ["python3", "/app/benchmark.py"]
