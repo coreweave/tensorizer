@@ -567,9 +567,11 @@ class _MetadataDeserializer(dict):
         # Read the shape.
         shape, offset = cls._read_shape(buffer, offset)
 
-        header_offset, data_offset, data_length = (
-            cls._location_segment.unpack_from(buffer, offset)
-        )
+        (
+            header_offset,
+            data_offset,
+            data_length,
+        ) = cls._location_segment.unpack_from(buffer, offset)
         offset += cls._location_segment.size
 
         return (
@@ -797,7 +799,7 @@ class TensorDeserializer(collections.abc.Mapping):
                 self._is_memory_pinned = True
             end_allocate = time.time()
             tensor_bytes_str = utils.convert_bytes(self.total_tensor_bytes)
-            logger.info(
+            logger.debug(
                 f"Allocated {tensor_bytes_str} "
                 f"for {len(self._metadata)} tensors "
                 f"in {end_allocate - start_allocate:0.4f}"
@@ -2087,9 +2089,10 @@ class TensorSerializer:
 
         cuda_tensors = [t for t in tensors if t.device.type == "cuda"]
         if cuda_tensors:
-            transferred, interrupt_transfer = (
-                self._async_bulk_device_to_host_transfer(cuda_tensors)
-            )
+            (
+                transferred,
+                interrupt_transfer,
+            ) = self._async_bulk_device_to_host_transfer(cuda_tensors)
         else:
             transferred = interrupt_transfer = None
         tensors.clear()

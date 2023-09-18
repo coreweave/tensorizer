@@ -142,6 +142,8 @@ class CURLStreamFile:
         begin: Optional[int] = None,
         end: Optional[int] = None,
         headers: Dict[str, Any] = None,
+        *,
+        buffer_size: int = 2 << 20,  # 2 MiB buffer on the Python IO object
     ) -> None:
         self._uri = uri
         self._error_context = []
@@ -174,11 +176,10 @@ class CURLStreamFile:
         self._curl = None
         with _wide_pipes.widen_new_pipes():  # Widen on Windows
             popen_start = time.monotonic()
-            # NOTE: `256mb` buffer on the python IO object.
             self._curl = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                bufsize=256 * 1024 * 1024,
+                bufsize=buffer_size,
             )
         popen_end = time.monotonic()
 

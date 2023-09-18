@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `buffer_size` parameter to `stream_io.CURLStreamFile` to control the amount of
+  data buffered in advance during loading
+  - Defaults to 2 MiB
+  - Previously, this was fixed at 256 MiB
+
 ### Changed
 
 - `TensorSerializer.write_module` has been optimized further for a speedup of
