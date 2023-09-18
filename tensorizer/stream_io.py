@@ -431,6 +431,7 @@ def _new_s3_client(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str,
+    signature_version: str = None,
 ):
     if s3_secret_access_key is None:
         raise TypeError("No secret key provided")
@@ -449,6 +450,8 @@ def _new_s3_client(
             aws_access_key_id=s3_access_key_id,
             aws_secret_access_key=s3_secret_access_key,
         )
+        if signature_version is not None:
+            config_args["signature_version"] = signature_version
 
     config = boto3.session.Config(**config_args)
 
@@ -491,11 +494,43 @@ def _s3_download_url(
     s3_endpoint: str = default_s3_read_endpoint,
 ) -> str:
     bucket, key = _parse_s3_uri(path_uri)
-    client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint)
+    # v2 signature is important to easily align the presigned URL expiry
+    # times. This allows multiple clients to generate the exact same
+    # presigned URL, and get hits on a HTTP caching proxy.
+    #
+    # why v2 signature?
+    # V2 signature has ONE part: expiry timestamp, in epoch seconds.
+    # V4 signature has TWO parts: x-amz-date & duration,
+    # boto3 does not permit easy modification of x-amz-date.
+    # See upstream bug https://github.com/boto/botocore/issues/2230
+    #
+    client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint, signature_version='s3')
+
+    # Explaination with SIG_GRANULARITY=1h
+    # compute an expiry that is aligned to the hour, at least 1 hour
+    # away from present time
+    # time=00:00:00 -> expiry=02:00:00
+    # time=00:01:00 -> expiry=02:00:00
+    # time=00:59:59 -> expiry=02:00:00
+    # time=01:00:00 -> expiry=03:00:00
+    #
+    # if your files are so large that they take LONGER than 1 hour to
+    # download, a larger SIG_GRANULARITY would be required.
+    #
+    # Caveats: If the time.time() call is at 3599.9̅ (9 repeating if your
+    # unicode is broken), and the Boto call happens at 3600.x, then the expiry
+    # will be at the NEXT boundary. Boto3 support specifying an absolute expiry
+    # time (Boto2 did support it).
+
+    SIG_GRANULARITY = 86400
+    t = int(time.time())
+    expiry = t - (t % SIG_GRANULARITY) + (SIG_GRANULARITY * 2)
+    seconds_to_expiry = expiry - t
+
     url = client.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=300,
+        ExpiresIn=seconds_to_expiry,
     )
     return url
 
