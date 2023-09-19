@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from urllib.parse import urlparse
 
 import boto3
 import botocore
+import redis
 
 import tensorizer._version as _version
 import tensorizer._wide_pipes as _wide_pipes
@@ -417,6 +419,175 @@ class CURLStreamFile:
             self.__init__(self._uri, position, None)
 
 
+def _parse_redis_uri(uri):
+    uri_components = urlparse(uri)
+
+    if uri_components.scheme.lower() != "redis":
+        raise ValueError(f"Invalid S3 URI: {uri}")
+
+    host = uri_components.hostname
+    port = uri_components.port
+    if port is None:
+        port = 6379
+    prefix = uri_components.path.lstrip("/")
+
+    return host, port, prefix
+
+
+class RedisStreamFile:
+    """
+    RedisStreamFile implements a file-like object around a Redis key namespace.
+    """
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        buffer_size: int = 2 << 20,  # 2 MiB buffer on the Python IO object
+    ) -> None:
+        host, port, prefix = _parse_redis_uri(uri)
+        self._redis = redis.Redis(host=host, port=port, db=0)
+        self._redis_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._redis_tcp.connect((host, port))
+
+        # Do a key scan for the prefix, and collect all the indexes from the keys.
+        self._keys = []
+        self._indexes = []
+        self._sizes = []
+        keys = self._redis.scan_iter(f"{prefix}:*")
+        # Sort the keys by their index.
+        for key in sorted(
+            keys, key=lambda x: int(x.decode("utf-8").split(":")[-1])
+        ):
+            self._keys.append(key)
+
+        # Get indexes.
+        for key in self._keys:
+            self._indexes.append(int(key.decode("utf-8").split(":")[-1]))
+
+        self._curr = 0
+        self._curr_key = 0
+        self._curr_buffer = b""
+        self.closed = False
+
+        self.response_latencies = []
+        self.bytes_read = 0
+        self.bytes_skipped = 0
+        self.read_operations = 0
+
+    def _find_key_index(self, position):
+        for i, index in enumerate(self._indexes):
+            if position < index:
+                return i - 1
+        return len(self._keys) - 1
+
+    def _read_from(
+        self, position: int, size: int, ba: Union[bytearray, memoryview]
+    ) -> int:
+        self.read_operations += 1
+        curr_key = self._find_key_index(position)
+        curr_key_pos = self._indexes[curr_key]
+        begin_idx = position - curr_key_pos
+        if curr_key + 1 in self._indexes:
+            read_sz = min(size, self._indexes[curr_key + 1] - position)
+        else:
+            read_sz = size
+        command = (
+            "GETRANGE"
+            f" {self._keys[curr_key].decode('utf-8')} {begin_idx} {begin_idx + read_sz - 1}"
+        )
+        self._redis_tcp.send(command.encode("utf-8") + b"\r\n")
+        value_sz = self._read_sz()
+        num_bytes = self._redis_tcp.recv_into(ba, value_sz, socket.MSG_WAITALL)
+        self._redis_tcp.recv(2)
+        return num_bytes
+
+    def _read_sz(self) -> int:
+        # Loop until we get a \r\n
+        sz_resp = b""
+        while True:
+            b = self._redis_tcp.recv(1)
+            sz_resp += b
+            if sz_resp[-2:] == b"\r\n":
+                break
+        sz_str = sz_resp.decode("utf-8").strip()[1:]
+        if sz_str == "-1":
+            raise IOError("Key not found")
+        return int(sz_str)
+
+    def _read_until(
+        self, goal_position: int, ba: Optional[bytearray] = None
+    ) -> Union[bytes, int]:
+        try:
+            if ba is None:
+                rq_sz = goal_position - self._curr
+                mv = memoryview(bytearray(rq_sz))
+            else:
+                rq_sz = len(ba)
+                mv = memoryview(ba)
+            left = rq_sz
+            while left > 0:
+                num_bytes = self._read_from(self._curr, left, mv)
+                if num_bytes == 0:
+                    break
+                left -= num_bytes
+                self._curr += num_bytes
+                if left == 0:
+                    break
+                mv = mv[num_bytes:]
+            self.bytes_read += rq_sz - left
+            if ba is None:
+                return mv.tobytes()
+            else:
+                return rq_sz - left
+        except (IOError, OSError) as e:
+            raise e
+
+    def tell(self) -> int:
+        return self._curr
+
+    def readinto(self, ba: bytearray) -> int:
+        goal_position = self._curr + len(ba)
+        return self._read_until(goal_position, ba)
+
+    def read(self, size=None) -> bytes:
+        if self.closed:
+            raise IOError("RedisStreamFile closed.")
+        if size is None:
+            return self._read_until(self._indexes[-1] + self._sizes[-1])
+        goal_position = self._curr + size
+        return self._read_until(goal_position)
+
+    @staticmethod
+    def writable() -> bool:
+        return False
+
+    @staticmethod
+    def fileno() -> int:
+        return -1
+
+    def seek(self, position, whence=SEEK_SET):
+        if whence == SEEK_CUR:
+            position += self._curr
+        if position == self._curr:
+            return
+        if whence == SEEK_END:
+            raise ValueError("Unsupported `whence`")
+        self._curr = position
+
+    def close(self):
+        self.closed = True
+        if self._redis is not None:
+            self._redis.close()
+            self._redis = None
+        if self._redis_tcp is not None:
+            self._redis_tcp.close()
+            self._redis_tcp = None
+
+    def readline(self):
+        raise NotImplementedError("Unimplemented")
+
+
 def _ensure_https_endpoint(endpoint: str):
     scheme, *location = endpoint.split("://", maxsplit=1)
     scheme = scheme.lower() if location else None
@@ -505,7 +676,12 @@ def _s3_download_url(
     # boto3 does not permit easy modification of x-amz-date.
     # See upstream bug https://github.com/boto/botocore/issues/2230
     #
-    client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint, signature_version='s3')
+    client = _new_s3_client(
+        s3_access_key_id,
+        s3_secret_access_key,
+        s3_endpoint,
+        signature_version="s3",
+    )
 
     # Explaination with SIG_GRANULARITY=1h
     # compute an expiry that is aligned to the hour, at least 1 hour

@@ -3,3 +3,4 @@ numpy>=1.19.5
 protobuf>=3.19.5
 psutil>=5.9.4
 boto3>=1.26.0
+hiredis

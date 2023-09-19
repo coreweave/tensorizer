@@ -2,12 +2,14 @@ import argparse
 import gc
 import logging
 import os
+import socket
 import time
 
+import redis
 import torch
 
 from tensorizer.serialization import TensorDeserializer
-from tensorizer.stream_io import CURLStreamFile
+from tensorizer.stream_io import CURLStreamFile, RedisStreamFile
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
@@ -16,7 +18,7 @@ logging.basicConfig(
 )
 
 # Read in model name from command line, or env var, or default to gpt-neo-2.7B
-model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-neo-2.7B/fp16"
+model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-j-6B/fp16"
 parser = argparse.ArgumentParser(
     description="Test CURLStreamFile download speeds"
 )
@@ -39,6 +41,8 @@ http_uri = (
     f"/{model_name}/model.tensors"
 )
 
+print(f"Testing {http_uri}")
+
 kibibyte = 1 << 10
 mebibyte = 1 << 20
 gibibyte = 1 << 30
@@ -47,9 +51,16 @@ gibibyte = 1 << 30
 nodename = os.getenv("K8S_NODE_NAME") or os.uname().nodename
 
 # Collect GPU data
-cudadev = torch.cuda.current_device()
-gpu_gb = int(torch.cuda.get_device_properties(0).total_memory / gibibyte)
-gpu_name = torch.cuda.get_device_name(cudadev)
+try:
+    cudadev = torch.cuda.current_device()
+    gpu_gb = int(torch.cuda.get_device_properties(0).total_memory / gibibyte)
+    gpu_name = torch.cuda.get_device_name(cudadev)
+except AssertionError:
+    gpu_gb = 0
+    gpu_name = "CPU"
+
+
+redis_client = redis.Redis(host="localhost", port=6379, db=0)
 
 
 def io_test(
@@ -129,13 +140,102 @@ def deserialize_test(
     gc.collect()
 
 
-# Test the speed of reading from a stream,
-# with different buffer sizes ranging from 128 KiB to 256 MiB.
-for buffer_size_power in range(17, 28):
-    buffer_size = 1 << buffer_size_power
-    for sample in range(10):
-        io_test(read_size=32 * kibibyte, buffer_size=buffer_size)
-        deserialize_test(source=http_uri, buffer_size=buffer_size)
-        deserialize_test(
-            source=http_uri, plaid_mode=True, buffer_size=buffer_size
+def test_read_performance():
+    # Test the speed of reading from a stream,
+    # with different buffer sizes ranging from 128 KiB to 256 MiB.
+    for buffer_size_power in range(17, 28):
+        buffer_size = 1 << buffer_size_power
+        for sample in range(10):
+            io_test(read_size=32 * kibibyte, buffer_size=buffer_size)
+            deserialize_test(source=http_uri, buffer_size=buffer_size)
+            deserialize_test(
+                source=http_uri, plaid_mode=True, buffer_size=buffer_size
+            )
+
+
+def load_redis():
+    start = time.monotonic()
+    test_dict = TensorDeserializer(http_uri, lazy_load=True)
+    test_dict.to_redis(redis_client, model_name)
+    end = time.monotonic()
+    rate = test_dict.total_bytes_read / (end - start)
+    print(
+        f"Loaded {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
+        f" {rate / mebibyte:0.2f} MiB/s in {end - start:0.2f}s"
+    )
+
+
+def bench_redis():
+    # Establish raw TCP connection to redis server.
+    RECV_BUF_SIZE = 256 * mebibyte
+    redis_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    bufsize = redis_tcp.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    # redis_tcp.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 0)
+    # redis_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUF_SIZE)
+    after_bufsize = redis_tcp.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+
+    print("Buffer size [Before]:%d" % bufsize)
+    print("Buffer size [After]:%d" % after_bufsize)
+
+    redis_tcp.connect(("localhost", 6379))
+
+    buf = bytearray(512 * mebibyte)
+
+    # Loop over redis keys, and read them into memory.
+    for key in redis_client.scan_iter(f"{model_name}:*:module"):
+        start = time.monotonic()
+        redis_tcp.send(f"GET {key.decode('utf-8')}\r\n".encode("utf-8"))
+        # Loop over tcp bytes until we get a \r\n
+        sz_resp = b""
+        while True:
+            b = redis_tcp.recv(1)
+            sz_resp += b
+            if sz_resp[-2:] == b"\r\n":
+                break
+        sz_str = sz_resp.decode("utf-8").strip()[1:]
+        if sz_str == "-1":
+            print("Key not found")
+            break
+        sz = int(sz_str)
+        left = sz
+        mv = memoryview(buf)
+        read_ct = 0
+        while left > 0:
+            num_bytes = redis_tcp.recv_into(mv, left, socket.MSG_WAITALL)
+            mv = mv[num_bytes:]
+            left -= num_bytes
+            read_ct += 1
+        end = time.monotonic()
+        rate = sz / (end - start)
+        # read trailing \r\n
+        redis_tcp.recv(2)
+
+        print(
+            f"{key.decode('utf-8')}: Read {sz / mebibyte:0.2f} MiB at"
+            f" {rate / mebibyte:0.2f} MiB/s in {(end - start) * 1000:0.2f}ms"
+            f" in {read_ct} reads"
         )
+
+
+# load_redis()
+
+test_dict = TensorDeserializer(
+    RedisStreamFile(f"redis://localhost:6379/{model_name}"),
+    lazy_load=True,
+)
+
+all_begin = time.monotonic()
+for name in test_dict:
+    begin = time.monotonic()
+    test_dict[name]
+    end = time.monotonic()
+    print(f"{name}: {end - begin:0.2f}s")
+all_end = time.monotonic()
+
+print(
+    f"Total bytes read: {test_dict.total_bytes_read / gibibyte:0.2f} GiB in"
+    f" {all_end - all_begin:0.2f}s"
+)
+
+
+exit(0)
