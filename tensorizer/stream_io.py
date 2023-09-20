@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import typing
 import weakref
@@ -449,6 +450,7 @@ class RedisStreamFile:
         self._redis = redis.Redis(host=host, port=port, db=0)
         self._redis_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._redis_tcp.connect((host, port))
+        self._redis_tcp_mutex = threading.Lock()
 
         # Do a key scan for the prefix, and collect all the indexes from the keys.
         self._keys = []
@@ -462,12 +464,20 @@ class RedisStreamFile:
             self._keys.append(key)
 
         # Get indexes.
+        largest = 0
+        prev = 0
         for key in self._keys:
+            size = self._redis.strlen(key)
+            if size > largest:
+                largest = size
+            self._sizes.append(size)
             self._indexes.append(int(key.decode("utf-8").split(":")[-1]))
 
         self._curr = 0
         self._curr_key = 0
-        self._curr_buffer = b""
+        self._curr_buffer = bytearray(largest)
+        self._curr_buffer_idx = -1
+        self._curr_buffer_view = memoryview(self._curr_buffer)[0:0]
         self.closed = False
 
         self.response_latencies = []
@@ -481,25 +491,82 @@ class RedisStreamFile:
                 return i - 1
         return len(self._keys) - 1
 
+    # def _perform_lookahead(self, pos):
+    #     curr_key = self._find_key_index(pos)
+    #     next_key = curr_key + 1
+    #     if next_key >= len(self._keys):
+    #         return
+    #     if len(self._next_buffer_view) > 0:
+    #         return
+    #     lookahead_key_sz = self._sizes[next_key]
+    #     lookahead_key_pos = self._indexes[next_key]
+    #     self._next_buffer_view = memoryview(self._next_buffer)[
+    #         :lookahead_key_sz
+    #     ]
+    #     self._read_from(
+    #         lookahead_key_pos, lookahead_key_sz, self._next_buffer_view, True
+    #     )
+    #     self._next_buffer_idx = lookahead_key_pos
+
     def _read_from(
-        self, position: int, size: int, ba: Union[bytearray, memoryview]
+        self,
+        position: int,
+        size: int,
+        ba: Union[bytearray, memoryview],
+        no_buffer: bool = False,
     ) -> int:
         self.read_operations += 1
         curr_key = self._find_key_index(position)
         curr_key_pos = self._indexes[curr_key]
+        curr_key_sz = self._sizes[curr_key]
         begin_idx = position - curr_key_pos
-        if curr_key + 1 in self._indexes:
-            read_sz = min(size, self._indexes[curr_key + 1] - position)
+        read_sz = min(size, curr_key_sz)
+
+        # Check if we have a partial read of the current key in the buffer.
+        # TODO: allow for reads that do not align with the key boundaries.
+        if (
+            self._curr_buffer_idx <= position
+            and len(self._curr_buffer_view) > 0
+            and not no_buffer
+        ):
+            num_bytes = min(read_sz, len(self._curr_buffer_view))
+            ba[:num_bytes] = self._curr_buffer_view[:num_bytes]
+            self._curr_buffer_idx += num_bytes
+            self._curr_buffer_view = self._curr_buffer_view[num_bytes:]
+            return num_bytes
+
+        self._redis_tcp_mutex.acquire(True)
+
+        # We have an aligned read, so we can use GET.
+        if position == curr_key_pos:
+            command = f"GET {self._keys[curr_key].decode('utf-8')}"
         else:
-            read_sz = size
-        command = (
-            "GETRANGE"
-            f" {self._keys[curr_key].decode('utf-8')} {begin_idx} {begin_idx + read_sz - 1}"
-        )
+            command = (
+                f"GETRANGE {self._keys[curr_key].decode('utf-8')}"
+                f" {begin_idx} {begin_idx + read_sz - 1}"
+            )
+
         self._redis_tcp.send(command.encode("utf-8") + b"\r\n")
         value_sz = self._read_sz()
-        num_bytes = self._redis_tcp.recv_into(ba, value_sz, socket.MSG_WAITALL)
+        tcp_read_sz = min(value_sz, read_sz)
+        num_bytes = self._redis_tcp.recv_into(
+            ba, tcp_read_sz, socket.MSG_WAITALL
+        )
+
+        # We performed a partial read of the entire key, so we need to
+        # store the remainder in the buffer.
+        if value_sz > read_sz:
+            tcp_read_sz = value_sz - num_bytes
+            if tcp_read_sz > len(self._curr_buffer):
+                self._curr_buffer = bytearray(tcp_read_sz)
+            self._curr_buffer_view = memoryview(self._curr_buffer)[:tcp_read_sz]
+            self._redis_tcp.recv_into(
+                self._curr_buffer_view, tcp_read_sz, socket.MSG_WAITALL
+            )
+            self._curr_buffer_idx = position + num_bytes
+
         self._redis_tcp.recv(2)
+        self._redis_tcp_mutex.release()
         return num_bytes
 
     def _read_sz(self) -> int:
@@ -532,6 +599,7 @@ class RedisStreamFile:
                     break
                 left -= num_bytes
                 self._curr += num_bytes
+                # self._perform_lookahead(self._curr)
                 if left == 0:
                     break
                 mv = mv[num_bytes:]
