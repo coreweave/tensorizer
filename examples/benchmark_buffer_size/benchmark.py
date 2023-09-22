@@ -136,7 +136,8 @@ def deserialize_test(
 
     test_dict.close()
     del test_dict
-    torch.cuda.synchronize()
+    if hasattr(torch, "cuda"):
+        torch.cuda.synchronize()
     gc.collect()
 
 
@@ -165,25 +166,42 @@ def load_redis():
     )
 
 
-def bench_redis():
+def bench_redis(buffer_size=256 * kibibyte):
+    test_dict = TensorDeserializer(
+        RedisStreamFile(
+            f"redis://localhost:6379/{model_name}", buffer_size=buffer_size
+        ),
+        lazy_load=True,
+    )
+
+    all_begin = time.monotonic()
+    for name in test_dict:
+        test_dict[name]
+    all_end = time.monotonic()
+
+    print(
+        f"Read {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
+        f" {buffer_size} bytes stream buffer size in"
+        f" {test_dict.total_bytes_read / gibibyte / (all_end - all_begin):0.2f} GiB/s"
+    )
+    del test_dict
+
+
+def io_test_redis(buffer_size=256 * kibibyte):
     # Establish raw TCP connection to redis server.
-    RECV_BUF_SIZE = 256 * mebibyte
     redis_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    bufsize = redis_tcp.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-    # redis_tcp.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 0)
-    # redis_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUF_SIZE)
-    after_bufsize = redis_tcp.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-
-    print("Buffer size [Before]:%d" % bufsize)
-    print("Buffer size [After]:%d" % after_bufsize)
-
+    redis_tcp.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 0)
+    redis_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_size)
     redis_tcp.connect(("localhost", 6379))
 
     buf = bytearray(512 * mebibyte)
 
+    total_bytes = 0
+
+    start_time = time.monotonic()
+
     # Loop over redis keys, and read them into memory.
-    for key in redis_client.scan_iter(f"{model_name}:*:module"):
-        start = time.monotonic()
+    for key in redis_client.scan_iter(f"{model_name}:*"):
         redis_tcp.send(f"GET {key.decode('utf-8')}\r\n".encode("utf-8"))
         # Loop over tcp bytes until we get a \r\n
         sz_resp = b""
@@ -204,38 +222,25 @@ def bench_redis():
             num_bytes = redis_tcp.recv_into(mv, left, socket.MSG_WAITALL)
             mv = mv[num_bytes:]
             left -= num_bytes
+            total_bytes += num_bytes
             read_ct += 1
-        end = time.monotonic()
-        rate = sz / (end - start)
-        # read trailing \r\n
         redis_tcp.recv(2)
 
-        print(
-            f"{key.decode('utf-8')}: Read {sz / mebibyte:0.2f} MiB at"
-            f" {rate / mebibyte:0.2f} MiB/s in {(end - start) * 1000:0.2f}ms"
-            f" in {read_ct} reads"
-        )
+    end_time = time.monotonic()
+    redis_tcp.close()
+    print(
+        f"Raw read {total_bytes / gibibyte:0.2f} GiB at"
+        f" {buffer_size} bytes stream buffer size in"
+        f" {total_bytes / gibibyte / (end_time - start_time):0.2f} GiB/s"
+    )
 
 
-# load_redis()
-
-test_dict = TensorDeserializer(
-    RedisStreamFile(f"redis://localhost:6379/{model_name}"),
-    lazy_load=True,
-)
-
-all_begin = time.monotonic()
-for name in test_dict:
-    begin = time.monotonic()
-    test_dict[name]
-    end = time.monotonic()
-    print(f"{name}: {end - begin:0.2f}s")
-all_end = time.monotonic()
-
-print(
-    f"Total bytes read: {test_dict.total_bytes_read / gibibyte:0.2f} GiB in"
-    f" {all_end - all_begin:0.2f}s"
-)
+load_redis()
+for buffer_size_power in range(16, 21):
+    buffer_size = 1 << buffer_size_power
+    for sample in range(5):
+        io_test_redis(buffer_size=buffer_size)
+        bench_redis(buffer_size=buffer_size)
 
 
 exit(0)

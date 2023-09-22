@@ -444,11 +444,14 @@ class RedisStreamFile:
         self,
         uri: str,
         *,
-        buffer_size: int = 2 << 20,  # 2 MiB buffer on the Python IO object
+        buffer_size: int = 2 << 20,
     ) -> None:
         host, port, prefix = _parse_redis_uri(uri)
         self._redis = redis.Redis(host=host, port=port, db=0)
         self._redis_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._redis_tcp.setsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_size
+        )
         self._redis_tcp.connect((host, port))
         self._redis_tcp_mutex = threading.Lock()
 
@@ -491,23 +494,6 @@ class RedisStreamFile:
                 return i - 1
         return len(self._keys) - 1
 
-    # def _perform_lookahead(self, pos):
-    #     curr_key = self._find_key_index(pos)
-    #     next_key = curr_key + 1
-    #     if next_key >= len(self._keys):
-    #         return
-    #     if len(self._next_buffer_view) > 0:
-    #         return
-    #     lookahead_key_sz = self._sizes[next_key]
-    #     lookahead_key_pos = self._indexes[next_key]
-    #     self._next_buffer_view = memoryview(self._next_buffer)[
-    #         :lookahead_key_sz
-    #     ]
-    #     self._read_from(
-    #         lookahead_key_pos, lookahead_key_sz, self._next_buffer_view, True
-    #     )
-    #     self._next_buffer_idx = lookahead_key_pos
-
     def _read_from(
         self,
         position: int,
@@ -520,14 +506,19 @@ class RedisStreamFile:
         curr_key_pos = self._indexes[curr_key]
         curr_key_sz = self._sizes[curr_key]
         begin_idx = position - curr_key_pos
+        position_end = position + size
         read_sz = min(size, curr_key_sz)
+        curr_buffer_end = self._curr_buffer_idx + len(self._curr_buffer_view)
 
         # Check if we have a partial read of the current key in the buffer.
         # TODO: allow for reads that do not align with the key boundaries.
         if (
-            self._curr_buffer_idx <= position
+            not no_buffer
             and len(self._curr_buffer_view) > 0
-            and not no_buffer
+            and self._curr_buffer_idx
+            <= position
+            < position_end
+            < curr_buffer_end
         ):
             num_bytes = min(read_sz, len(self._curr_buffer_view))
             ba[:num_bytes] = self._curr_buffer_view[:num_bytes]
@@ -565,7 +556,9 @@ class RedisStreamFile:
             )
             self._curr_buffer_idx = position + num_bytes
 
+        # Read the trailing \r\n and discard.
         self._redis_tcp.recv(2)
+
         self._redis_tcp_mutex.release()
         return num_bytes
 
@@ -599,7 +592,6 @@ class RedisStreamFile:
                     break
                 left -= num_bytes
                 self._curr += num_bytes
-                # self._perform_lookahead(self._curr)
                 if left == 0:
                     break
                 mv = mv[num_bytes:]
