@@ -11,15 +11,16 @@ spec:
         - name: benchmark
           image: ghcr.io/coreweave/tensorizer:benchmark-5dda83c
           imagePullPolicy: IfNotPresent
-          command: [ "python", "/app/benchmark.py" ]
+          command: [ "/bin/bash" ]
+          args: [ "-c" "redis-server && python /app/benchmark.py" ]
           resources:
             requests:
-              cpu: "4"
-              memory: 32Gi
+              cpu: "8"
+              memory: 64Gi
               nvidia.com/gpu: "1"
             limits:
-              cpu: "4"
-              memory: 32Gi
+              cpu: "8"
+              memory: 64Gi
               nvidia.com/gpu: "1"
           env:
             - name: PYTHONUNBUFFERED

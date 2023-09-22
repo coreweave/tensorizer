@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 
 # Read in model name from command line, or env var, or default to gpt-neo-2.7B
-model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-j-6B/fp16"
+model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-neo-2.7B/fp16"
 parser = argparse.ArgumentParser(
     description="Test CURLStreamFile download speeds"
 )
@@ -241,6 +241,5 @@ for buffer_size_power in range(16, 21):
     for sample in range(5):
         io_test_redis(buffer_size=buffer_size)
         bench_redis(buffer_size=buffer_size)
-
 
 exit(0)
