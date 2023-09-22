@@ -9,10 +9,10 @@ spec:
     spec:
       containers:
         - name: benchmark
-          image: ghcr.io/coreweave/tensorizer:benchmark-ddf4b3f
+          image: ghcr.io/coreweave/tensorizer:benchmark-da4e2dd
           imagePullPolicy: IfNotPresent
           command: [ "/bin/bash" ]
-          args: [ "-c" "redis-server && python /app/benchmark.py" ]
+          args: [ "-c", "redis-server --daemonize yes & python /app/benchmark.py" ]
           resources:
             requests:
               cpu: "8"

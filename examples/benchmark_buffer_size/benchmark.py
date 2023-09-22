@@ -41,7 +41,7 @@ http_uri = (
     f"/{model_name}/model.tensors"
 )
 
-print(f"Testing {http_uri}")
+logging.info(f"Testing {http_uri}")
 
 kibibyte = 1 << 10
 mebibyte = 1 << 20
@@ -55,9 +55,11 @@ try:
     cudadev = torch.cuda.current_device()
     gpu_gb = int(torch.cuda.get_device_properties(0).total_memory / gibibyte)
     gpu_name = torch.cuda.get_device_name(cudadev)
+    has_gpu = True
 except AssertionError:
     gpu_gb = 0
     gpu_name = "CPU"
+    has_gpu = False
 
 
 redis_client = redis.Redis(host="localhost", port=6379, db=0)
@@ -88,8 +90,8 @@ def io_test(
 
     # Print the total size of the stream, and the speed at which it was read.
     logging.info(
-        f"{nodename} -- "
-        f"gpu: {gpu_name} ({gpu_gb} GiB), streamed "
+        f"{nodename} -- curl:  "
+        f"gpu: {gpu_name} ({gpu_gb} GiB), raw read "
         f"{total_sz / mebibyte:0.2f} MiB at "
         f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
         f"{buffer_size / kibibyte} KiB stream buffer size, "
@@ -125,7 +127,7 @@ def deserialize_test(
     total_sz = test_dict.total_bytes_read
 
     logging.info(
-        f"{nodename} -- "
+        f"{nodename} -- curl:  "
         f"gpu: {gpu_name} ({gpu_gb} GiB), loaded  "
         f" {total_sz / mebibyte:0.2f} MiB at"
         f" {total_sz / mebibyte / (end - start):0.2f} MiB/s,"
@@ -160,32 +162,48 @@ def load_redis():
     test_dict.to_redis(redis_client, model_name)
     end = time.monotonic()
     rate = test_dict.total_bytes_read / (end - start)
-    print(
-        f"Loaded {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
+    logging.info(
+        f"redis: Loaded {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
         f" {rate / mebibyte:0.2f} MiB/s in {end - start:0.2f}s"
     )
 
 
-def bench_redis(buffer_size=256 * kibibyte):
+def bench_redis(
+    plaid_mode=False,
+    verify_hash=False,
+    lazy_load=False,
+    buffer_size=256 * kibibyte,
+):
     test_dict = TensorDeserializer(
         RedisStreamFile(
             f"redis://localhost:6379/{model_name}", buffer_size=buffer_size
         ),
-        lazy_load=True,
-        plaid_mode=True,
+        lazy_load=lazy_load,
+        plaid_mode=plaid_mode,
+        verify_hash=verify_hash,
     )
 
-    all_begin = time.monotonic()
+    start = time.monotonic()
     for name in test_dict:
         test_dict[name]
-    all_end = time.monotonic()
+    end = time.monotonic()
+    total_sz = test_dict.total_bytes_read
 
-    print(
-        f"Read {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
-        f" {buffer_size} bytes stream buffer size in"
-        f" {test_dict.total_bytes_read / gibibyte / (all_end - all_begin):0.2f} GiB/s"
+    logging.info(
+        f"{nodename} -- redis: "
+        f"gpu: {gpu_name} ({gpu_gb} GiB), loaded  "
+        f" {total_sz / mebibyte:0.2f} MiB at"
+        f" {total_sz / mebibyte / (end - start):0.2f} MiB/s,"
+        f" {buffer_size / kibibyte} KiB stream buffer size, plaid:"
+        f" {plaid_mode}, verify_hash: {verify_hash}, lazy_load:"
+        f" {lazy_load or plaid_mode}"
     )
+
     del test_dict
+
+    if hasattr(torch, "cuda"):
+        torch.cuda.synchronize()
+    gc.collect()
 
 
 def io_test_redis(buffer_size=256 * kibibyte):
@@ -197,9 +215,9 @@ def io_test_redis(buffer_size=256 * kibibyte):
 
     buf = bytearray(512 * mebibyte)
 
-    total_bytes = 0
+    total_sz = 0
 
-    start_time = time.monotonic()
+    start = time.monotonic()
 
     # Loop over redis keys, and read them into memory.
     for key in redis_client.scan_iter(f"{model_name}:*"):
@@ -223,16 +241,18 @@ def io_test_redis(buffer_size=256 * kibibyte):
             num_bytes = redis_tcp.recv_into(mv, left, socket.MSG_WAITALL)
             mv = mv[num_bytes:]
             left -= num_bytes
-            total_bytes += num_bytes
+            total_sz += num_bytes
             read_ct += 1
         redis_tcp.recv(2)
 
-    end_time = time.monotonic()
+    end = time.monotonic()
     redis_tcp.close()
-    print(
-        f"Raw read {total_bytes / gibibyte:0.2f} GiB at"
-        f" {buffer_size} bytes stream buffer size in"
-        f" {total_bytes / gibibyte / (end_time - start_time):0.2f} GiB/s"
+    logging.info(
+        f"{nodename} -- redis: "
+        f"gpu: {gpu_name} ({gpu_gb} GiB), raw read "
+        f"{total_sz / mebibyte:0.2f} MiB at "
+        f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
+        f"{buffer_size / kibibyte} KiB stream buffer size"
     )
 
 
@@ -242,8 +262,12 @@ for buffer_size_power in range(16, 21):
     for sample in range(5):
         io_test(buffer_size=buffer_size)
         io_test_redis(buffer_size=buffer_size)
-        bench_redis(buffer_size=buffer_size)
-        deserialize_test(buffer_size=buffer_size)
+        if has_gpu:
+            bench_redis(buffer_size=buffer_size, plaid_mode=True)
+        bench_redis(buffer_size=buffer_size, lazy_load=True)
+        if has_gpu:
+            deserialize_test(buffer_size=buffer_size, plaid_mode=True)
+        deserialize_test(buffer_size=buffer_size, lazy_load=True)
 
 
 exit(0)

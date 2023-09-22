@@ -1519,10 +1519,6 @@ class TensorDeserializer(collections.abc.Mapping):
             # convert to ms
             duration_ms = (end - start) * 1000
             rate = (header_size + len(data_entry)) / (end - start) / 1024 / 1024
-            print(
-                f"Redis write for {name} took {duration_ms:0.2f}ms @"
-                f" {rate:0.2f}MB/s"
-            )
 
 
 class TensorSerializer:
