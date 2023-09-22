@@ -1493,12 +1493,13 @@ class TensorDeserializer(collections.abc.Mapping):
 
         return all(result for name, result in results), results
 
-    def to_redis(self, redis_client: redis.Redis, key_prefix: str) -> None:
+    def to_redis(
+        self, redis_client: redis.Redis, key_prefix: str, force: bool = False
+    ) -> None:
         """
         Given a redis client and a key_prefix, write the tensors in this
         Tensorizer object to the redis client under the given key prefixes.
         """
-        metadata_size = 256 * 1024
         header_entry = b"|TZR|"
         header_entry += self._file_header.to_bytes()
         header_entry += self._metadata_raw
@@ -1506,19 +1507,19 @@ class TensorDeserializer(collections.abc.Mapping):
 
         for name in self._metadata:
             entry = self._metadata[name]
-            start = time.monotonic()
             offset = self._metadata[name].offset
             data_offset = self._metadata[name].data_offset
             header_size = data_offset - offset
             self._file.seek(offset)
             header_entry = self._file.read(header_size)
+            # Check if the key already exists
+            if not force and redis_client.exists(
+                f"{key_prefix}:{name}:{offset}"
+            ):
+                continue
             redis_client.set(f"{key_prefix}:{name}:{offset}", header_entry)
             data_entry = self._file.read(entry.data_length)
             redis_client.set(f"{key_prefix}:{name}:{data_offset}", data_entry)
-            end = time.monotonic()
-            # convert to ms
-            duration_ms = (end - start) * 1000
-            rate = (header_size + len(data_entry)) / (end - start) / 1024 / 1024
 
 
 class TensorSerializer:
