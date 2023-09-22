@@ -32,6 +32,18 @@ parser.add_argument(
         f" with which to test deserialization (default: {model_name_default})"
     ),
 )
+parser.add_argument(
+    "--redis",
+    type=str,
+    default="redis://localhost:6379",
+    help="Redis URI to use for testing (default: redis://localhost:6379)",
+)
+parser.add_argument(
+    "--load_redis",
+    type=bool,
+    default=True,
+    help="Whether to load the model into redis (default: True)",
+)
 args = parser.parse_args()
 
 model_name: str = args.model
@@ -41,14 +53,15 @@ http_uri = (
     f"/{model_name}/model.tensors"
 )
 
-logging.info(f"Testing {http_uri}")
+# Get nodename from environment, or default to os.uname().nodename
+nodename = os.getenv("K8S_NODE_NAME") or os.uname().nodename
+
+logging.info(f"{nodename} -- Testing {http_uri}")
 
 kibibyte = 1 << 10
 mebibyte = 1 << 20
 gibibyte = 1 << 30
 
-# Get nodename from environment, or default to os.uname().nodename
-nodename = os.getenv("K8S_NODE_NAME") or os.uname().nodename
 
 # Collect GPU data
 try:
@@ -61,8 +74,12 @@ except AssertionError:
     gpu_name = "CPU"
     has_gpu = False
 
+# Parse redis URI
+redis_uri = args.redis
+redis_host = redis_uri.split("://")[1].split(":")[0]
+redis_port = int(redis_uri.split("://")[1].split(":")[1])
 
-redis_client = redis.Redis(host="localhost", port=6379, db=0)
+redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
 
 
 def io_test(
@@ -163,7 +180,8 @@ def load_redis():
     end = time.monotonic()
     rate = test_dict.total_bytes_read / (end - start)
     logging.info(
-        f"redis: Loaded {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
+        f"{nodename} -- redis: Loaded"
+        f" {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
         f" {rate / mebibyte:0.2f} MiB/s in {end - start:0.2f}s"
     )
 
@@ -176,7 +194,8 @@ def bench_redis(
 ):
     test_dict = TensorDeserializer(
         RedisStreamFile(
-            f"redis://localhost:6379/{model_name}", buffer_size=buffer_size
+            f"redis://{redis_host}:{redis_port}/{model_name}",
+            buffer_size=buffer_size,
         ),
         lazy_load=lazy_load,
         plaid_mode=plaid_mode,
@@ -211,7 +230,7 @@ def io_test_redis(buffer_size=256 * kibibyte):
     redis_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     redis_tcp.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 0)
     redis_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_size)
-    redis_tcp.connect(("localhost", 6379))
+    redis_tcp.connect((redis_host, redis_port))
 
     buf = bytearray(512 * mebibyte)
 
@@ -256,7 +275,8 @@ def io_test_redis(buffer_size=256 * kibibyte):
     )
 
 
-load_redis()
+if args.load_redis:
+    load_redis()
 for buffer_size_power in range(16, 21):
     buffer_size = 1 << buffer_size_power
     for sample in range(5):
