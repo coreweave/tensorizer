@@ -172,6 +172,7 @@ def bench_redis(buffer_size=256 * kibibyte):
             f"redis://localhost:6379/{model_name}", buffer_size=buffer_size
         ),
         lazy_load=True,
+        plaid_mode=True,
     )
 
     all_begin = time.monotonic()
@@ -239,7 +240,10 @@ load_redis()
 for buffer_size_power in range(16, 21):
     buffer_size = 1 << buffer_size_power
     for sample in range(5):
+        io_test(buffer_size=buffer_size)
         io_test_redis(buffer_size=buffer_size)
         bench_redis(buffer_size=buffer_size)
+        deserialize_test(buffer_size=buffer_size)
+
 
 exit(0)

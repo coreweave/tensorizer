@@ -9,7 +9,7 @@ spec:
     spec:
       containers:
         - name: benchmark
-          image: ghcr.io/coreweave/tensorizer:benchmark-5dda83c
+          image: ghcr.io/coreweave/tensorizer:benchmark-ddf4b3f
           imagePullPolicy: IfNotPresent
           command: [ "/bin/bash" ]
           args: [ "-c" "redis-server && python /app/benchmark.py" ]
