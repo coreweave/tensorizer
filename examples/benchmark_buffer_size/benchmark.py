@@ -44,6 +44,18 @@ parser.add_argument(
     default=True,
     help="Whether to load the model into redis (default: True)",
 )
+parser.add_argument(
+    "--start",
+    type=int,
+    default=8,
+    help="Starting buffer size power (default: 8)",
+)
+parser.add_argument(
+    "--end",
+    type=int,
+    default=28,
+    help="Ending buffer size power (default: 28)",
+)
 args = parser.parse_args()
 
 model_name: str = args.model
@@ -277,7 +289,7 @@ def io_test_redis(buffer_size=256 * kibibyte):
 
 if args.load_redis:
     load_redis()
-for buffer_size_power in range(16, 21):
+for buffer_size_power in range(args.start, args.end):
     buffer_size = 1 << buffer_size_power
     for sample in range(5):
         io_test(buffer_size=buffer_size)
