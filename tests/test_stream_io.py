@@ -169,7 +169,7 @@ class TestRedis(unittest.TestCase):
         # Read output until ready
         output = b""
         time_limit = 5
-        while b"Ready to accept connections" not in output and not time_limit:
+        while b"Ready to accept connections" not in output and time_limit > 0:
             poll_result = select.select(
                 [self.redis.stdout], [], [], time_limit
             )[0]
