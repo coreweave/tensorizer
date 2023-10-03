@@ -23,7 +23,7 @@ import redis
 import tensorizer._version as _version
 import tensorizer._wide_pipes as _wide_pipes
 
-__all__ = ["open_stream", "CURLStreamFile"]
+__all__ = ["open_stream", "CURLStreamFile", "RedisStreamFile"]
 
 logger = logging.getLogger(__name__)
 
