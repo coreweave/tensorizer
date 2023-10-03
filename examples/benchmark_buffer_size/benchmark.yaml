@@ -7,12 +7,28 @@ spec:
   completions: 100
   template:
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: ethernet.coreweave.cloud/speed
+                operator: In
+                values:
+                   - 10G
+                   - 40G
+                   - 100G
+              - key: topology.kubernetes.io/region
+                operator: In
+                values:
+                - LGA1
       containers:
         - name: benchmark
-          image: ghcr.io/coreweave/tensorizer:benchmark-78ed8fe
+          image: ghcr.io/coreweave/tensorizer:benchmark-8e85696
           imagePullPolicy: IfNotPresent
           command: [ "/bin/bash" ]
-          args: [ "-c", "redis-server --daemonize yes & python /app/benchmark.py" ]
+          args: [ "-c", "redis-server --daemonize yes >/dev/null & python /app/benchmark.py" ]
+          #--redis redis://redis-master:6379" ]
           resources:
             requests:
               cpu: "8"
