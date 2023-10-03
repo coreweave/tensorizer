@@ -1,16 +1,22 @@
 import contextlib
 import os
 import re
+import select
+import subprocess
+import sys
 import unittest
+from subprocess import Popen
+from typing import List
 from unittest.mock import patch
 
 import boto3
 import moto
+import redis
 
 from tensorizer import stream_io
 
 # Logging of Boto3 ops in case you need it for moto confirmation.
-#boto3.set_stream_logger(name='botocore')
+# boto3.set_stream_logger(name='botocore')
 
 NEO_URL = (
     "https://raw.githubusercontent.com/EleutherAI/gpt-neo/master/README.md"
@@ -112,6 +118,99 @@ def mock_server():
         werkzeug_logger.setLevel(old_log_level)
 
 
+redisTestInstance = None
+
+
+class TestRedis(unittest.TestCase):
+    redis_uri: str
+    redis_host: str
+    redis_port: int
+    hello_str: bytes
+    world_str: bytes
+    ex_str: bytes
+    hello_k: str
+    world_k: str
+    ex_k: str
+    keys: List[str]
+    redis: Popen
+    redis_client: redis.Redis
+
+    @classmethod
+    def setUpClass(cls):
+        cls.redis_uri = "redis://localhost:6381"
+        cls.redis_host = cls.redis_uri.split("://")[1].split(":")[0]
+        cls.redis_port = int(cls.redis_uri.split("://")[1].split(":")[1])
+
+        cls.hello_str = b"Hello" * 1024 * 1024
+        cls.world_str = b"World" * 64 * 1024
+        cls.ex_str = b"!" * 1024 * 1024
+        cls.hello_k = "t:hello:0"
+        cls.world_k = f"t:world:{len(cls.hello_str)}"
+        cls.ex_k = f"t:excl:{len(cls.hello_str) + len(cls.world_str)}"
+        cls.keys = [cls.hello_k, cls.world_k, cls.ex_k]
+
+    @classmethod
+    def tearDown(self):
+        self.redis_client.delete(*self.keys)
+        self.redis_client.close()
+        self.redis.kill()
+
+    @classmethod
+    def setUp(self):
+        # Start redis server
+        self.redis = Popen(
+            [
+                "redis-server",
+                "--port",
+                str(self.redis_port),
+            ],
+            stdout=subprocess.PIPE,
+        )
+        # Read output until ready
+        output = b""
+        time_limit = 5
+        while b"Ready to accept connections" not in output and not time_limit:
+            poll_result = select.select(
+                [self.redis.stdout], [], [], time_limit
+            )[0]
+            if poll_result:
+                line = self.redis.stdout.readline()
+                output += line
+                time_limit -= 1
+            else:
+                raise Exception("Redis server did not start")
+
+        # Populate redis with data
+        self.redis_client = redis.Redis(
+            host=self.redis_host, port=self.redis_port, db=0
+        )
+        self.redis_client.set(self.hello_k, self.hello_str)
+        self.redis_client.set(self.world_k, self.world_str)
+        self.redis_client.set(self.ex_k, self.ex_str)
+
+    def test_download(self):
+        with stream_io.open_stream(
+            f"redis://{self.redis_host}:{self.redis_port}/t",
+            mode="rb",
+        ) as s:
+            self.assertEqual(s.read(1024), self.hello_str[:1024])
+            s.seek(0)
+            self.assertEqual(s.read(len(self.hello_str)), self.hello_str)
+            s.seek(len(self.hello_str) - 16)
+            self.assertEqual(s.read(16), self.hello_str[-16:])
+            s.seek(len(self.hello_str) - 16)
+            overlap = self.hello_str[-16:] + self.world_str[:1008]
+            readOverlap = s.read(1024)
+            self.assertEqual(readOverlap, overlap)
+            s.seek(0)
+            self.assertEqual(
+                s.read(
+                    len(self.hello_str) + len(self.world_str) + len(self.ex_str)
+                ),
+                self.hello_str + self.world_str + self.ex_str,
+            )
+
+
 class TestS3(unittest.TestCase):
     endpoint: str
     region: str
@@ -125,7 +224,7 @@ class TestS3(unittest.TestCase):
         # Sets up a mock S3 environment with moto.
         # Can be replaced for testing without mocks.
         cls.endpoint = "https://" + stream_io.default_s3_write_endpoint
-        cls.region = 'ord1' # must match the region for the endpoint above
+        cls.region = "ord1"  # must match the region for the endpoint above
         cls.BUCKET_NAME = "test-bucket"
         (
             cls.mock_s3,
@@ -148,7 +247,7 @@ class TestS3(unittest.TestCase):
         bucket.create(
             CreateBucketConfiguration={
                 # This must match the test endpoints name
-                'LocationConstraint': self.region,
+                "LocationConstraint": self.region,
             },
         )
 
@@ -199,21 +298,21 @@ class TestS3(unittest.TestCase):
             # http://127.0.0.1:5000/test-bucket/model.tensors?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=X%2F20230803%2Ford1%2Fs3%2Faws4_request&X-Amz-Date=20230803T204528Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=x
 
             # TODO: add test for s3_access_key_id="" => unsigned
-            self.assertRegex(url, re.escape(f'{self.BUCKET_NAME}/{key}?'))
+            self.assertRegex(url, re.escape(f"{self.BUCKET_NAME}/{key}?"))
             V4_regex = [
-                r'X-Amz-Expires=[0-9]+',
-                r'X-Amz-Credential=[A-Z]+',
+                r"X-Amz-Expires=[0-9]+",
+                r"X-Amz-Credential=[A-Z]+",
             ]
             V2_regex = [
-                r'Expires=1[0-9]+',
-                r'AWSAccessKeyId=[A-Z]+',
+                r"Expires=1[0-9]+",
+                r"AWSAccessKeyId=[A-Z]+",
             ]
 
             # This should be tweaked to say if it's meant to be v4 or v2
-            if 'X-Amz-Algorithm=' in url:
+            if "X-Amz-Algorithm=" in url:
                 regex_present = V4_regex
                 regex_absent = V2_regex
-            elif 'AWSAccessKeyId=' in url:
+            elif "AWSAccessKeyId=" in url:
                 regex_present = V2_regex
                 regex_absent = V4_regex
             else:

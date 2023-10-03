@@ -585,6 +585,7 @@ class RedisStreamFile:
             else:
                 rq_sz = len(ba)
                 mv = memoryview(ba)
+            orig_mv = mv
             left = rq_sz
             while left > 0:
                 num_bytes = self._read_from(self._curr, left, mv)
@@ -597,7 +598,7 @@ class RedisStreamFile:
                 mv = mv[num_bytes:]
             self.bytes_read += rq_sz - left
             if ba is None:
-                return mv.tobytes()
+                return orig_mv.tobytes()
             else:
                 return rq_sz - left
         except (IOError, OSError) as e:
@@ -625,6 +626,15 @@ class RedisStreamFile:
     @staticmethod
     def fileno() -> int:
         return -1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def __del__(self):
+        self.close()
 
     def seek(self, position, whence=SEEK_SET):
         if whence == SEEK_CUR:
@@ -933,7 +943,7 @@ def open_stream(
     s3_secret_access_key: Optional[str] = None,
     s3_endpoint: Optional[str] = None,
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
-) -> Union[CURLStreamFile, typing.BinaryIO]:
+) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
     Open a file path, http(s):// URL, or s3:// URI.
 
@@ -1024,6 +1034,12 @@ def open_stream(
                 'Only the mode "rb" is valid when opening http(s):// streams.'
             )
         return CURLStreamFile(path_uri)
+    elif scheme == "redis":
+        if normalized_mode != "br":
+            raise ValueError(
+                'Only the mode "rb" is valid when opening redis:// streams.'
+            )
+        return RedisStreamFile(path_uri)
 
     elif scheme == "s3":
         if normalized_mode not in ("br", "bw", "ab", "+bw", "+ab"):
