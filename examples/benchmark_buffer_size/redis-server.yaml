@@ -1,0 +1,42 @@
+# Master pod spec
+master: &sharedConfig
+  # Only use nodes from ORD1
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: topology.kubernetes.io/region
+            operator: In
+            values:
+              - ORD1
+          - key: ethernet.coreweave.cloud/speed
+            operator: In
+            values:
+              - 40G
+  # Set limits
+  resources:
+    limits:
+      cpu: "4"
+      memory: 49Gi
+  # Persistence volume claim
+  persistence:
+    storageClass: block-hdd-ord1
+
+# Replica pod spec
+replica: *sharedConfig
+
+# Disable replication for now
+# TODO: Move to Redis Sentinel
+architecture: standalone
+
+# Set redis config
+commonConfiguration: |
+  maxmemory 32768mb
+  maxmemory-policy allkeys-lru
+  appendonly no
+  save ""
+
+# Disable password auth
+auth:
+  enabled: false
