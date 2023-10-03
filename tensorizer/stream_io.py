@@ -444,7 +444,7 @@ class RedisStreamFile:
         self,
         uri: str,
         *,
-        buffer_size: int = 2 << 20,
+        buffer_size: int = 2 << 22,  # 8mb buffer on TCP socket
     ) -> None:
         host, port, prefix = _parse_redis_uri(uri)
         self._redis = redis.Redis(host=host, port=port, db=0)
