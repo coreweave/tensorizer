@@ -426,7 +426,7 @@ def _parse_redis_uri(uri):
     uri_components = urlparse(uri)
 
     if uri_components.scheme.lower() != "redis":
-        raise ValueError(f"Invalid S3 URI: {uri}")
+        raise ValueError(f"Invalid Redis URI: {uri}")
 
     host = uri_components.hostname
     port = uri_components.port
