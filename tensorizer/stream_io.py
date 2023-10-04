@@ -148,6 +148,8 @@ class CURLStreamFile:
         *,
         buffer_size: int = 2 << 20,  # 2 MiB buffer on the Python IO object
     ) -> None:
+        if buffer_size is None:
+            buffer_size = 2 << 20
         self._uri = uri
         self._error_context = []
 
@@ -482,6 +484,8 @@ class RedisStreamFile:
         *,
         buffer_size: int = _MAX_TCP_BUFFER_SIZE,
     ) -> None:
+        if buffer_size is None:
+            buffer_size = _MAX_TCP_BUFFER_SIZE
         init_begin = time.monotonic()
         host, port, prefix = _parse_redis_uri(uri)
         self._redis = redis.Redis(host=host, port=port, db=0)
@@ -833,6 +837,7 @@ def s3_download(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
+    buffer_size: Optional[int] = None,
 ) -> CURLStreamFile:
     url = _s3_download_url(
         path_uri=path_uri,
@@ -840,7 +845,7 @@ def s3_download(
         s3_secret_access_key=s3_secret_access_key,
         s3_endpoint=s3_endpoint,
     )
-    return CURLStreamFile(url)
+    return CURLStreamFile(url, buffer_size=buffer_size)
 
 
 def _infer_credentials(
@@ -989,6 +994,7 @@ def open_stream(
     s3_secret_access_key: Optional[str] = None,
     s3_endpoint: Optional[str] = None,
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
+    buffer_size: Optional[int] = None,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
     Open a file path, http(s):// URL, or s3:// URI.
@@ -1026,6 +1032,7 @@ def open_stream(
         s3_config_path: An explicit path to the `~/.s3cfg` config file
             to be parsed if full credentials are not provided.
             If None, platform-specific default paths are used.
+        buffer_size: The size of the TCP or pipe buffer to use.
 
     Returns:
         An opened file-like object representing the target resource.
@@ -1079,13 +1086,13 @@ def open_stream(
             raise ValueError(
                 'Only the mode "rb" is valid when opening http(s):// streams.'
             )
-        return CURLStreamFile(path_uri)
+        return CURLStreamFile(path_uri, buffer_size=buffer_size)
     elif scheme == "redis":
         if normalized_mode != "br":
             raise ValueError(
                 'Only the mode "rb" is valid when opening redis:// streams.'
             )
-        return RedisStreamFile(path_uri)
+        return RedisStreamFile(path_uri, buffer_size=buffer_size)
 
     elif scheme == "s3":
         if normalized_mode not in ("br", "bw", "ab", "+bw", "+ab"):
@@ -1153,7 +1160,11 @@ def open_stream(
         else:
             s3_endpoint = s3_endpoint or default_s3_read_endpoint
             curl_stream_file = s3_download(
-                path_uri, s3_access_key_id, s3_secret_access_key, s3_endpoint
+                path_uri,
+                s3_access_key_id,
+                s3_secret_access_key,
+                s3_endpoint,
+                buffer_size=buffer_size,
             )
             if error_context:
                 curl_stream_file.register_error_context(error_context)

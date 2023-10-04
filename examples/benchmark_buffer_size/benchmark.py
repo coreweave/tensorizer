@@ -9,7 +9,12 @@ import redis
 import torch
 
 from tensorizer.serialization import TensorDeserializer
-from tensorizer.stream_io import CURLStreamFile, RedisStreamFile
+from tensorizer.stream_io import (
+    CURLStreamFile,
+    RedisStreamFile,
+    default_s3_read_endpoint,
+    open_stream,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
@@ -47,8 +52,8 @@ parser.add_argument(
 parser.add_argument(
     "--start",
     type=int,
-    default=8,
-    help="Starting buffer size power (default: 8)",
+    default=18,
+    help="Starting buffer size power (default: 18)",
 )
 parser.add_argument(
     "--end",
@@ -64,6 +69,8 @@ http_uri = (
     "http://tensorized.accel-object.ord1.coreweave.com"
     f"/{model_name}/model.tensors"
 )
+
+s3_uri = f"s3://tensorized/{model_name}/model.tensors"
 
 # Get nodename from environment, or default to os.uname().nodename
 nodename = os.getenv("K8S_NODE_NAME") or os.uname().nodename
@@ -136,9 +143,14 @@ def deserialize_test(
     lazy_load=False,
     buffer_size=256 * kibibyte,
 ):
+    scheme = source.split("://")[0]
+    scheme_pad = " " * (5 - len(scheme))
+    source = open_stream(
+        source, s3_endpoint=default_s3_read_endpoint, buffer_size=buffer_size
+    )
     start = time.monotonic()
     test_dict = TensorDeserializer(
-        CURLStreamFile(source, buffer_size=buffer_size),
+        source,
         verify_hash=verify_hash,
         plaid_mode=plaid_mode,
         lazy_load=lazy_load,
@@ -156,7 +168,7 @@ def deserialize_test(
     total_sz = test_dict.total_bytes_read
 
     logging.info(
-        f"{nodename} -- curl:  "
+        f"{nodename} -- {scheme}:{scheme_pad} "
         f"gpu: {gpu_name} ({gpu_gb} GiB), loaded  "
         f" {total_sz / mebibyte:0.2f} MiB at"
         f" {total_sz / mebibyte / (end - start):0.2f} MiB/s,"
@@ -300,6 +312,7 @@ for buffer_size_power in range(args.start, args.end):
         if has_gpu:
             deserialize_test(buffer_size=buffer_size, plaid_mode=True)
         deserialize_test(buffer_size=buffer_size, lazy_load=True)
-
+        deserialize_test(source=s3_uri, buffer_size=buffer_size)
+        deserialize_test(source=s3_uri, buffer_size=buffer_size, lazy_load=True)
 
 exit(0)
