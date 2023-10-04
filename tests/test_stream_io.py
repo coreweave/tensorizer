@@ -154,6 +154,7 @@ class TestRedis(unittest.TestCase):
         cls.redis_client.delete(*cls.keys)
         cls.redis_client.close()
         cls.redis.kill()
+        cls.redis.wait()
 
     @classmethod
     def setUp(cls):
