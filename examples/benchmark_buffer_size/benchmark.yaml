@@ -15,16 +15,18 @@ spec:
               - key: ethernet.coreweave.cloud/speed
                 operator: In
                 values:
-                   - 10G
+                   #- 10G
                    - 40G
                    - 100G
               - key: topology.kubernetes.io/region
                 operator: In
                 values:
                 - LGA1
+                - LAS1
+                - ORD1
       containers:
         - name: benchmark
-          image: ghcr.io/coreweave/tensorizer:benchmark-8e85696
+          image: ghcr.io/coreweave/tensorizer:benchmark-9821ae3
           imagePullPolicy: IfNotPresent
           command: [ "/bin/bash" ]
           args: [ "-c", "redis-server --daemonize yes >/dev/null & python /app/benchmark.py" ]
