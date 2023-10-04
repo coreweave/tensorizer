@@ -69,7 +69,7 @@ http_uri = (
     "http://tensorized.accel-object.ord1.coreweave.com"
     f"/{model_name}/model.tensors"
 )
-
+https_uri = http_uri.replace("http://", "https://")
 s3_uri = f"s3://tensorized/{model_name}/model.tensors"
 
 # Get nodename from environment, or default to os.uname().nodename
@@ -126,7 +126,7 @@ def io_test(
 
     # Print the total size of the stream, and the speed at which it was read.
     logging.info(
-        f"{nodename} -- curl:  "
+        f"{nodename} -- http:  "
         f"gpu: {gpu_name} ({gpu_gb} GiB), raw read "
         f"{total_sz / mebibyte:0.2f} MiB at "
         f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
@@ -306,16 +306,23 @@ for buffer_size_power in range(args.start, args.end):
     for sample in range(5):
         io_test(buffer_size=buffer_size)
         io_test_redis(buffer_size=buffer_size)
-        if has_gpu:
-            bench_redis(buffer_size=buffer_size, plaid_mode=True)
         bench_redis(buffer_size=buffer_size, lazy_load=True)
         if has_gpu:
-            deserialize_test(buffer_size=buffer_size, plaid_mode=True)
+            bench_redis(buffer_size=buffer_size, plaid_mode=True)
         deserialize_test(buffer_size=buffer_size, lazy_load=True)
+        if has_gpu:
+            deserialize_test(buffer_size=buffer_size, plaid_mode=True)
+        deserialize_test(
+            source=https_uri, buffer_size=buffer_size, lazy_load=True
+        )
+        if has_gpu:
+            deserialize_test(
+                source=https_uri, buffer_size=buffer_size, plaid_mode=True
+            )
+        deserialize_test(source=s3_uri, buffer_size=buffer_size, lazy_load=True)
         if has_gpu:
             deserialize_test(
                 source=s3_uri, buffer_size=buffer_size, plaid_mode=True
             )
-        deserialize_test(source=s3_uri, buffer_size=buffer_size)
 
 exit(0)
