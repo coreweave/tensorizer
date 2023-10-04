@@ -444,7 +444,35 @@ else:
 
 class RedisStreamFile:
     """
-    RedisStreamFile implements a file-like object around a Redis key namespace.
+    RedisStreamFile implements a file-like object around a Redis key namespace. Each
+    'file' is broken up into multiple keys, each of which is a slice of the file. Each
+    key is named with the prefix, followed by a colon, a user-assigned name, another
+    colon, and then the byte index of the key.
+
+    For example, if the prefix is 'foo', and the user-assigned name is 'bar', then the
+    keys would be 'foo:bar:0', 'foo:bar:16'. The first key would be the first 16 bytes
+    of the file, and the remainder would be in the next key.
+
+    On initialization, it performs a prefix scan of the keys for the prefix, and then
+    sorts the keys by their byte index. This allows it to perform a seek operation
+    efficiently, as it can find the key that contains the byte index, and then read
+    from that key.
+
+    RedisStreamFile has some optimizations, such as reading the entirety of a key into
+    a buffer, and then serving subsequent reads from that buffer. It also has a buffer
+    for the remainder of a key, so that it can serve partial reads of a key.
+
+    Arguments:
+        uri: The URI of the Redis key namespace. This should be prefixed by the
+            'redis://' scheme, and include the key prefix. For example,
+            'redis://localhost:6379/foo'.
+        buffer_size: The size of the TCP buffer to use for the Redis connection.
+
+    Attributes:
+        response_latencies: A list of the time it took to get the Redis responses.
+        bytes_read: The number of bytes read from the stream.
+        bytes_skipped: The number of bytes skipped from the stream.
+        read_operations: The number of read operations performed on the stream.
     """
 
     def __init__(
@@ -475,7 +503,6 @@ class RedisStreamFile:
 
         # Get indexes.
         largest = 0
-        prev = 0
         for key in self._keys:
             size = self._redis.strlen(key)
             if size > largest:
@@ -544,6 +571,7 @@ class RedisStreamFile:
                 f" {begin_idx} {begin_idx + read_sz - 1}"
             )
 
+        begin_timer = time.monotonic()
         self._redis_tcp.send(command.encode("utf-8") + b"\r\n")
         value_sz = self._read_sz()
         tcp_read_sz = min(value_sz, read_sz)
@@ -553,6 +581,9 @@ class RedisStreamFile:
         num_bytes = self._redis_tcp.recv_into(
             ba, tcp_read_sz, socket.MSG_WAITALL
         )
+
+        end_timer = time.monotonic()
+        self.response_latencies.append(end_timer - begin_timer)
 
         # We performed a partial read of the entire key, so we need to
         # store the remainder in the buffer.
