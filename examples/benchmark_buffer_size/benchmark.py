@@ -312,7 +312,10 @@ for buffer_size_power in range(args.start, args.end):
         if has_gpu:
             deserialize_test(buffer_size=buffer_size, plaid_mode=True)
         deserialize_test(buffer_size=buffer_size, lazy_load=True)
+        if has_gpu:
+            deserialize_test(
+                source=s3_uri, buffer_size=buffer_size, plaid_mode=True
+            )
         deserialize_test(source=s3_uri, buffer_size=buffer_size)
-        deserialize_test(source=s3_uri, buffer_size=buffer_size, lazy_load=True)
 
 exit(0)
