@@ -225,6 +225,13 @@ class TestRedis(unittest.TestCase):
                     ),
                     self.hello_str + self.world_str + self.ex_str,
                 )
+            # Report on our latencies
+            setup_latency_ms = s.setup_latency * 1000
+            response_latencies = ", ".join(
+                [f"{r * 1000:0.2f}ms" for r in s.response_latencies]
+            )
+            print(f"Redis setup latency: {setup_latency_ms:0.2f}ms")
+            print(f"Redis response latencies: {response_latencies}")
 
 
 class TestS3(unittest.TestCase):

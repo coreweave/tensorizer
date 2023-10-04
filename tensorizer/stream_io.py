@@ -469,6 +469,7 @@ class RedisStreamFile:
         buffer_size: The size of the TCP buffer to use for the Redis connection.
 
     Attributes:
+        setup_latency: The time it took to setup the Redis connections and enumerate.
         response_latencies: A list of the time it took to get the Redis responses.
         bytes_read: The number of bytes read from the stream.
         bytes_skipped: The number of bytes skipped from the stream.
@@ -481,6 +482,7 @@ class RedisStreamFile:
         *,
         buffer_size: int = _MAX_TCP_BUFFER_SIZE,
     ) -> None:
+        init_begin = time.monotonic()
         host, port, prefix = _parse_redis_uri(uri)
         self._redis = redis.Redis(host=host, port=port, db=0)
         self._redis_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -517,6 +519,9 @@ class RedisStreamFile:
         self._curr_buffer_view = memoryview(self._curr_buffer)[0:0]
         self.closed = False
 
+        init_end = time.monotonic()
+
+        self.setup_latency = init_end - init_begin
         self.response_latencies = []
         self.bytes_read = 0
         self.bytes_skipped = 0
