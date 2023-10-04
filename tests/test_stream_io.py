@@ -150,19 +150,19 @@ class TestRedis(unittest.TestCase):
         cls.keys = [cls.hello_k, cls.world_k, cls.ex_k]
 
     @classmethod
-    def tearDown(self):
-        self.redis_client.delete(*self.keys)
-        self.redis_client.close()
-        self.redis.kill()
+    def tearDown(cls):
+        cls.redis_client.delete(*cls.keys)
+        cls.redis_client.close()
+        cls.redis.kill()
 
     @classmethod
-    def setUp(self):
+    def setUp(cls):
         # Start redis server
-        self.redis = Popen(
+        cls.redis = Popen(
             [
                 "redis-server",
                 "--port",
-                str(self.redis_port),
+                str(cls.redis_port),
             ],
             stdout=subprocess.PIPE,
         )
@@ -170,45 +170,58 @@ class TestRedis(unittest.TestCase):
         output = b""
         time_limit = 5
         while b"Ready to accept connections" not in output and time_limit > 0:
-            poll_result = select.select(
-                [self.redis.stdout], [], [], time_limit
-            )[0]
+            poll_result = select.select([cls.redis.stdout], [], [], time_limit)[
+                0
+            ]
             if poll_result:
-                line = self.redis.stdout.readline()
+                line = cls.redis.stdout.readline()
                 output += line
                 time_limit -= 1
             else:
                 raise Exception("Redis server did not start")
 
         # Populate redis with data
-        self.redis_client = redis.Redis(
-            host=self.redis_host, port=self.redis_port, db=0
+        cls.redis_client = redis.Redis(
+            host=cls.redis_host, port=cls.redis_port, db=0
         )
-        self.redis_client.set(self.hello_k, self.hello_str)
-        self.redis_client.set(self.world_k, self.world_str)
-        self.redis_client.set(self.ex_k, self.ex_str)
+        cls.redis_client.set(cls.hello_k, cls.hello_str)
+        cls.redis_client.set(cls.world_k, cls.world_str)
+        cls.redis_client.set(cls.ex_k, cls.ex_str)
 
     def test_download(self):
         with stream_io.open_stream(
             f"redis://{self.redis_host}:{self.redis_port}/t",
             mode="rb",
         ) as s:
-            self.assertEqual(s.read(1024), self.hello_str[:1024])
-            s.seek(0)
-            self.assertEqual(s.read(len(self.hello_str)), self.hello_str)
-            s.seek(len(self.hello_str) - 16)
-            self.assertEqual(s.read(16), self.hello_str[-16:])
-            s.seek(len(self.hello_str) - 16)
-            overlap = self.hello_str[-16:] + self.world_str[:1008]
-            readOverlap = s.read(1024)
-            self.assertEqual(readOverlap, overlap)
-            s.seek(0)
-            self.assertEqual(
-                s.read(
-                    len(self.hello_str) + len(self.world_str) + len(self.ex_str)
-                ),
-                self.hello_str + self.world_str + self.ex_str,
-            )
+            with self.subTest("test basic 1024 byte read"):
+                self.assertEqual(s.read(1024), self.hello_str[:1024])
+
+            with self.subTest("test read that spans entire key"):
+                s.seek(0)
+                self.assertEqual(s.read(len(self.hello_str)), self.hello_str)
+
+            with self.subTest("test seeking and read that begins offset"):
+                s.seek(len(self.hello_str) - 16)
+                self.assertEqual(s.read(16), self.hello_str[-16:])
+
+            with self.subTest(
+                "test seeking and read that spans two key subsets"
+            ):
+                s.seek(len(self.hello_str) - 16)
+                overlap = self.hello_str[-16:] + self.world_str[:1008]
+                readOverlap = s.read(1024)
+                self.assertEqual(readOverlap, overlap)
+
+            with self.subTest("test reading from all keys"):
+                s.seek(0)
+                self.assertEqual(
+                    s.read(
+                        len(self.hello_str)
+                        + len(self.world_str)
+                        + len(self.ex_str)
+                    ),
+                    self.hello_str + self.world_str + self.ex_str,
+                )
 
 
 class TestS3(unittest.TestCase):

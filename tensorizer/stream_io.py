@@ -435,6 +435,13 @@ def _parse_redis_uri(uri):
     return host, port, prefix
 
 
+# Detect if we're running on OSX, and if so, set max buffer size to 1 MiB.
+if sys.platform == "darwin":
+    _MAX_TCP_BUFFER_SIZE = 2 << 20  # 1 MiB if OSX
+else:
+    _MAX_TCP_BUFFER_SIZE = 2 << 22  # 8 MiB
+
+
 class RedisStreamFile:
     """
     RedisStreamFile implements a file-like object around a Redis key namespace.
@@ -444,7 +451,7 @@ class RedisStreamFile:
         self,
         uri: str,
         *,
-        buffer_size: int = 2 << 22,  # 8mb buffer on TCP socket
+        buffer_size: int = _MAX_TCP_BUFFER_SIZE,
     ) -> None:
         host, port, prefix = _parse_redis_uri(uri)
         self._redis = redis.Redis(host=host, port=port, db=0)
@@ -540,6 +547,9 @@ class RedisStreamFile:
         self._redis_tcp.send(command.encode("utf-8") + b"\r\n")
         value_sz = self._read_sz()
         tcp_read_sz = min(value_sz, read_sz)
+        if tcp_read_sz == 0:
+            self._redis_tcp_mutex.release()
+            return 0
         num_bytes = self._redis_tcp.recv_into(
             ba, tcp_read_sz, socket.MSG_WAITALL
         )
