@@ -5,6 +5,7 @@
 
 import collections.abc
 import concurrent.futures
+import contextlib
 import ctypes
 import dataclasses
 import hashlib
@@ -27,12 +28,15 @@ from typing import (
     Callable,
     ClassVar,
     Dict,
+    Generator,
+    Iterable,
     Iterator,
     List,
     Optional,
     Sequence,
     Tuple,
     Union,
+    overload,
 )
 
 import numpy
@@ -113,7 +117,7 @@ class TensorEntry:
 class _FileHeader:
     __slots__ = ("version_number", "tensor_size", "tensor_count")
     version_number_format: ClassVar[struct.Struct] = struct.Struct(
-        "<I"  # Little-endian  # Version number
+        "<I"  # Little-endian version number
     )
     format: ClassVar[struct.Struct] = struct.Struct(
         "<"
@@ -595,7 +599,9 @@ class HashMismatchError(Exception):
     pass
 
 
-class TensorDeserializer(collections.abc.Mapping):
+class TensorDeserializer(
+    collections.abc.Mapping, contextlib.AbstractContextManager
+):
     """
     Given a file-like object for read, deserialize tensors to a state_dict or
     a torch.nn.Module.
@@ -689,145 +695,201 @@ class TensorDeserializer(collections.abc.Mapping):
         # Whether to verify the hashes of the tensors when they are loaded.
         # This value is used when no verify_hash argument is passed to the
         # tensor loading methods.
-        self._verify_hash = verify_hash
+        self._cleanup = contextlib.ExitStack()
+        # If __init__ fails, there is no way to invoke cleanup functions
+        # other than __del__, so instead, enter the cleanup context
+        # pre-emptively and cancel it if __init__ is successful
+        with self._cleanup:
+            self._verify_hash = verify_hash
 
-        if isinstance(file_obj, (str, bytes, os.PathLike, int)):
-            self._file = stream_io.open_stream(file_obj, "rb")
-        else:
-            self._mode_check(file_obj)
-            self._file = file_obj
-        self.total_compressed_tensor_bytes = 0
-        self.read_bytes = 0
+            if isinstance(file_obj, (str, bytes, os.PathLike, int)):
+                self._file = stream_io.open_stream(file_obj, "rb")
+            else:
+                self._mode_check(file_obj)
+                self._file = file_obj
+            self._cleanup.callback(self._file.close)
+            self.total_compressed_tensor_bytes = 0
+            self.read_bytes = 0
 
-        # If device is None, use the current device, otherwise use the given
-        # device.
-        device = utils.get_device() if device is None else torch.device(device)
-        self._device: torch.device = device
+            # If device is None, use the current device, otherwise use the given
+            # device.
+            device = (
+                utils.get_device() if device is None else torch.device(device)
+            )
+            self._device: torch.device = device
+            is_cuda = self._device.type == "cuda"
+            if is_cuda and not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Cannot deserialize to CUDA device"
+                    " because CUDA is not available"
+                )
 
-        self._dtype: Optional[torch.dtype] = dtype
+            self._dtype: Optional[torch.dtype] = dtype
 
-        self._plaid_mode: bool = plaid_mode
+            self._plaid_mode: bool = plaid_mode
 
-        # plaid_mode implies lazy_load
-        self._lazy_load: bool = lazy_load or plaid_mode
+            # plaid_mode implies lazy_load
+            self._lazy_load: bool = lazy_load or plaid_mode
 
-        self._metadata: Dict[str, TensorEntry] = {}
+            self._metadata: Dict[str, TensorEntry] = {}
 
-        if self._plaid_mode and (
-            not torch.cuda.is_available() or self._device.type == "cpu"
-        ):
-            raise ValueError("Plaid mode requires CUDA")
+            if self._plaid_mode and not is_cuda:
+                raise ValueError("Plaid mode requires CUDA")
 
-        # Read the magic
-        magic = self._file.read(5)
-        if magic != TENSORIZER_MAGIC:
-            raise ValueError("Not a tensorizer file")
+            # Read the magic
+            magic = self._file.read(5)
+            if magic != TENSORIZER_MAGIC:
+                raise ValueError("Not a tensorizer file")
 
-        # Read the file header
-        file_header = _FileHeader.from_io(
-            self._file,
-            accepted_versions=(
-                NON_OPAQUE_TENSORIZER_VERSION,
-                TENSORIZER_VERSION,
-            ),
-        )
+            # Read the file header
+            file_header = _FileHeader.from_io(
+                self._file,
+                accepted_versions=(
+                    NON_OPAQUE_TENSORIZER_VERSION,
+                    TENSORIZER_VERSION,
+                ),
+            )
 
-        # The total size of the file.
-        # WARNING: this is not accurate. This field isn't used in the
-        # deserializer, but has been available as a public attribute,
-        # so it is kept how it was for compatibility until the next
-        # major version.
-        self.total_file_bytes = file_header.tensor_size
+            # The total size of the file.
+            # WARNING: this is not accurate. This field isn't used in the
+            # deserializer, but has been available as a public attribute,
+            # so it is kept how it was for compatibility until the next
+            # major version.
+            self.total_file_bytes = file_header.tensor_size
 
-        # Read the metadata index of tensors. This is a list of offsets into the
-        # file where the per-tensor data is stored.
-        self._metadata = _MetadataDeserializer.from_io(
-            self._file, file_header.tensor_count
-        )
-        # filter_func is a test that determines the tensor names to read.
-        # If filter_func is None, all tensors are read.
-        if filter_func is not None:
-            self._metadata = {
-                name: entry
+            # Read the metadata index of tensors.
+            # This is a list of offsets into the file where the per-tensor data
+            # is stored.
+            self._metadata = _MetadataDeserializer.from_io(
+                self._file, file_header.tensor_count
+            )
+            # filter_func is a test that determines the tensor names to read.
+            # If filter_func is None, all tensors are read.
+            if filter_func is not None:
+                self._metadata = {
+                    name: entry
+                    for name, entry in self._metadata.items()
+                    if filter_func(name)
+                }
+
+            self._prior_key: Optional[str] = None
+
+            # We calculate the total tensor bytes here so that we can use mmap,
+            # based on the total size of the tensors that we're going to read,
+            # filtered by the filter_func.
+            tensor_sizes = {
+                name: entry.data_length
                 for name, entry in self._metadata.items()
-                if filter_func(name)
             }
+            self.total_tensor_bytes = sum(tensor_sizes.values())
+            self._largest_tensor_bytes = max(tensor_sizes.values())
 
-        self._prior_key: Optional[str] = None
+            self._buffers = {}
 
-        # We calculate the total tensor bytes here so that we can use mmap,
-        # based on the total size of the tensors that we're going to read,
-        # filtered by the filter_func.
-        self.total_tensor_bytes = 0
-        self._largest_tensor_bytes = 0
-        for name, metadata in self._metadata.items():
-            self.total_tensor_bytes += metadata.data_length
-            if metadata.data_length > self._largest_tensor_bytes:
-                self._largest_tensor_bytes = metadata.data_length
-
-        # Allocate the buffer for the tensors. If we're not in lazy_load mode,
-        # we'll allocate a single buffer for all the tensors. Otherwise, we'll
-        # allocate a buffer for the largest tensor.
-        self._buffer_addr = None
-        self._is_memory_pinned = False
-        if not self._lazy_load and not self._plaid_mode:
-            start_allocate = time.time()
-
+            # Allocate the buffer for the tensors.
             # Check if our platform supports mmap.MAP_ANONYMOUS and
             # mmap.MAP_PRIVATE
             mmap_flags = 0
             mmap_flags |= getattr(mmap, "MAP_PRIVATE", 0)
             mmap_flags |= getattr(mmap, "MAP_ANONYMOUS", 0)
             mmap_args = {"flags": mmap_flags} if mmap_flags else {}
-            self._buffer = mmap.mmap(-1, self.total_tensor_bytes, **mmap_args)
+            anonymous_mmap = partial(mmap.mmap, -1, **mmap_args)
 
-            # If we're on CUDA, we register the buffer with CUDA so that
-            # it is pinned. This allows for Torch to internally use
-            # cudaMemcpyAsync.
-            if self._device.type == "cuda":
+            start_allocate = time.monotonic()
+            if self._plaid_mode:
+                # Allocate a buffer big enough to fit any tensor,
+                # and pin it later
+                self._buffer = anonymous_mmap(self._largest_tensor_bytes)
+                # All sub-buffers are some prefix of this buffer
+                with memoryview(self._buffer) as mv:
+                    for name, size in tensor_sizes.items():
+                        self._buffers[name] = mv[:size]
+            elif not self._lazy_load:
+                # Eager loading mode
+                # Allocate a single buffer for all the tensors, and pin it later
+                self._buffer = anonymous_mmap(self.total_tensor_bytes)
+                # Mark sub-buffer locations
+                with memoryview(self._buffer) as mv:
+                    sub_buffer_start = 0
+                    for name, size in tensor_sizes.items():
+                        sub_buffer_end = sub_buffer_start + size
+                        self._buffers[name] = mv[
+                            sub_buffer_start:sub_buffer_end
+                        ]
+                        sub_buffer_start = sub_buffer_end
+            else:
+                # Lazy loading mode
+                # mmap objects usually reserve memory without committing it
+                # so any of these allocation strategies could be lazy,
+                # But the other modes pin memory which forces pre-allocation.
+                # The allocation strategy used here is to reserve memory with a
+                # separate mmap for each potential tensor, which allows granular
+                # de-allocation/garbage collection and easy madvise calls
+                self._buffer = None
+                for name, size in tensor_sizes.items():
+                    self._buffers[name] = anonymous_mmap(size)
+
+            # Register cleanup callbacks for buffers and views
+            if is_cuda:
+                # Buffers shouldn't be cleaned up for CPU tensors
+                # because they will still be in use after deserialization.
+                # For CUDA tensors, it is just a staging area.
+                if hasattr(self._buffer, "close"):
+                    self._cleanup.enter_context(self._buffer)
+                for name, buffer in self._buffers.items():
+                    self._cleanup.enter_context(buffer)
+
+            # If we're on CUDA, and not performing lazy memory allocation,
+            # register the buffer with CUDA so that it is pinned.
+            # This allows for PyTorch to internally use cudaMemcpyAsync.
+            if is_cuda and (self._plaid_mode or not self._lazy_load):
                 # We need to use ctypes to get the address of the buffer
                 # because mmap.mmap doesn't expose the buffer address.
-                tb = ctypes.c_char * self.total_tensor_bytes
+                tb = ctypes.c_char * len(self._buffer)
                 ctb = tb.from_buffer(self._buffer)
-                self._buffer_addr = ctypes.addressof(ctb)
-                del ctb  # don't leave an open exported pointer into the mmap
+                buffer_addr = ctypes.addressof(ctb)
+                # Don't leave an open exported pointer into the mmap
+                del ctb
 
                 # Register the buffer with CUDA
-                cudart.cudaHostRegister(
-                    self._buffer_addr, self.total_tensor_bytes, 0
-                )
-                self._is_memory_pinned = True
-            end_allocate = time.time()
+                cudart.cudaHostRegister(buffer_addr, self.total_tensor_bytes, 0)
+                self._cleanup.callback(cudart.cudaHostUnregister, buffer_addr)
+            end_allocate = time.monotonic()
             tensor_bytes_str = utils.convert_bytes(self.total_tensor_bytes)
             logger.debug(
                 f"Allocated {tensor_bytes_str} "
                 f"for {len(self._metadata)} tensors "
                 f"in {end_allocate - start_allocate:0.4f}"
             )
-        else:
-            self._buffer = bytearray(self._largest_tensor_bytes)
 
-        # The number of bytes we've allocated so far. Tensors may be read
-        # from the file in any order, so we need to keep track of how much
-        # we've used so far so that we can index into the buffer correctly.
-        self._allocated = 0
+            # The number of bytes we've allocated so far. Tensors may be read
+            # from the file in any order, so we need to keep track of how much
+            # we've used so far so that we can index into the buffer correctly.
+            self._allocated = 0
 
-        # Our cache of tensors. This is a dict of name -> tensor. If lazy_load
-        # is True, then the tensors are not loaded until they are accessed.
-        self._cache: typing.OrderedDict[str, Union[torch.Tensor, None, bool]]
+            # Our cache of tensors. This is a dict of name -> tensor.
+            # If lazy_load is True, then the tensors are not loaded until they
+            # are accessed.
+            self._cache: typing.OrderedDict[
+                str, Union[torch.Tensor, None, bool]
+            ]
 
-        # The offset in the file where the tensor data begins.
-        self._tensors_begin = self._file.tell()
+            # The offset in the file where the tensor data begins.
+            self._tensors_begin = self._file.tell()
 
-        if not self._lazy_load:
-            # If we're not in lazy_load mode, we populate the cache with all
-            # the tensors.
-            self._cache = self._generate_state_dict()
-        else:
-            # We populate the cache with None values so that we can
-            # differentiate between tensors that have not been loaded yet
-            # and tensors that are not present in the file.
-            self._cache = OrderedDict.fromkeys(self._metadata.keys())
+            if not self._lazy_load:
+                # If we're not in lazy_load mode, we populate the cache with all
+                # the tensors.
+                self._generate_state_dict()
+            else:
+                # We populate the cache with None values so that we can
+                # differentiate between tensors that have not been loaded yet
+                # and tensors that are not present in the file.
+                self._cache = OrderedDict.fromkeys(self._metadata.keys())
+
+            # Once __init__ finishes successfully,
+            # cancel the currently entered cleanup context
+            self._cleanup = self._cleanup.pop_all()
 
     @staticmethod
     def _mode_check(file_obj: io.IOBase) -> None:
@@ -849,22 +911,11 @@ class TensorDeserializer(collections.abc.Mapping):
     def __del__(self):
         self.close()
 
+    def __exit__(self, exc_type, exc_val, traceback):
+        self.close()
+
     def close(self):
-        # Don't throw an attribute error if these aren't defined yet,
-        # e.g. if __init__ threw an error before defining both
-        buffer = getattr(self, "_buffer", None)
-        if buffer is not None:
-            if self._is_memory_pinned and self._buffer_addr:
-                cudart.cudaHostUnregister(self._buffer_addr)
-                self._is_memory_pinned = False
-            if self._device.type != "cpu" and hasattr(buffer, "close"):
-                # Don't close the mmap buffer for CPU tensors because
-                # it would free their memory out from under them.
-                # For GPU tensors we just need to wait until
-                # they are transferred out of RAM.
-                buffer.close()
-        if getattr(self, "_file", None) is not None:
-            self._file.close()
+        self._cleanup.close()
 
     @property
     def total_bytes_read(self) -> int:
@@ -886,7 +937,16 @@ class TensorDeserializer(collections.abc.Mapping):
         else:
             return None
 
-    def __getitem__(self, name) -> torch.nn.Parameter:
+    @overload
+    def __getitem__(self, name: str) -> torch.nn.Parameter:
+        ...
+
+    @overload
+    def __getitem__(self, name: Iterable[str]) -> Iterator[torch.nn.Parameter]:
+        ...
+
+    def __getitem__(self, name):
+        # if isinstance(name, str)
         if self._plaid_mode:
             # In plaid_mode, we only have one valid tensor at a time, so
             # we need to make sure that prior tensors are not accessed.
@@ -908,7 +968,7 @@ class TensorDeserializer(collections.abc.Mapping):
         if name in self._metadata:
             self._file.seek(self._metadata[name].offset)
             tensor_arr = next(self.read_tensors(num_tensors=1))[3]
-            self._cache[name] = self._to_torch_parameter(tensor_arr)
+            self._cache[name] = tensor_arr
             return self._cache[name]
         else:
             raise KeyError(f"Tensor {name} not found")
@@ -967,7 +1027,7 @@ class TensorDeserializer(collections.abc.Mapping):
     @staticmethod
     def _verify_hashes(
         name: str,
-        hashes: List[TensorHash],
+        hashes: Iterable[TensorHash],
         headers: bytes,
         mv: Union[memoryview, bytes],
     ) -> None:
@@ -1089,9 +1149,7 @@ class TensorDeserializer(collections.abc.Mapping):
                     # memory we need in a single buffer that contains
                     # all the tensors. We just need to slice out the
                     # memoryview for the current tensor.
-                    mv = memoryview(self._buffer)[
-                        self._allocated : self._allocated + header.data_length
-                    ]
+                    mv = self._buffers[header.name]
                     self._file.readinto(mv)
                     self._allocated += header.data_length
                 elif self._plaid_mode:
@@ -1101,13 +1159,17 @@ class TensorDeserializer(collections.abc.Mapping):
                     # the prior tensor. This works because we don't use
                     # the buffer contents after we yield the tensor, which
                     # is loaded straight into the GPU memory.
-                    mv = memoryview(self._buffer)
-                    self._file.readinto(mv[: header.data_length])
+                    mv = self._buffers[header.name]
+                    self._file.readinto(mv)
                 else:
                     # In lazy_load mode, we allocate a new buffer for each
                     # tensor. This is a bit slower, but it's the only way
                     # to support lazy loading.
-                    buffer = bytearray(header.data_length)
+                    # buffer = bytearray(header.data_length)
+                    # mv = memoryview(buffer)
+                    buffer = self._buffers[header.name]
+                    if len(buffer) != header.data_length:
+                        raise RuntimeError("Header data length mismatch")
                     mv = memoryview(buffer)
                     self._file.readinto(mv)
 
@@ -1310,17 +1372,20 @@ class TensorDeserializer(collections.abc.Mapping):
         if (
             self._dtype is not None
             and tensor.dtype != torch.bool
-            and torch.dtype != self._dtype
+            and tensor.dtype != self._dtype
         ):
-            tensor = tensor.to(self._dtype)
+            target_dtype = self._dtype
+        else:
+            target_dtype = None
 
         gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
         return torch.nn.Parameter(
-            tensor.to(self._device), requires_grad=gradient
+            tensor.to(device=self._device, dtype=target_dtype),
+            requires_grad=gradient,
         )
 
-    def _generate_state_dict(self) -> OrderedDict:
+    def _generate_state_dict(self) -> None:
         """
         Load the tensors in this Tensorizer object into a state_dict. This
         is used to populate the cache in non-lazy_load cases.
@@ -1328,12 +1393,279 @@ class TensorDeserializer(collections.abc.Mapping):
         if self._file.closed:
             raise IOError("IO closed, instantiate if you want to load again.")
 
-        d = OrderedDict()
-        for idx, typ, name, arr in self.read_tensors():
-            d[name] = self._to_torch_parameter(arr)
+        self._cache = OrderedDict()
+        keys = tuple(self.keys())
+        bulk_loader = self._bulk_load(keys)
+        with contextlib.closing(bulk_loader):
+            for _ in bulk_loader:
+                # Just run this for the caching side effect
+                pass
+        # for idx, typ, name, arr in self.read_tensors():
+        #     d[name] = self._to_torch_parameter(arr)
         self.total_tensor_bytes = self._file.tell()
         self._file.close()
-        return d
+
+    class _AsymmetricBarrier:
+        def __init__(self, count: int, initial: Optional[int] = None):
+            if count <= 0:
+                raise ValueError("Invalid barrier count.")
+            self._condition = threading.Condition()
+            self._initial = self._count = count
+            if initial is not None:
+                self._count = initial
+            self._cancelled = False
+
+        def _is_done(self):
+            return self._count == 0 or self._cancelled
+
+        def wait(self, timeout: float = None) -> bool:
+            """
+            Waits for the internal counter to hit zero,
+            but doesn't decrement the counter itself.
+            """
+            with self._condition:
+                self._condition.wait_for(self._is_done, timeout=timeout)
+                return not self._cancelled
+
+        def signal(self) -> None:
+            """
+            Decrements the internal counter and then returns.
+            Does not wait for the counter to reach zero.
+            """
+            with self._condition:
+                if self._count > 0:
+                    self._count -= 1
+                if self._count == 0:
+                    self._condition.notify_all()
+
+        def reset(self) -> None:
+            """Resets the internal counter."""
+            with self._condition:
+                self._count = self._initial
+                self._cancelled = False
+
+        def cancel(self) -> None:
+            with self._condition:
+                self._cancelled = True
+                self._condition.notify_all()
+
+    def _bulk_load(
+        self, keys: Iterable[str], verify_hash: Optional[bool] = None
+    ) -> Generator[torch.nn.Parameter, None, None]:
+        keys: Tuple[str, ...] = tuple(keys)
+        # Quick route for no keys
+        if not keys:
+            return
+        if verify_hash is None:
+            verify_hash = self._verify_hash
+
+        for key in keys:
+            if key not in self:
+                raise KeyError(f"Invalid key: {key}")
+
+        if self._plaid_mode:
+            in_order = 0
+            for key in self:
+                if key == keys[in_order]:
+                    in_order += 1
+                if in_order == len(keys):
+                    break
+            else:
+                raise ValueError(
+                    "Cannot load keys out of order with plaid_mode enabled"
+                )
+
+        # Quick route for a single key
+        if len(keys) == 1:
+            old_verify_hash, self._verify_hash = self._verify_hash, verify_hash
+            try:
+                item = self.get(keys[0])
+            finally:
+                self._verify_hash = old_verify_hash
+            yield item
+            return
+
+        # Main route for multiple keys
+        transfer_in_queue = queue.SimpleQueue()
+        transfer_out_queue = queue.SimpleQueue()
+        sentinel = object()
+        throttling: Optional[int] = 1 if self._plaid_mode else len(keys)
+        tasks_per_tensor = 3 if verify_hash else 1
+        asymmetric_barrier: typing.Type = TensorDeserializer._AsymmetricBarrier
+        barriers: List[asymmetric_barrier] = [
+            asymmetric_barrier(tasks_per_tensor, 0) for _ in range(throttling)
+        ]
+        barrier_cycle = itertools.cycle(barriers)
+
+        class Cancelled(Exception):
+            pass
+
+        def cancel_thread(thread: threading.Thread):
+            thread_id = ctypes.c_long(thread.ident)
+            exc = ctypes.py_object(Cancelled)
+            return (
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, exc) == 1
+            )
+
+        def transfer() -> None:
+            next_tensor, barrier = transfer_in_queue.get()
+            next_tensor: torch.Tensor
+            barrier: asymmetric_barrier
+            if next_tensor is sentinel:
+                barrier.cancel()
+                return
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                while next_tensor is not sentinel:
+                    transfer_out_queue.put(
+                        self._to_torch_parameter(next_tensor),
+                        timeout=3600,
+                    )
+                    del next_tensor
+                    barrier.signal()
+                    next_tensor, barrier = transfer_in_queue.get(timeout=3600)
+                else:
+                    barrier.cancel()
+            stream.synchronize()
+
+        def ready_buffers(
+            key_list: Iterable[str],
+        ) -> Generator[str, None, None]:
+            # This function was originally for yielding buffers on-demand.
+            # In its current state, it primes buffers using madvise before they
+            # are used, and returns their names. It is a good candidate to adapt
+            # for round-robin buffer cycling for plaid mode in the future.
+            can_madvise = (
+                self._buffers
+                and hasattr(next(iter(self._buffers.values())), "madvise")
+                and hasattr(mmap, "MADV_WILLNEED")
+            )
+            if not can_madvise:
+                # If madvise is not possible, just yield the existing buffers
+                yield from key_list
+                return
+            out_queue = collections.deque(maxlen=2)
+            # start = 0
+            # pagesize_mask = ~(mmap.PAGESIZE - 1)
+            for buf_name in key_list:
+                self._buffers[buf_name].madvise(mmap.MADV_WILLNEED)
+                # Other unused code for madvise on a contiguous mmap buffer
+                #
+                # size = self._metadata[buf_name].data_length
+                # end = start + size
+                # region_start = start & pagesize_mask
+                # region_length = end - region_start
+                # mem.madvise(mmap.MADV_WILLNEED, region_start, region_length)
+                # start = end
+                if len(out_queue) == out_queue.maxlen:
+                    yield out_queue.popleft()
+                out_queue.append(buf_name)
+            yield from out_queue
+
+        stop: bool = False
+
+        if verify_hash:
+            computation_threads = concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(keys) * 2, os.cpu_count()),
+                thread_name_prefix="TensorizerComputation",
+            )
+        else:
+            computation_threads = None
+
+        def check_hash(
+            metadata: TensorEntry,
+            data,
+            hashes: Iterable[TensorHash],
+            barrier: Optional[asymmetric_barrier],
+        ) -> None:
+            with memoryview(data).cast("B") as mv:
+                self._verify_hashes(
+                    metadata.name, hashes, metadata.raw_headers, mv
+                )
+                if barrier is not None:
+                    barrier.signal()
+
+        def check_hashes(
+            tensor_name: str, tensor: torch.Tensor, barrier: asymmetric_barrier
+        ) -> None:
+            entry: TensorEntry = self._metadata[tensor_name]
+            storage = tensor.untyped_storage()
+            data = ctypes.cast(
+                storage.data_ptr(),
+                ctypes.POINTER(ctypes.c_ubyte * storage.nbytes()),
+            ).contents
+            for h in entry.hashes:
+                checks.append(
+                    computation_threads.submit(
+                        check_hash, entry, data, (h,), barrier
+                    )
+                )
+
+        checks: List[concurrent.futures.Future] = []
+
+        def read_into_buffers() -> None:
+            buffers = ready_buffers(keys)
+            with contextlib.closing(buffers):
+                for name, barrier in zip(buffers, barrier_cycle):
+                    barrier: asymmetric_barrier
+                    if stop:
+                        break
+                    metadata: TensorEntry = self._metadata[name]
+                    self._file.seek(metadata.offset)
+                    barrier.wait()
+                    for *_, tensor in self.read_tensors(
+                        num_tensors=1, verify_hash=False
+                    ):
+                        pass
+                    if stop:
+                        break
+                    tensor: torch.Tensor
+                    barrier.reset()
+                    if computation_threads is not None:
+                        check_hashes(name, tensor, barrier)
+                    transfer_in_queue.put_nowait((tensor, barrier))
+
+        transfer_thread = threading.Thread(
+            target=transfer, name="TensorizerTransfer", daemon=True
+        )
+        read_thread = threading.Thread(target=read_into_buffers, daemon=True)
+        transfer_thread.start()
+        read_thread.start()
+
+        try:
+            for key in keys[:-1]:
+                self._cache[key] = transfer_out_queue.get(timeout=3600)
+                yield self._cache[key]
+            # Stop before yielding the final tensor
+            # to catch up on hash verification
+            read_thread.join(timeout=3600)
+            if computation_threads is not None:
+                # At this point, all checks have been added to `checks`
+                # v_hash_start = time.monotonic()
+                computation_threads.shutdown(wait=True)
+                # v_hash_end = time.monotonic()
+                # v_hash_time = v_hash_end - v_hash_start
+                # print(f"{v_hash_time:.2f} seconds spent on validation")
+                # At this point, all checks have finished
+                for check in checks:
+                    # This will raise if any of the checks failed
+                    check.result(timeout=3600)
+                checks.clear()
+            self._cache[keys[-1]] = transfer_out_queue.get(timeout=3600)
+            yield self._cache[keys[-1]]
+        finally:
+            stop = True
+            if computation_threads is not None:
+                computation_threads.shutdown(wait=False)
+            if transfer_thread.is_alive():
+                transfer_in_queue.put_nowait(sentinel)
+                cancel_thread(transfer_thread)
+                transfer_thread.join(timeout=3600)
+            if read_thread.is_alive():
+                cancel_thread(read_thread)
+                read_thread.join(timeout=3600)
+            for check in checks:
+                check.cancel()
 
     def load_into_module(
         self,
@@ -1376,37 +1708,33 @@ class TensorDeserializer(collections.abc.Mapping):
         for name, module in m.named_modules():
             modules[name] = module
 
-        tensor_ct = 0
+        keys = tuple(
+            k for k in self.keys() if filter_func is None or filter_func(k)
+        )
 
-        for name in self.keys():
-            if filter_func is not None and not filter_func(name):
-                continue
-            obj_path, attr = name.rsplit(".", 1)
-            module: torch.nn.Module = modules[obj_path]
-            entry = self._metadata[name]
+        tensor_ct = len(keys)
 
-            # Swap out self._verify_hash for our function-local
-            # verify_hash, since self.get() provides no mechanism
-            # propagate this function-local hash to its implicit loads.
-            global_verify_hash = self._verify_hash
-            try:
-                self._verify_hash = verify_hash
-                param = self._to_torch_parameter(self.get(name))
-            finally:
-                self._verify_hash = global_verify_hash
+        bulk_loader = self._bulk_load(keys, verify_hash=verify_hash)
+        with contextlib.closing(bulk_loader):
+            for name, tensor in zip(keys, bulk_loader):
+                obj_path, attr = name.rsplit(".", 1)
+                module: torch.nn.Module = modules[obj_path]
+                entry = self._metadata[name]
 
-            if entry.type is TensorType.PARAM:
-                module.register_parameter(attr, param)
-            elif entry.type is TensorType.BUFFER:
-                module.register_buffer(attr, param)
-            elif entry.type is TensorType.STATE_DICT:
-                raise NotImplementedError(
-                    "This was serialized using the write_state_dict() method,"
-                    " and cannot be loaded using the load_into_module() method."
-                    " Use the TensorDeserializer object directly as a"
-                    " state_dict mapping instead."
-                )
-            tensor_ct += 1
+                if entry.type is TensorType.PARAM:
+                    module.register_parameter(attr, tensor)
+                elif entry.type is TensorType.BUFFER:
+                    module.register_buffer(attr, tensor)
+                elif entry.type is TensorType.STATE_DICT:
+                    raise NotImplementedError(
+                        "This was serialized using"
+                        " TensorSerializer.write_state_dict(), so it cannot be"
+                        " loaded using TensorDeserializer.load_into_module()."
+                        " Use the TensorDeserializer object directly as a"
+                        " state_dict mapping instead."
+                    )
+                else:
+                    raise RuntimeError(f"Invalid tensor type: {entry.type}")
 
         self._file.close()
         return tensor_ct
@@ -1587,7 +1915,7 @@ class TensorSerializer:
         # implementations release the GIL during longer hash computations.
         self._computation_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=os.cpu_count(),
-            thread_name_prefix="TensorizerComputation-",
+            thread_name_prefix="TensorizerComputation",
         )
 
         # There is no use spawning many writer threads when they share a lock.
@@ -1597,7 +1925,7 @@ class TensorSerializer:
         # tensor data writes.
         self._writer_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_concurrent_writers,
-            thread_name_prefix="TensorizerWriter-",
+            thread_name_prefix="TensorizerWriter",
         )
 
         self._tensor_count_update_lock = threading.Lock()
@@ -1611,7 +1939,7 @@ class TensorSerializer:
         # since there is no way to yield its thread slot back to the pool.
         self._header_writer_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_concurrent_writers,
-            thread_name_prefix="TensorizerHeaderWriter-",
+            thread_name_prefix="TensorizerHeaderWriter",
         )
 
         # Implementation detail for CPython: ThreadPoolExecutor objects
@@ -2043,6 +2371,17 @@ class TensorSerializer:
             iter(lambda: transferred.get(timeout=3600), None),
             _interrupt_transfer,
         )
+
+    # class _WriteSpec(typing.NamedTuple):
+    #     idx: int
+    #     name: str
+    #     tensor_type: TensorType
+    #     tensor: torch.Tensor
+    #     callback: Optional[Callable]
+    #
+    # def _bulk_writer(self, tensors: Iterable[_WriteSpec]):
+    #     tensors = collections.deque(tensors)
+    #     size = sum(len(t.name) for t in tensors)
 
     def write_module(
         self, m: torch.nn.Module, remove_tensors: bool = False
