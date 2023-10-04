@@ -147,11 +147,10 @@ class TestRedis(unittest.TestCase):
         cls.hello_k = "t:hello:0"
         cls.world_k = f"t:world:{len(cls.hello_str)}"
         cls.ex_k = f"t:excl:{len(cls.hello_str) + len(cls.world_str)}"
-        cls.keys = [cls.hello_k, cls.world_k, cls.ex_k]
 
     @classmethod
     def tearDown(cls):
-        cls.redis_client.delete(*cls.keys)
+        cls.redis_client.flushall()
         cls.redis_client.close()
         cls.redis.kill()
         cls.redis.wait()
@@ -179,6 +178,8 @@ class TestRedis(unittest.TestCase):
                 output += line
                 time_limit -= 1
             else:
+                # Log the output in case of failure
+                print(output)
                 raise Exception("Redis server did not start")
 
         # Populate redis with data
@@ -189,7 +190,7 @@ class TestRedis(unittest.TestCase):
         cls.redis_client.set(cls.world_k, cls.world_str)
         cls.redis_client.set(cls.ex_k, cls.ex_str)
 
-    def test_download(self):
+    def test_redis_stream(self):
         with stream_io.open_stream(
             f"redis://{self.redis_host}:{self.redis_port}/t",
             mode="rb",
