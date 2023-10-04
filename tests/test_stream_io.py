@@ -152,6 +152,7 @@ class TestRedis(unittest.TestCase):
     def tearDown(cls):
         cls.redis_client.flushall()
         cls.redis_client.close()
+        cls.redis.stdout.close()
         cls.redis.kill()
         cls.redis.wait()
 
