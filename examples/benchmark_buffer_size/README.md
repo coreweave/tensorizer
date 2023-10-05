@@ -29,7 +29,7 @@ from this directory. This will start a Kubernetes Job that runs the benchmark ac
 10 pods. You can change the number of pods by changing the `parallelism` field in
 `benchmark.yaml`.
 
-To look at the benchmark results, you can run `kubectl logs -l job-name==tensorizer-benchmark-read-size`
+To look at the benchmark results, you can run `kubectl logs --tail=-1 -l job-name==tensorizer-benchmark-read-size`
 which will collect the logs from all the pods and print them out. You can also
 look at the logs for individual pods by running `kubectl logs <pod-name>`.
 
