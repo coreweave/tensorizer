@@ -4,9 +4,11 @@ import io
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import typing
 import weakref
@@ -16,11 +18,12 @@ from urllib.parse import urlparse
 
 import boto3
 import botocore
+import redis
 
 import tensorizer._version as _version
 import tensorizer._wide_pipes as _wide_pipes
 
-__all__ = ["open_stream", "CURLStreamFile"]
+__all__ = ["open_stream", "CURLStreamFile", "RedisStreamFile"]
 
 logger = logging.getLogger(__name__)
 
@@ -143,8 +146,10 @@ class CURLStreamFile:
         end: Optional[int] = None,
         headers: Dict[str, Any] = None,
         *,
-        buffer_size: int = 2 << 20,  # 2 MiB buffer on the Python IO object
+        buffer_size: Optional[int] = None,
     ) -> None:
+        if buffer_size is None:
+            buffer_size = 2 << 23  # 16mb
         self._uri = uri
         self._error_context = []
 
@@ -417,6 +422,289 @@ class CURLStreamFile:
             self.__init__(self._uri, position, None)
 
 
+def _parse_redis_uri(uri):
+    uri_components = urlparse(uri)
+
+    if uri_components.scheme.lower() != "redis":
+        raise ValueError(f"Invalid Redis URI: {uri}")
+
+    host = uri_components.hostname
+    port = uri_components.port
+    if port is None:
+        port = 6379
+    prefix = uri_components.path.lstrip("/")
+
+    return host, port, prefix
+
+
+# Detect if we're running on OSX, and if so, set max buffer size to 1 MiB.
+if sys.platform == "darwin":
+    _MAX_TCP_BUFFER_SIZE = 1 << 20  # 1 MiB if OSX
+else:
+    _MAX_TCP_BUFFER_SIZE = 8 << 20  # 8 MiB
+
+
+class RedisStreamFile:
+    """
+    RedisStreamFile implements a file-like object around a Redis key namespace. Each
+    'file' is broken up into multiple keys, each of which is a slice of the file. Each
+    key is named with the prefix, followed by a colon, a user-assigned name, another
+    colon, and then the byte index of the key.
+
+    For example, if the prefix is 'foo', and the user-assigned name is 'bar', then the
+    keys would be 'foo:bar:0', 'foo:bar:16'. The first key would be the first 16 bytes
+    of the file, and the remainder would be in the next key.
+
+    On initialization, it performs a prefix scan of the keys for the prefix, and then
+    sorts the keys by their byte index. This allows it to perform a seek operation
+    efficiently, as it can find the key that contains the byte index, and then read
+    from that key.
+
+    RedisStreamFile has some optimizations, such as reading the entirety of a key into
+    a buffer, and then serving subsequent reads from that buffer. It also has a buffer
+    for the remainder of a key, so that it can serve partial reads of a key.
+
+    Arguments:
+        uri: The URI of the Redis key namespace. This should be prefixed by the
+            'redis://' scheme, and include the key prefix. For example,
+            'redis://localhost:6379/foo'.
+        buffer_size: The size of the TCP buffer to use for the Redis connection.
+
+    Attributes:
+        setup_latency: The time it took to setup the Redis connections and enumerate.
+        response_latencies: A list of the time it took to get the Redis responses.
+        bytes_read: The number of bytes read from the stream.
+        bytes_skipped: The number of bytes skipped from the stream.
+        read_operations: The number of read operations performed on the stream.
+    """
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        buffer_size: Optional[int] = None,
+    ) -> None:
+        if buffer_size is None:
+            buffer_size = _MAX_TCP_BUFFER_SIZE
+        init_begin = time.monotonic()
+        host, port, prefix = _parse_redis_uri(uri)
+        self._redis = redis.Redis(host=host, port=port, db=0)
+        self._redis_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._redis_tcp.setsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_size
+        )
+        self._redis_tcp.connect((host, port))
+        self._redis_tcp_mutex = threading.Lock()
+
+        # Do a key scan for the prefix, and collect all the indexes from the keys.
+        self._indexes = []
+        self._sizes = []
+        keys = self._redis.scan_iter(f"{prefix}:*")
+        # Sort the keys by their index.
+        self._keys = sorted(
+            keys, key=lambda x: int(x.decode("utf-8").split(":")[-1])
+        )
+
+        # Get indexes.
+        largest = 0
+        for key in self._keys:
+            size = self._redis.strlen(key)
+            if size > largest:
+                largest = size
+            self._sizes.append(size)
+            self._indexes.append(int(key.decode("utf-8").split(":")[-1]))
+
+        self._curr = 0
+        self._curr_key = 0
+        self._curr_buffer = bytearray(largest)
+        self._curr_buffer_idx = -1
+        self._curr_buffer_view = memoryview(self._curr_buffer)[0:0]
+        self.closed = False
+
+        init_end = time.monotonic()
+
+        self.setup_latency = init_end - init_begin
+        self.response_latencies = []
+        self.bytes_read = 0
+        self.bytes_skipped = 0
+        self.read_operations = 0
+
+    def _find_key_index(self, position):
+        for i, index in enumerate(self._indexes):
+            if position < index:
+                return i - 1
+        return len(self._keys) - 1
+
+    def _read_from(
+        self,
+        position: int,
+        size: int,
+        ba: Union[bytearray, memoryview],
+        no_buffer: bool = False,
+    ) -> int:
+        self.read_operations += 1
+        curr_key = self._find_key_index(position)
+        curr_key_pos = self._indexes[curr_key]
+        curr_key_sz = self._sizes[curr_key]
+        begin_idx = position - curr_key_pos
+        position_end = position + size
+        read_sz = min(size, curr_key_sz)
+        curr_buffer_end = self._curr_buffer_idx + len(self._curr_buffer_view)
+
+        # Check if we have a partial read of the current key in the buffer.
+        # TODO: allow for reads that do not align with the key boundaries.
+        if (
+            not no_buffer
+            and len(self._curr_buffer_view) > 0
+            and self._curr_buffer_idx
+            <= position
+            < position_end
+            < curr_buffer_end
+        ):
+            num_bytes = min(read_sz, len(self._curr_buffer_view))
+            ba[:num_bytes] = self._curr_buffer_view[:num_bytes]
+            self._curr_buffer_idx += num_bytes
+            self._curr_buffer_view = self._curr_buffer_view[num_bytes:]
+            return num_bytes
+
+        with self._redis_tcp_mutex:
+            # We have an aligned read, so we can use GET.
+            if position == curr_key_pos:
+                command = f"GET {self._keys[curr_key].decode('utf-8')}"
+            else:
+                command = (
+                    f"GETRANGE {self._keys[curr_key].decode('utf-8')}"
+                    f" {begin_idx} {begin_idx + read_sz - 1}"
+                )
+
+            begin_timer = time.monotonic()
+            self._redis_tcp.send(command.encode("utf-8") + b"\r\n")
+            value_sz = self._read_sz()
+            tcp_read_sz = min(value_sz, read_sz)
+            if tcp_read_sz == 0:
+                return 0
+            num_bytes = self._redis_tcp.recv_into(
+                ba, tcp_read_sz, socket.MSG_WAITALL
+            )
+
+            end_timer = time.monotonic()
+            self.response_latencies.append(end_timer - begin_timer)
+
+            # We performed a partial read of the entire key, so we need to
+            # store the remainder in the buffer.
+            if value_sz > read_sz:
+                tcp_read_sz = value_sz - num_bytes
+                if tcp_read_sz > len(self._curr_buffer):
+                    self._curr_buffer = bytearray(tcp_read_sz)
+                self._curr_buffer_view = memoryview(self._curr_buffer)[
+                    :tcp_read_sz
+                ]
+                self._redis_tcp.recv_into(
+                    self._curr_buffer_view, tcp_read_sz, socket.MSG_WAITALL
+                )
+                self._curr_buffer_idx = position + num_bytes
+
+            # Read the trailing \r\n and discard.
+            if self._redis_tcp.recv(2) != b"\r\n":
+                raise RuntimeError("Missing key footer")
+
+        return num_bytes
+
+    def _read_sz(self) -> int:
+        # Loop until we get a \r\n
+        sz_resp = bytearray()
+        while True:
+            b = self._redis_tcp.recv(1)
+            if b == b"":
+                raise IOError("Failed to read size")
+            sz_resp += b
+            if sz_resp[-2:] == b"\r\n":
+                break
+        sz_str = sz_resp.decode("utf-8").strip()[1:]
+        if sz_str == "-1":
+            raise IOError("Key not found")
+        return int(sz_str)
+
+    def _read_until(
+        self, goal_position: int, ba: Optional[bytearray] = None
+    ) -> Union[bytes, int]:
+        if ba is None:
+            rq_sz = goal_position - self._curr
+            mv = memoryview(bytearray(rq_sz))
+        else:
+            rq_sz = len(ba)
+            mv = memoryview(ba)
+        orig_mv = mv
+        left = rq_sz
+        while left > 0:
+            num_bytes = self._read_from(self._curr, left, mv)
+            if num_bytes == 0:
+                break
+            left -= num_bytes
+            self._curr += num_bytes
+            if left == 0:
+                break
+            mv = mv[num_bytes:]
+        self.bytes_read += rq_sz - left
+        if ba is None:
+            return orig_mv.obj
+        else:
+            return rq_sz - left
+
+    def tell(self) -> int:
+        return self._curr
+
+    def readinto(self, ba: bytearray) -> int:
+        goal_position = self._curr + len(ba)
+        return self._read_until(goal_position, ba)
+
+    def read(self, size=None) -> bytes:
+        if self.closed:
+            raise IOError("RedisStreamFile closed.")
+        if size is None:
+            return self._read_until(self._indexes[-1] + self._sizes[-1])
+        goal_position = self._curr + size
+        return self._read_until(goal_position)
+
+    @staticmethod
+    def writable() -> bool:
+        return False
+
+    @staticmethod
+    def fileno() -> int:
+        return -1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+    def seek(self, position, whence=SEEK_SET):
+        if whence == SEEK_CUR:
+            position += self._curr
+        if position == self._curr:
+            return
+        if whence == SEEK_END:
+            raise ValueError("Unsupported `whence`")
+        self._curr = position
+
+    def close(self):
+        self.closed = True
+        if self._redis is not None:
+            self._redis.close()
+            self._redis = None
+        if self._redis_tcp is not None:
+            self._redis_tcp.close()
+            self._redis_tcp = None
+
+    def readline(self):
+        raise NotImplementedError("Unimplemented")
+
+
 def _ensure_https_endpoint(endpoint: str):
     scheme, *location = endpoint.split("://", maxsplit=1)
     scheme = scheme.lower() if location else None
@@ -505,7 +793,12 @@ def _s3_download_url(
     # boto3 does not permit easy modification of x-amz-date.
     # See upstream bug https://github.com/boto/botocore/issues/2230
     #
-    client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint, signature_version='s3')
+    client = _new_s3_client(
+        s3_access_key_id,
+        s3_secret_access_key,
+        s3_endpoint,
+        signature_version="s3",
+    )
 
     # Explaination with SIG_GRANULARITY=1h
     # compute an expiry that is aligned to the hour, at least 1 hour
@@ -541,6 +834,8 @@ def s3_download(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
+    buffer_size: Optional[int] = None,
+    force_http: bool = False,
 ) -> CURLStreamFile:
     url = _s3_download_url(
         path_uri=path_uri,
@@ -548,7 +843,9 @@ def s3_download(
         s3_secret_access_key=s3_secret_access_key,
         s3_endpoint=s3_endpoint,
     )
-    return CURLStreamFile(url)
+    if force_http:
+        url = url.replace("https://", "http://")
+    return CURLStreamFile(url, buffer_size=buffer_size)
 
 
 def _infer_credentials(
@@ -697,7 +994,9 @@ def open_stream(
     s3_secret_access_key: Optional[str] = None,
     s3_endpoint: Optional[str] = None,
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
-) -> Union[CURLStreamFile, typing.BinaryIO]:
+    buffer_size: Optional[int] = None,
+    force_http: bool = False,
+) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
     Open a file path, http(s):// URL, or s3:// URI.
 
@@ -734,6 +1033,10 @@ def open_stream(
         s3_config_path: An explicit path to the `~/.s3cfg` config file
             to be parsed if full credentials are not provided.
             If None, platform-specific default paths are used.
+        buffer_size: The size of the TCP or pipe buffer to use.
+        force_http: If True, force the use of HTTP instead of HTTPS for
+            S3 downloads. This will double the throughput, but at the cost
+            of security.
 
     Returns:
         An opened file-like object representing the target resource.
@@ -787,7 +1090,13 @@ def open_stream(
             raise ValueError(
                 'Only the mode "rb" is valid when opening http(s):// streams.'
             )
-        return CURLStreamFile(path_uri)
+        return CURLStreamFile(path_uri, buffer_size=buffer_size)
+    elif scheme == "redis":
+        if normalized_mode != "br":
+            raise ValueError(
+                'Only the mode "rb" is valid when opening redis:// streams.'
+            )
+        return RedisStreamFile(path_uri, buffer_size=buffer_size)
 
     elif scheme == "s3":
         if normalized_mode not in ("br", "bw", "ab", "+bw", "+ab"):
@@ -855,7 +1164,12 @@ def open_stream(
         else:
             s3_endpoint = s3_endpoint or default_s3_read_endpoint
             curl_stream_file = s3_download(
-                path_uri, s3_access_key_id, s3_secret_access_key, s3_endpoint
+                path_uri,
+                s3_access_key_id,
+                s3_secret_access_key,
+                s3_endpoint,
+                buffer_size=buffer_size,
+                force_http=force_http,
             )
             if error_context:
                 curl_stream_file.register_error_context(error_context)

@@ -19,5 +19,8 @@ jobs:
           python -m pip install -e . &&
           python -m pip install -r tests/requirements.txt
 
+      - name: Install Redis
+        run: sudo apt-get install -y redis-server
+
       - name: Run tests
         run: python -m unittest discover tests/ --verbose

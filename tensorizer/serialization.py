@@ -36,6 +36,7 @@ from typing import (
 )
 
 import numpy
+import redis
 import torch
 
 import tensorizer.stream_io as stream_io
@@ -530,15 +531,15 @@ class _MetadataDeserializer(dict):
     @classmethod
     def from_io(
         cls, reader: io.BufferedIOBase, count: int
-    ) -> "_MetadataDeserializer":
-        total_len: int = cls._total_len_segment.unpack(
-            reader.read(cls._total_len_segment.size)
-        )[0]
+    ) -> Tuple["_MetadataDeserializer", bytes]:
+        raw = reader.read(cls._total_len_segment.size)
+        total_len: int = cls._total_len_segment.unpack(raw)[0]
         if total_len == 0:
-            return cls()
+            return cls(), raw
         else:
             encoded_metadata: bytes = reader.read(total_len)
-            return cls.from_buffer(encoded_metadata, count)
+            raw += encoded_metadata
+            return cls.from_buffer(encoded_metadata, count), raw
 
     @classmethod
     def from_buffer(cls, buffer: bytes, count: int) -> "_MetadataDeserializer":
@@ -664,7 +665,7 @@ class TensorDeserializer(collections.abc.Mapping):
             deserializer = TensorDeserializer(s3, plaid_mode=True)
             deserializer.load_into_module(model)
 
-        .. _pre-serialized: https://github.com/coreweave/tensorizer/tree/main#available-pre-tensorized-models-on-the-coreweave-cloud
+        ... _pre-serialized: https://github.com/coreweave/tensorizer/tree/main#available-pre-tensorized-models-on-the-coreweave-cloud
     """
 
     def __init__(
@@ -724,7 +725,7 @@ class TensorDeserializer(collections.abc.Mapping):
             raise ValueError("Not a tensorizer file")
 
         # Read the file header
-        file_header = _FileHeader.from_io(
+        self._file_header = _FileHeader.from_io(
             self._file,
             accepted_versions=(
                 NON_OPAQUE_TENSORIZER_VERSION,
@@ -737,12 +738,12 @@ class TensorDeserializer(collections.abc.Mapping):
         # deserializer, but has been available as a public attribute,
         # so it is kept how it was for compatibility until the next
         # major version.
-        self.total_file_bytes = file_header.tensor_size
+        self.total_file_bytes = self._file_header.tensor_size
 
         # Read the metadata index of tensors. This is a list of offsets into the
         # file where the per-tensor data is stored.
-        self._metadata = _MetadataDeserializer.from_io(
-            self._file, file_header.tensor_count
+        self._metadata, self._metadata_raw = _MetadataDeserializer.from_io(
+            self._file, self._file_header.tensor_count
         )
         # filter_func is a test that determines the tensor names to read.
         # If filter_func is None, all tensors are read.
@@ -1009,7 +1010,8 @@ class TensorDeserializer(collections.abc.Mapping):
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
         num_tensors: int = -1,
         verify_hash: Optional[bool] = None,
-    ) -> Iterator[Tuple[int, int, str, _NumpyTensor]]:
+        raw: bool = False,
+    ) -> Iterator[Tuple[int, int, str, Union[_NumpyTensor, memoryview]]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
         `tensor_type`, parameter/buffer `name`, and a _NumpyTensor `tensor`.
@@ -1121,12 +1123,15 @@ class TensorDeserializer(collections.abc.Mapping):
                         mv.release()
                         raise
 
-                tensor = _NumpyTensor.from_buffer(
-                    numpy_dtype,
-                    torch_dtype,
-                    header.shape,
-                    mv,
-                )
+                if raw:
+                    tensor = mv
+                else:
+                    tensor = _NumpyTensor.from_buffer(
+                        numpy_dtype,
+                        torch_dtype,
+                        header.shape,
+                        mv,
+                    )
 
                 tensors_read += 1
 
@@ -1348,9 +1353,6 @@ class TensorDeserializer(collections.abc.Mapping):
 
         Args:
             m: The module to load the tensors into.
-            device: The device to load the tensors onto.
-            dtype: The dtype to load the tensors as. Defaults to None, which
-                means the dtype is not changed from the serialized dtype.
             filter_func: A function (tensor_name: str) -> bool that returns
                 True if a tensor should be loaded, or False if it should be
                 skipped.
@@ -1487,6 +1489,39 @@ class TensorDeserializer(collections.abc.Mapping):
             results.append((name, False))
 
         return all(result for name, result in results), results
+
+    def to_redis(
+        self, redis_client: redis.Redis, key_prefix: str, force: bool = False
+    ) -> None:
+        """
+        Given a redis client and a key_prefix, write the tensors in this
+        Tensorizer object to the redis client under the given key prefixes.
+
+        Args:
+            redis_client: A redis client to write the tensors to.
+            key_prefix: A key prefix to use for the tensors.
+            force: If True, overwrite existing keys in redis.
+        """
+        header_entry = b"|TZR|"
+        header_entry += self._file_header.to_bytes()
+        header_entry += self._metadata_raw
+        redis_client.set(f"{key_prefix}:header:0", header_entry)
+
+        for name in self._metadata:
+            entry = self._metadata[name]
+            offset = self._metadata[name].offset
+            data_offset = self._metadata[name].data_offset
+            header_size = data_offset - offset
+            self._file.seek(offset)
+            header_entry = self._file.read(header_size)
+            # Check if the key already exists
+            if not force and redis_client.exists(
+                f"{key_prefix}:{name}:{offset}"
+            ):
+                continue
+            redis_client.set(f"{key_prefix}:{name}:{offset}", header_entry)
+            data_entry = self._file.read(entry.data_length)
+            redis_client.set(f"{key_prefix}:{name}:{data_offset}", data_entry)
 
 
 class TensorSerializer:
