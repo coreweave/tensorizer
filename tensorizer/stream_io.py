@@ -615,7 +615,7 @@ class RedisStreamFile:
 
     def _read_sz(self) -> int:
         # Loop until we get a \r\n
-        sz_resp = b""
+        sz_resp = bytearray()
         while True:
             b = self._redis_tcp.recv(1)
             sz_resp += b
