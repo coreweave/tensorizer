@@ -618,6 +618,8 @@ class RedisStreamFile:
         sz_resp = bytearray()
         while True:
             b = self._redis_tcp.recv(1)
+            if b == b"":
+                raise IOError("Failed to read size")
             sz_resp += b
             if sz_resp[-2:] == b"\r\n":
                 break
