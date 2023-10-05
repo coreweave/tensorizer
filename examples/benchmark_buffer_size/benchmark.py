@@ -86,7 +86,7 @@ gibibyte = 1 << 30
 # Collect GPU data
 try:
     cudadev = torch.cuda.current_device()
-    gpu_gb = int(torch.cuda.get_device_properties(0).total_memory / gibibyte)
+    gpu_gb = torch.cuda.get_device_properties(0).total_memory // gibibyte
     gpu_name = torch.cuda.get_device_name(cudadev)
     has_gpu = True
 except AssertionError:
