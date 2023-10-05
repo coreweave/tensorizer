@@ -99,7 +99,7 @@ if sys.platform != "win32":
         pipe_buf_sz = get_max_pipe_size()
         try:
             fcntl.fcntl(fileno, F_SETPIPE_SZ, pipe_buf_sz)
-        except (PermissionError, OSError) as e:
+        except OSError as e:
             _logger.warning(
                 f"Couldn't fcntl F_SETPIPE_SZ to {pipe_buf_sz}: {e.strerror}"
             )
