@@ -654,8 +654,6 @@ class RedisStreamFile:
                 return orig_mv.tobytes()
             else:
                 return rq_sz - left
-        except (IOError, OSError) as e:
-            raise e
 
     def tell(self) -> int:
         return self._curr
