@@ -149,7 +149,7 @@ class CURLStreamFile:
         buffer_size: Optional[int] = None,
     ) -> None:
         if buffer_size is None:
-            buffer_size = 2 << 23  # 16mb
+            buffer_size = 16 << 20  # 16mb
         self._uri = uri
         self._error_context = []
 
@@ -843,8 +843,8 @@ def s3_download(
         s3_secret_access_key=s3_secret_access_key,
         s3_endpoint=s3_endpoint,
     )
-    if force_http:
-        url = url.replace("https://", "http://")
+    if force_http and url.lower().startswith("https://"):
+        url = "http://" + url[8:]
     return CURLStreamFile(url, buffer_size=buffer_size)
 
 
