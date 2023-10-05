@@ -44,8 +44,9 @@ parser.add_argument(
     help="Redis URI to use for testing (default: redis://localhost:6379)",
 )
 parser.add_argument(
-    "--load_redis",
+    "--load-redis",
     type=bool,
+    action=argparse.BooleanOptionalAction,
     default=True,
     help="Whether to load the model into redis (default: True)",
 )
