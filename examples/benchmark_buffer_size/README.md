@@ -40,7 +40,7 @@ If you want to test against an external Redis server, you can uncomment the
 Redis server in your namespace. You can install it by running `helm install
 redis-server redis-server.yaml`.
 
-If you want to test against a different model in the `tensorizer` bucket,
+If you want to test against a different model in the `tensorized` bucket,
 you can provide the `--model` flag. Please note that models larger than 2.7-3B
 require the container specs for GPUs to be increased to use a card with more
 than 8GB of memory.
