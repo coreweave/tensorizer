@@ -149,7 +149,7 @@ class CURLStreamFile:
         buffer_size: Optional[int] = None,
     ) -> None:
         if buffer_size is None:
-            buffer_size = 2 << 20
+            buffer_size = 2 << 23  # 16mb
         self._uri = uri
         self._error_context = []
 
