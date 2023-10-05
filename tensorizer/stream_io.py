@@ -607,7 +607,8 @@ class RedisStreamFile:
             self._curr_buffer_idx = position + num_bytes
 
         # Read the trailing \r\n and discard.
-        self._redis_tcp.recv(2)
+        if self._redis_tcp.recv(2) != b"\r\n":
+            raise RuntimeError("Missing key footer")
 
         self._redis_tcp_mutex.release()
         return num_bytes
