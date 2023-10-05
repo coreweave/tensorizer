@@ -188,7 +188,7 @@ def deserialize_test(
 def test_read_performance():
     # Test the speed of reading from a stream,
     # with different buffer sizes ranging from 128 KiB to 256 MiB.
-    for buffer_size_power in range(17, 28):
+    for buffer_size_power in range(args.start, args.end):
         buffer_size = 1 << buffer_size_power
         for sample in range(10):
             io_test(read_size=32 * kibibyte, buffer_size=buffer_size)
