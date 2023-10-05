@@ -44,11 +44,10 @@ parser.add_argument(
     help="Redis URI to use for testing (default: redis://localhost:6379)",
 )
 parser.add_argument(
-    "--load-redis",
-    type=bool,
-    action=argparse.BooleanOptionalAction,
-    default=True,
-    help="Whether to load the model into redis (default: True)",
+    "--no-load-redis",
+    action="store_true",
+    default=False,
+    help="Don't load the model into redis",
 )
 parser.add_argument(
     "--start",
@@ -301,7 +300,7 @@ def io_test_redis(buffer_size=256 * kibibyte):
     )
 
 
-if args.load_redis:
+if not args.no_load_redis:
     load_redis()
 for buffer_size_power in range(args.start, args.end):
     buffer_size = 1 << buffer_size_power
