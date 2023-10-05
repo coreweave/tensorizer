@@ -326,4 +326,3 @@ for buffer_size_power in range(args.start, args.end):
                 source=s3_uri, buffer_size=buffer_size, plaid_mode=True
             )
 
-exit(0)
