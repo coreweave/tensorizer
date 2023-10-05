@@ -146,7 +146,7 @@ class CURLStreamFile:
         end: Optional[int] = None,
         headers: Dict[str, Any] = None,
         *,
-        buffer_size: Optional[int],
+        buffer_size: Optional[int] = None,
     ) -> None:
         if buffer_size is None:
             buffer_size = 2 << 20
@@ -482,7 +482,7 @@ class RedisStreamFile:
         self,
         uri: str,
         *,
-        buffer_size: Optional[int],
+        buffer_size: Optional[int] = None,
     ) -> None:
         if buffer_size is None:
             buffer_size = _MAX_TCP_BUFFER_SIZE
