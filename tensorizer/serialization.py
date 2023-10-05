@@ -531,7 +531,7 @@ class _MetadataDeserializer(dict):
     @classmethod
     def from_io(
         cls, reader: io.BufferedIOBase, count: int
-    ) -> ("_MetadataDeserializer", bytes):
+    ) -> Tuple["_MetadataDeserializer", bytes]:
         raw = reader.read(cls._total_len_segment.size)
         total_len: int = cls._total_len_segment.unpack(raw)[0]
         if total_len == 0:
