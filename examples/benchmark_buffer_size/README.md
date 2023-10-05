@@ -20,12 +20,12 @@ Python buffer size to the `curl` external process.
 
 By default, the `redis` tests are targeted to `localhost` on port `6379`. The
 pod definition automatically starts a Redis server on the same pod. We load the
-model into the Redis server from the `tensorizer` S3 bucket.
+model into the Redis server from the `tensorized` S3 bucket.
 
 Running the Benchmark
 ---------------------
 You should be able to run the benchmark by invoking `kubectl apply -f benchmark.yaml`
-from this directory. This will start a Kubernetes Job that runs the benchmakr across
+from this directory. This will start a Kubernetes Job that runs the benchmark across
 10 pods. You can change the number of pods by changing the `parallelism` field in
 `benchmark.yaml`.
 
