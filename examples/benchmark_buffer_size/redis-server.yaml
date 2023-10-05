@@ -19,7 +19,7 @@ master: &sharedConfig
     limits:
       cpu: "4"
       memory: 49Gi
-  # Persistence volume claim
+  # Persistent volume claim
   persistence:
     storageClass: block-hdd-ord1
 
