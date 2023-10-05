@@ -118,7 +118,41 @@ def mock_server():
         werkzeug_logger.setLevel(old_log_level)
 
 
-redisTestInstance = None
+def start_redis(port=6381) -> (Popen, redis.Redis):
+    # Start redis server
+    redis_process = Popen(
+        [
+            "redis-server",
+            "--port",
+            str(port),
+        ],
+        stdout=subprocess.PIPE,
+    )
+    # Read output until ready
+    output = b""
+    time_limit = 5
+    while b"Ready to accept connections" not in output and time_limit > 0:
+        poll_result = select.select([redis_process.stdout], [], [], time_limit)[
+            0
+        ]
+        if poll_result:
+            line = redis_process.stdout.readline()
+            output += line
+            time_limit -= 1
+        else:
+            # Log the output in case of failure
+            print(output)
+            raise Exception("Redis server did not start")
+    redis_client = redis.Redis(host="localhost", port=port, db=0)
+    return redis_process, redis_client
+
+
+def teardown_redis(redis_process: Popen, redis_client: redis.Redis):
+    redis_client.flushall()
+    redis_client.close()
+    redis_process.stdout.close()
+    redis_process.kill()
+    redis_process.wait()
 
 
 class TestRedis(unittest.TestCase):
@@ -150,43 +184,14 @@ class TestRedis(unittest.TestCase):
 
     @classmethod
     def tearDown(cls):
-        cls.redis_client.flushall()
-        cls.redis_client.close()
-        cls.redis.stdout.close()
-        cls.redis.kill()
-        cls.redis.wait()
+        teardown_redis(cls.redis, cls.redis_client)
 
     @classmethod
     def setUp(cls):
         # Start redis server
-        cls.redis = Popen(
-            [
-                "redis-server",
-                "--port",
-                str(cls.redis_port),
-            ],
-            stdout=subprocess.PIPE,
-        )
-        # Read output until ready
-        output = b""
-        time_limit = 5
-        while b"Ready to accept connections" not in output and time_limit > 0:
-            poll_result = select.select([cls.redis.stdout], [], [], time_limit)[
-                0
-            ]
-            if poll_result:
-                line = cls.redis.stdout.readline()
-                output += line
-                time_limit -= 1
-            else:
-                # Log the output in case of failure
-                print(output)
-                raise Exception("Redis server did not start")
+        cls.redis, cls.redis_client = start_redis(cls.redis_port)
 
         # Populate redis with data
-        cls.redis_client = redis.Redis(
-            host=cls.redis_host, port=cls.redis_port, db=0
-        )
         cls.redis_client.set(cls.hello_k, cls.hello_str)
         cls.redis_client.set(cls.world_k, cls.world_str)
         cls.redis_client.set(cls.ex_k, cls.ex_str)

@@ -567,48 +567,47 @@ class RedisStreamFile:
             self._curr_buffer_view = self._curr_buffer_view[num_bytes:]
             return num_bytes
 
-        self._redis_tcp_mutex.acquire(True)
+        with self._redis_tcp_mutex:
+            # We have an aligned read, so we can use GET.
+            if position == curr_key_pos:
+                command = f"GET {self._keys[curr_key].decode('utf-8')}"
+            else:
+                command = (
+                    f"GETRANGE {self._keys[curr_key].decode('utf-8')}"
+                    f" {begin_idx} {begin_idx + read_sz - 1}"
+                )
 
-        # We have an aligned read, so we can use GET.
-        if position == curr_key_pos:
-            command = f"GET {self._keys[curr_key].decode('utf-8')}"
-        else:
-            command = (
-                f"GETRANGE {self._keys[curr_key].decode('utf-8')}"
-                f" {begin_idx} {begin_idx + read_sz - 1}"
+            begin_timer = time.monotonic()
+            self._redis_tcp.send(command.encode("utf-8") + b"\r\n")
+            value_sz = self._read_sz()
+            tcp_read_sz = min(value_sz, read_sz)
+            if tcp_read_sz == 0:
+                return 0
+            num_bytes = self._redis_tcp.recv_into(
+                ba, tcp_read_sz, socket.MSG_WAITALL
             )
 
-        begin_timer = time.monotonic()
-        self._redis_tcp.send(command.encode("utf-8") + b"\r\n")
-        value_sz = self._read_sz()
-        tcp_read_sz = min(value_sz, read_sz)
-        if tcp_read_sz == 0:
-            self._redis_tcp_mutex.release()
-            return 0
-        num_bytes = self._redis_tcp.recv_into(
-            ba, tcp_read_sz, socket.MSG_WAITALL
-        )
+            end_timer = time.monotonic()
+            self.response_latencies.append(end_timer - begin_timer)
 
-        end_timer = time.monotonic()
-        self.response_latencies.append(end_timer - begin_timer)
+            # We performed a partial read of the entire key, so we need to
+            # store the remainder in the buffer.
+            if value_sz > read_sz:
+                tcp_read_sz = value_sz - num_bytes
+                if tcp_read_sz > len(self._curr_buffer):
+                    self._curr_buffer = bytearray(tcp_read_sz)
+                self._curr_buffer_view = memoryview(self._curr_buffer)[
+                    :tcp_read_sz
+                ]
+                self._redis_tcp.recv_into(
+                    self._curr_buffer_view, tcp_read_sz, socket.MSG_WAITALL
+                )
+                self._curr_buffer_idx = position + num_bytes
 
-        # We performed a partial read of the entire key, so we need to
-        # store the remainder in the buffer.
-        if value_sz > read_sz:
-            tcp_read_sz = value_sz - num_bytes
-            if tcp_read_sz > len(self._curr_buffer):
-                self._curr_buffer = bytearray(tcp_read_sz)
-            self._curr_buffer_view = memoryview(self._curr_buffer)[:tcp_read_sz]
-            self._redis_tcp.recv_into(
-                self._curr_buffer_view, tcp_read_sz, socket.MSG_WAITALL
-            )
-            self._curr_buffer_idx = position + num_bytes
+            # Read the trailing \r\n and discard.
+            if self._redis_tcp.recv(2) != b"\r\n":
+                raise RuntimeError("Missing key footer")
 
-        # Read the trailing \r\n and discard.
-        if self._redis_tcp.recv(2) != b"\r\n":
-            raise RuntimeError("Missing key footer")
-
-        self._redis_tcp_mutex.release()
         return num_bytes
 
     def _read_sz(self) -> int:
@@ -629,29 +628,28 @@ class RedisStreamFile:
     def _read_until(
         self, goal_position: int, ba: Optional[bytearray] = None
     ) -> Union[bytes, int]:
-        try:
-            if ba is None:
-                rq_sz = goal_position - self._curr
-                mv = memoryview(bytearray(rq_sz))
-            else:
-                rq_sz = len(ba)
-                mv = memoryview(ba)
-            orig_mv = mv
-            left = rq_sz
-            while left > 0:
-                num_bytes = self._read_from(self._curr, left, mv)
-                if num_bytes == 0:
-                    break
-                left -= num_bytes
-                self._curr += num_bytes
-                if left == 0:
-                    break
-                mv = mv[num_bytes:]
-            self.bytes_read += rq_sz - left
-            if ba is None:
-                return orig_mv.tobytes()
-            else:
-                return rq_sz - left
+        if ba is None:
+            rq_sz = goal_position - self._curr
+            mv = memoryview(bytearray(rq_sz))
+        else:
+            rq_sz = len(ba)
+            mv = memoryview(ba)
+        orig_mv = mv
+        left = rq_sz
+        while left > 0:
+            num_bytes = self._read_from(self._curr, left, mv)
+            if num_bytes == 0:
+                break
+            left -= num_bytes
+            self._curr += num_bytes
+            if left == 0:
+                break
+            mv = mv[num_bytes:]
+        self.bytes_read += rq_sz - left
+        if ba is None:
+            return orig_mv.obj
+        else:
+            return rq_sz - left
 
     def tell(self) -> int:
         return self._curr

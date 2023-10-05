@@ -228,8 +228,9 @@ def bench_redis(
     )
 
     start = time.monotonic()
-    for name in test_dict:
-        test_dict[name]
+    if lazy_load or plaid_mode:
+        for name in test_dict:
+            test_dict[name]
     end = time.monotonic()
     total_sz = test_dict.total_bytes_read
 
@@ -325,4 +326,3 @@ for buffer_size_power in range(args.start, args.end):
             deserialize_test(
                 source=s3_uri, buffer_size=buffer_size, plaid_mode=True
             )
-

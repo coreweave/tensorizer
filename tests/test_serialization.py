@@ -28,7 +28,7 @@ from tensorizer import (
     utils,
 )
 from tensorizer.serialization import TensorHash, TensorType
-from test_stream_io import TestRedis
+from test_stream_io import start_redis, teardown_redis
 
 model_name = "EleutherAI/gpt-neo-125M"
 num_hellos = 400
@@ -339,45 +339,44 @@ class TestDeserialization(unittest.TestCase):
         deserialized.close()
 
     def test_redis(self):
-        test_redis = TestRedis()
-        test_redis.setUpClass()
-        test_redis.setUp()
-        redis_model_path = (
-            f"redis://{test_redis.redis_host}:{test_redis.redis_port}"
-            f"/{model_name}"
-        )
+        redis_server, redis_client = start_redis(port=6380)
+        try:
+            redis_model_path = f"redis://localhost:6380/{model_name}"
 
-        deserialized_s3 = TensorDeserializer(
-            f"s3://tensorized/{model_name}/model.tensors",
-            device=default_device,
-        )
-        deserialized_s3.to_redis(test_redis.redis_client, model_name)
-        deserialized_s3.close()
-
-        with self.subTest(msg="Testing redis deserialization in eager mode"):
-            deserialized_redis = TensorDeserializer(
-                redis_model_path,
-                device=default_device,
-            )
-            check_deserialized(self, deserialized_redis, model_name)
-            check_inference(
-                self, deserialized_redis, model_name, default_device
-            )
-            deserialized_redis.close()
-
-        with self.subTest(msg="Testing redis deserialization in lazy mode"):
-            deserialized_redis = TensorDeserializer(
-                redis_model_path,
+            deserialized_s3 = TensorDeserializer(
+                f"s3://tensorized/{model_name}/model.tensors",
                 device=default_device,
                 lazy_load=True,
             )
-            check_deserialized(self, deserialized_redis, model_name)
-            check_inference(
-                self, deserialized_redis, model_name, default_device
-            )
-            deserialized_redis.close()
+            deserialized_s3.to_redis(redis_client, model_name)
+            deserialized_s3.close()
 
-        test_redis.tearDown()
+            with self.subTest(
+                msg="Testing redis deserialization in eager mode"
+            ):
+                deserialized_redis = TensorDeserializer(
+                    redis_model_path,
+                    device=default_device,
+                )
+                check_deserialized(self, deserialized_redis, model_name)
+                check_inference(
+                    self, deserialized_redis, model_name, default_device
+                )
+                deserialized_redis.close()
+
+            with self.subTest(msg="Testing redis deserialization in lazy mode"):
+                deserialized_redis = TensorDeserializer(
+                    redis_model_path,
+                    device=default_device,
+                    lazy_load=True,
+                )
+                check_deserialized(self, deserialized_redis, model_name)
+                check_inference(
+                    self, deserialized_redis, model_name, default_device
+                )
+                deserialized_redis.close()
+        finally:
+            teardown_redis(redis_server, redis_client)
 
     def test_filter_func(self):
         # These two filters should produce identical results

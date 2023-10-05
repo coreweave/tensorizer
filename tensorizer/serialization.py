@@ -1499,6 +1499,11 @@ class TensorDeserializer(collections.abc.Mapping):
         """
         Given a redis client and a key_prefix, write the tensors in this
         Tensorizer object to the redis client under the given key prefixes.
+
+        Args:
+            redis_client: A redis client to write the tensors to.
+            key_prefix: A key prefix to use for the tensors.
+            force: If True, overwrite existing keys in redis.
         """
         header_entry = b"|TZR|"
         header_entry += self._file_header.to_bytes()
