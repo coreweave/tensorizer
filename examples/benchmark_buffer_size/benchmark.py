@@ -180,7 +180,7 @@ def deserialize_test(
 
     test_dict.close()
     del test_dict
-    if hasattr(torch, "cuda"):
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
     gc.collect()
 
