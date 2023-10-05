@@ -497,15 +497,13 @@ class RedisStreamFile:
         self._redis_tcp_mutex = threading.Lock()
 
         # Do a key scan for the prefix, and collect all the indexes from the keys.
-        self._keys = []
         self._indexes = []
         self._sizes = []
         keys = self._redis.scan_iter(f"{prefix}:*")
         # Sort the keys by their index.
-        for key in sorted(
+        self._keys = sorted(
             keys, key=lambda x: int(x.decode("utf-8").split(":")[-1])
-        ):
-            self._keys.append(key)
+        )
 
         # Get indexes.
         largest = 0
