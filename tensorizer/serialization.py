@@ -665,7 +665,7 @@ class TensorDeserializer(collections.abc.Mapping):
             deserializer = TensorDeserializer(s3, plaid_mode=True)
             deserializer.load_into_module(model)
 
-        .. _pre-serialized: https://github.com/coreweave/tensorizer/tree/main#available-pre-tensorized-models-on-the-coreweave-cloud
+        ... _pre-serialized: https://github.com/coreweave/tensorizer/tree/main#available-pre-tensorized-models-on-the-coreweave-cloud
     """
 
     def __init__(
@@ -1353,9 +1353,6 @@ class TensorDeserializer(collections.abc.Mapping):
 
         Args:
             m: The module to load the tensors into.
-            device: The device to load the tensors onto.
-            dtype: The dtype to load the tensors as. Defaults to None, which
-                means the dtype is not changed from the serialized dtype.
             filter_func: A function (tensor_name: str) -> bool that returns
                 True if a tensor should be loaded, or False if it should be
                 skipped.
