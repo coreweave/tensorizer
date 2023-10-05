@@ -141,12 +141,18 @@ def deserialize_test(
     plaid_mode=False,
     verify_hash=False,
     lazy_load=False,
+    force_http=False,
     buffer_size=256 * kibibyte,
 ):
     scheme = source.split("://")[0]
+    if scheme == "s3" and not force_http:
+        scheme = "s3s"
     scheme_pad = " " * (5 - len(scheme))
     source = open_stream(
-        source, s3_endpoint=default_s3_read_endpoint, buffer_size=buffer_size
+        source,
+        s3_endpoint=default_s3_read_endpoint,
+        buffer_size=buffer_size,
+        force_http=force_http,
     )
     start = time.monotonic()
     test_dict = TensorDeserializer(
@@ -324,4 +330,17 @@ for buffer_size_power in range(args.start, args.end):
         if has_gpu:
             deserialize_test(
                 source=s3_uri, buffer_size=buffer_size, plaid_mode=True
+            )
+        deserialize_test(
+            source=s3_uri,
+            buffer_size=buffer_size,
+            lazy_load=True,
+            force_http=True,
+        )
+        if has_gpu:
+            deserialize_test(
+                source=s3_uri,
+                buffer_size=buffer_size,
+                plaid_mode=True,
+                force_http=True,
             )

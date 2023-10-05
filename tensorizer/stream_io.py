@@ -835,6 +835,7 @@ def s3_download(
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
     buffer_size: Optional[int] = None,
+    force_http: bool = False,
 ) -> CURLStreamFile:
     url = _s3_download_url(
         path_uri=path_uri,
@@ -842,6 +843,8 @@ def s3_download(
         s3_secret_access_key=s3_secret_access_key,
         s3_endpoint=s3_endpoint,
     )
+    if force_http:
+        url = url.replace("https://", "http://")
     return CURLStreamFile(url, buffer_size=buffer_size)
 
 
@@ -992,6 +995,7 @@ def open_stream(
     s3_endpoint: Optional[str] = None,
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
+    force_http: bool = False,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
     Open a file path, http(s):// URL, or s3:// URI.
@@ -1030,6 +1034,9 @@ def open_stream(
             to be parsed if full credentials are not provided.
             If None, platform-specific default paths are used.
         buffer_size: The size of the TCP or pipe buffer to use.
+        force_http: If True, force the use of HTTP instead of HTTPS for
+            S3 downloads. This will double the throughput, but at the cost
+            of security.
 
     Returns:
         An opened file-like object representing the target resource.
@@ -1162,6 +1169,7 @@ def open_stream(
                 s3_secret_access_key,
                 s3_endpoint,
                 buffer_size=buffer_size,
+                force_http=force_http,
             )
             if error_context:
                 curl_stream_file.register_error_context(error_context)
