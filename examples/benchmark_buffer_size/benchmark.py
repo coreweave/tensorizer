@@ -267,7 +267,7 @@ def io_test_redis(buffer_size=256 * kibibyte):
     for key in redis_client.scan_iter(f"{model_name}:*"):
         redis_tcp.send(f"GET {key.decode('utf-8')}\r\n".encode("utf-8"))
         # Loop over tcp bytes until we get a \r\n
-        sz_resp = b""
+        sz_resp = bytearray()
         while True:
             b = redis_tcp.recv(1)
             sz_resp += b
