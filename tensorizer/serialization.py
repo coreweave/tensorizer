@@ -36,7 +36,6 @@ from typing import (
     Sequence,
     Tuple,
     Union,
-    overload,
 )
 
 import numpy
@@ -728,8 +727,7 @@ class TensorDeserializer(
 
             self._plaid_mode: bool = plaid_mode
 
-            # plaid_mode implies lazy_load
-            self._lazy_load: bool = lazy_load or plaid_mode
+            self._lazy_load: bool = lazy_load
 
             self._metadata: Dict[str, TensorEntry] = {}
 
@@ -807,6 +805,8 @@ class TensorDeserializer(
                 # Allocate a buffer big enough to fit any tensor,
                 # and pin it later
                 self._buffer = anonymous_mmap(sum(largest_tensor_bytes))
+                # Track which buffers overlap for later concurrent access
+                self._buffer_ids = {}
                 # Sub-buffers alternate between which segment they use
                 with memoryview(self._buffer) as mv:
                     starts = (
@@ -818,6 +818,7 @@ class TensorDeserializer(
                     ):
                         end = start + size
                         self._buffers[name] = mv[start:end]
+                        self._buffer_ids[name] = start
             elif not self._lazy_load:
                 # Eager loading mode
                 # Allocate a single buffer for all the tensors, and pin it later
@@ -902,8 +903,12 @@ class TensorDeserializer(
                 self._cache = OrderedDict.fromkeys(self._metadata.keys())
 
             # Once __init__ finishes successfully,
-            # cancel the currently entered cleanup context
-            self._cleanup = self._cleanup.pop_all()
+            # cancel the currently entered cleanup context — except when eagerly
+            # loading to the GPU, because after eager loading finishes and data
+            # has been moved from the CPU to the GPU, there is no need to keep
+            # around the CPU buffers anymore, and we can clean up early.
+            if self._lazy_load or not is_cuda:
+                self._cleanup = self._cleanup.pop_all()
 
     @staticmethod
     def _mode_check(file_obj: io.IOBase) -> None:
@@ -951,27 +956,7 @@ class TensorDeserializer(
         else:
             return None
 
-    @overload
-    def __getitem__(self, name: str) -> torch.nn.Parameter:
-        ...
-
-    @overload
-    def __getitem__(self, name: Iterable[str]) -> Iterator[torch.nn.Parameter]:
-        ...
-
     def __getitem__(self, name):
-        # if isinstance(name, str)
-        if self._plaid_mode:
-            # In plaid_mode, we only have one valid tensor at a time, so
-            # we need to make sure that prior tensors are not accessed.
-            if self._prior_key is not None and self._prior_key != name:
-                self._cache[self._prior_key] = False
-            if self._cache[name] is False:
-                raise RuntimeError(
-                    f"Tensor {name} already overwritten in plaid_mode"
-                )
-            self._prior_key = name
-
         if name in self._cache and self._cache[name] is not None:
             return self._cache[name]
 
@@ -981,7 +966,7 @@ class TensorDeserializer(
         # forward in a stream works well even for HTTP/HTTPS streams.
         if name in self._metadata:
             self._file.seek(self._metadata[name].offset)
-            tensor_arr = next(self.read_tensors(num_tensors=1))[3]
+            tensor_arr = tuple(self.read_tensors(num_tensors=1))[0][3]
             self._cache[name] = tensor_arr
             return self._cache[name]
         else:
@@ -1419,10 +1404,10 @@ class TensorDeserializer(
         self.total_tensor_bytes = self._file.tell()
         self._file.close()
 
-    class _AsymmetricBarrier:
+    class _AtomicCountdown:
         def __init__(self, count: int, initial: Optional[int] = None):
             if count <= 0:
-                raise ValueError("Invalid barrier count.")
+                raise ValueError("Invalid count.")
             self._condition = threading.Condition()
             self._initial = self._count = count
             if initial is not None:
@@ -1441,7 +1426,7 @@ class TensorDeserializer(
                 self._condition.wait_for(self._is_done, timeout=timeout)
                 return not self._cancelled
 
-        def signal(self) -> None:
+        def trigger(self) -> None:
             """
             Decrements the internal counter and then returns.
             Does not wait for the counter to reach zero.
@@ -1477,17 +1462,11 @@ class TensorDeserializer(
             if key not in self:
                 raise KeyError(f"Invalid key: {key}")
 
-        if self._plaid_mode:
-            in_order = 0
-            for key in self:
-                if key == keys[in_order]:
-                    in_order += 1
-                if in_order == len(keys):
-                    break
-            else:
-                raise ValueError(
-                    "Cannot load keys out of order with plaid_mode enabled"
-                )
+        # Quick route for all cached keys
+        # A later revision should more efficiently handle when some keys
+        # are cached, but not all of them
+        if all(self._cache.get(key) is not None for key in keys):
+            yield from map(self._cache.get, keys)
 
         # Quick route for a single key
         if len(keys) == 1:
@@ -1503,23 +1482,34 @@ class TensorDeserializer(
         transfer_in_queue = queue.SimpleQueue()
         transfer_out_queue = queue.SimpleQueue()
         sentinel = object()
-        throttling: Optional[int] = (
-            self._plaid_mode_buffer_count if self._plaid_mode else None
-        )
+
         num_hash_tasks = 2
         tasks_per_tensor = 1
         if verify_hash:
             tasks_per_tensor += num_hash_tasks
-        asymmetric_barrier: typing.Type = TensorDeserializer._AsymmetricBarrier
-        barriers: List[Optional[asymmetric_barrier]]
-        if throttling:
-            barriers = [
-                asymmetric_barrier(tasks_per_tensor, 0)
-                for _ in range(throttling)
-            ]
+
+        atomic_countdown: typing.Type = TensorDeserializer._AtomicCountdown
+        if self._plaid_mode:
+            buffer_ids = {k: self._buffer_ids[k] for k in keys}
+            # Throttling is based on the number of distinct buffers involved
+            # based on the set of keys being requested. In a future revision,
+            # the buffers should be chosen within this function, so they can
+            # always be placed for maximal efficiency.
+            # Round-robin scheduling doesn't exactly work here because the order
+            # of the list of keys being requested doesn't have to correspond to
+            # the order that the buffers were originally assigned. Instead,
+            # atomic countdowns need to stick with whichever buffer is
+            # associated with each key being loaded.
+            # Arbitrarily associate buffer IDs with countdowns
+            distinct_buffer_ids = set(buffer_ids.values())
+            countdowns = {
+                buffer_id: atomic_countdown(tasks_per_tensor, 0)
+                for buffer_id in distinct_buffer_ids
+            }
+            # Ensure each atomic countdown sticks with the same buffer
+            countdown_cycle = tuple(countdowns[buffer_ids[k]] for k in keys)
         else:
-            barriers = [None]
-        barrier_cycle = itertools.cycle(barriers)
+            countdown_cycle = itertools.cycle((None,))
 
         class Cancelled(Exception):
             pass
@@ -1531,31 +1521,40 @@ class TensorDeserializer(
                 ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, exc) == 1
             )
 
+        def receive_and_check(timeout: int = 3600) -> torch.nn.Parameter:
+            outcome = transfer_out_queue.get(timeout=timeout)
+            if outcome is sentinel:
+                raise RuntimeError("Loading failed")
+            return outcome
+
         def transfer() -> None:
-            next_tensor, barrier = transfer_in_queue.get()
-            next_tensor: torch.Tensor
-            barrier: asymmetric_barrier
-            if next_tensor is sentinel:
-                if barrier is not None:
-                    barrier.cancel()
-                return
+            countdown = None
             stream = torch.cuda.Stream()
-            with torch.cuda.stream(stream):
-                while next_tensor is not sentinel:
-                    try:
-                        transfer_out_queue.put(
-                            self._to_torch_parameter(next_tensor),
-                            timeout=3600,
+            try:
+                with torch.cuda.stream(stream):
+                    while True:
+                        next_tensor, countdown = transfer_in_queue.get(
+                            timeout=3600
                         )
-                        del next_tensor
-                    finally:
-                        if barrier is not None:
-                            barrier.signal()
-                    next_tensor, barrier = transfer_in_queue.get(timeout=3600)
-                else:
-                    if barrier is not None:
-                        barrier.cancel()
-                stream.synchronize()
+                        next_tensor: torch.Tensor
+                        countdown: Optional[atomic_countdown]
+                        if next_tensor is sentinel:
+                            break
+                        try:
+                            transfer_out_queue.put(
+                                self._to_torch_parameter(next_tensor),
+                                timeout=3600,
+                            )
+                        finally:
+                            if countdown is not None:
+                                countdown.trigger()
+                    stream.synchronize()
+            except Exception:
+                transfer_out_queue.put_nowait(sentinel)
+                raise
+            finally:
+                if countdown is not None:
+                    countdown.cancel()
 
         def ready_buffers(
             key_list: Iterable[str],
@@ -1605,7 +1604,7 @@ class TensorDeserializer(
             metadata: TensorEntry,
             data,
             hashes: Iterable[TensorHash],
-            barrier: Optional[asymmetric_barrier],
+            countdown: Optional[atomic_countdown],
         ) -> None:
             with memoryview(data).cast("B") as mv:
                 try:
@@ -1613,13 +1612,13 @@ class TensorDeserializer(
                         metadata.name, hashes, metadata.raw_headers, mv
                     )
                 finally:
-                    if barrier is not None:
-                        barrier.signal()
+                    if countdown is not None:
+                        countdown.trigger()
 
         def check_hashes(
             tensor_name: str,
             tensor: torch.Tensor,
-            barrier: Optional[asymmetric_barrier],
+            countdown: Optional[atomic_countdown],
         ) -> None:
             entry: TensorEntry = self._metadata[tensor_name]
             storage = tensor.untyped_storage()
@@ -1630,7 +1629,7 @@ class TensorDeserializer(
             for h in entry.hashes:
                 checks.append(
                     computation_threads.submit(
-                        check_hash, entry, data, (h,), barrier
+                        check_hash, entry, data, (h,), countdown
                     )
                 )
 
@@ -1638,27 +1637,31 @@ class TensorDeserializer(
 
         def read_into_buffers() -> None:
             buffers = ready_buffers(keys)
-            with contextlib.closing(buffers):
-                for name, barrier in zip(buffers, barrier_cycle):
-                    barrier: Optional[asymmetric_barrier]
-                    if stop:
-                        break
-                    metadata: TensorEntry = self._metadata[name]
-                    self._file.seek(metadata.offset)
-                    if barrier is not None and not barrier.wait():
-                        break
-                    for *_, tensor in self.read_tensors(
-                        num_tensors=1, verify_hash=False
-                    ):
-                        pass
-                    if stop:
-                        break
-                    tensor: torch.Tensor
-                    if barrier is not None:
-                        barrier.reset()
-                    if computation_threads is not None:
-                        check_hashes(name, tensor, barrier)
-                    transfer_in_queue.put_nowait((tensor, barrier))
+            try:
+                with contextlib.closing(buffers):
+                    for name, countdown in zip(buffers, countdown_cycle):
+                        countdown: Optional[atomic_countdown]
+                        if stop:
+                            break
+                        metadata: TensorEntry = self._metadata[name]
+                        self._file.seek(metadata.offset)
+                        if countdown is not None and not countdown.wait():
+                            break
+                        for *_, tensor in self.read_tensors(
+                            num_tensors=1, verify_hash=False
+                        ):
+                            pass
+                        if stop:
+                            break
+                        tensor: torch.Tensor
+                        if countdown is not None:
+                            countdown.reset()
+                        if computation_threads is not None:
+                            check_hashes(name, tensor, countdown)
+                        transfer_in_queue.put_nowait((tensor, countdown))
+            except Exception:
+                transfer_out_queue.put_nowait(sentinel)
+                raise
 
         transfer_thread = threading.Thread(
             target=transfer, name="TensorizerTransfer", daemon=True
@@ -1669,7 +1672,7 @@ class TensorDeserializer(
 
         try:
             for key in keys[:-1]:
-                self._cache[key] = transfer_out_queue.get(timeout=3600)
+                self._cache[key] = receive_and_check()
                 yield self._cache[key]
             # Stop before yielding the final tensor
             # to catch up on hash verification
@@ -1686,7 +1689,7 @@ class TensorDeserializer(
                     # This will raise if any of the checks failed
                     check.result(timeout=3600)
                 checks.clear()
-            self._cache[keys[-1]] = transfer_out_queue.get(timeout=3600)
+            self._cache[keys[-1]] = receive_and_check()
             transfer_in_queue.put_nowait((sentinel, None))
             transfer_thread.join(timeout=3600)
             yield self._cache[keys[-1]]
