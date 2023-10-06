@@ -2,9 +2,9 @@
 Module, Model, and Tensor Serialization/Deserialization
 
 ## TLDR
-Extremely fast model loads from HTTP/HTTPS and S3 endpoints. GPT-J
-(`20GB`) loads at wire-speed (`~5GB/s`) on a 40GbE network, and is
-only bottlenecked by the Linux kernel TCP stack.
+Extremely fast model loads from HTTP/HTTPS, Redis, and S3 endpoints.
+GPT-J (`20GB`) loads at wire-speed (`~5GB/s`) on a 40GbE network, and
+is only bottlenecked by the Linux kernel TCP stack.
 
 ## Rationale
 CoreWeave and our customers use KNative to deploy models as serverless
@@ -35,6 +35,11 @@ pertains to HTTP/HTTPS endpoints, as S3 is just an HTTP/HTTPS endpoint.
 so you can use it to serialize models locally and load them locally. This
 is extremely fast, as the same principles that make it fast for HTTP/HTTPS
 and S3 endpoints also apply to local filesystems.
+
+`tensorizer` has preliminary support for Redis, but it is not recommended
+for model deployment due to the lack of distributed caching. It is intended
+for sharing state between inference pods, or for loading data on a per-request
+basis from a Redis cache.
 
 ## Installation
 
@@ -195,6 +200,12 @@ where `df_main()` serializes models from
 [HuggingFace Diffusers](https://github.com/huggingface/diffusers)
 and `hf_main()` serializes
 [HuggingFace Transformers](https://github.com/huggingface/transformers) models.
+
+## Benchmarks
+
+You can run your own benchmarks on CoreWeave or your own Kubernetes cluster
+by using the `benchmark.yaml` file in the `examples/benchmark_buffer_size`
+directory. Please see the [README](examples/benchmark_buffer_size/README.md).
 
 ## Available Pre-Tensorized Models on the CoreWeave Cloud
 

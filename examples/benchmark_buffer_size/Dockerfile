@@ -1,5 +1,8 @@
 FROM ghcr.io/coreweave/ml-containers/torch:9faf4d7-base-cuda12.0.1-torch2.0.1-vision0.15.2-audio2.0.2
 
+RUN apt-get -qq update && \
+     apt-get install -y redis-server && \
+     apt-get clean
 RUN mkdir /app
 COPY tensorizer /app/tensorizer
 COPY requirements.txt /app/tensorizer

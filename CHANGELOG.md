@@ -5,19 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.4.0] - 2023-10-05
 
 ### Added
 
-- `buffer_size` parameter to `stream_io.CURLStreamFile` to control the amount of
-  data buffered in advance during loading
-  - Defaults to 2 MiB
+- Support for `redis://` URIs in `stream_io.open_stream`
+  - E.g. `redis://localhost:6379/mymodel`
+- New `stream_io.RedisStreamFile` class
+  - Similar to `stream_io.CURLStreamFile`
+- `TensorDeserializer.to_redis` method for initially loading tensors into
+  a Redis data store
+- `force_http` parameter to `stream_io.open_stream` to downgrade an S3
+  connection from HTTPS to HTTP
+  - **Warning!** This will stream all data completely unencrypted
+  - **Warning!** If accessing a private S3 bucket, this will also send
+    your object-scoped access key to the server unencrypted
+- `buffer_size` parameter to `stream_io.open_stream` to control the amount of
+  data buffered in advance during HTTP(S) loading
+  - Defaults to 16 MiB for HTTP(S) streams and 1 to 8 MiB for Redis streams
   - Previously, this was fixed at 256 MiB
 
 ### Changed
 
 - `TensorSerializer.write_module` has been optimized further for a speedup of
-  ~3.6x on CUDA modules and ~3.1x faster on CPU modules
+  ~3.6x on CUDA modules and ~3.1x on CPU modules
+- `redis` and `hiredis` are now required package dependencies
 
 ### Fixed
 
@@ -129,7 +141,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
-[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.3.0...HEAD
+[2.4.0]: https://github.com/coreweave/tensorizer/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/coreweave/tensorizer/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/coreweave/tensorizer/compare/v2.1.2...v2.2.0
 [2.1.2]: https://github.com/coreweave/tensorizer/compare/v2.1.1...v2.1.2

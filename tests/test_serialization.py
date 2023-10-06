@@ -28,6 +28,7 @@ from tensorizer import (
     utils,
 )
 from tensorizer.serialization import TensorHash, TensorType
+from test_stream_io import start_redis, teardown_redis
 
 model_name = "EleutherAI/gpt-neo-125M"
 num_hellos = 400
@@ -321,6 +322,46 @@ class TestDeserialization(unittest.TestCase):
         check_deserialized(self, deserialized, model_name)
         check_inference(self, deserialized, model_name, default_device)
         deserialized.close()
+
+    def test_redis(self):
+        redis_server, redis_client = start_redis(port=6380)
+        try:
+            redis_model_path = f"redis://localhost:6380/{model_name}"
+
+            deserialized_s3 = TensorDeserializer(
+                f"s3://tensorized/{model_name}/model.tensors",
+                device=default_device,
+                lazy_load=True,
+            )
+            deserialized_s3.to_redis(redis_client, model_name)
+            deserialized_s3.close()
+
+            with self.subTest(
+                msg="Testing redis deserialization in eager mode"
+            ):
+                deserialized_redis = TensorDeserializer(
+                    redis_model_path,
+                    device=default_device,
+                )
+                check_deserialized(self, deserialized_redis, model_name)
+                check_inference(
+                    self, deserialized_redis, model_name, default_device
+                )
+                deserialized_redis.close()
+
+            with self.subTest(msg="Testing redis deserialization in lazy mode"):
+                deserialized_redis = TensorDeserializer(
+                    redis_model_path,
+                    device=default_device,
+                    lazy_load=True,
+                )
+                check_deserialized(self, deserialized_redis, model_name)
+                check_inference(
+                    self, deserialized_redis, model_name, default_device
+                )
+                deserialized_redis.close()
+        finally:
+            teardown_redis(redis_server, redis_client)
 
     def test_filter_func(self):
         # These two filters should produce identical results
