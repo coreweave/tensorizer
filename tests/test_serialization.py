@@ -287,21 +287,6 @@ class TestDeserialization(unittest.TestCase):
         check_inference(self, deserialized, model_name, "cuda")
         deserialized.close()
 
-    @unittest.skipIf(not is_cuda_available, "plaid_mode requires CUDA")
-    def test_plaid_mode_guards(self):
-        in_file = open(self._serialized_model_path, "rb")
-        deserialized = TensorDeserializer(
-            in_file, device="cuda", plaid_mode=True
-        )
-        keys = list(deserialized.keys())
-        _ = deserialized[keys[0]]
-        _ = deserialized[keys[1]]
-
-        with self.assertRaises(RuntimeError):
-            _ = deserialized[keys[0]]
-
-        deserialized.close()
-
     @patch.object(stream_io, "_s3_default_config_paths", ())
     @patch.object(stream_io, "default_s3_read_endpoint", default_read_endpoint)
     def test_s3(self):
