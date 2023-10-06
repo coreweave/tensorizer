@@ -1615,7 +1615,8 @@ class TensorDeserializer(
                         finally:
                             if countdown is not None:
                                 countdown.trigger()
-                    stream.synchronize()
+                    if stream is not None:
+                        stream.synchronize()
             except Exception:
                 transfer_out_queue.put_nowait(sentinel)
                 raise
