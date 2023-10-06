@@ -1,9 +1,12 @@
 import argparse
 import gc
+import json
 import logging
 import os
+import platform
 import socket
 import time
+from typing import Optional
 
 import redis
 import torch
@@ -21,6 +24,10 @@ logging.basicConfig(
     level=logging.INFO,
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+kibibyte = 1 << 10
+mebibyte = 1 << 20
+gibibyte = 1 << 30
 
 # Read in model name from command line, or env var, or default to gpt-neo-2.7B
 model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-neo-2.7B/fp16"
@@ -61,6 +68,12 @@ parser.add_argument(
     default=28,
     help="Ending buffer size power (default: 28)",
 )
+parser.add_argument(
+    "--json",
+    action="store_true",
+    default=False,
+    help="Output JSON lines instead of logging",
+)
 args = parser.parse_args()
 
 model_name: str = args.model
@@ -75,12 +88,26 @@ s3_uri = f"s3://tensorized/{model_name}/model.tensors"
 # Get nodename from environment, or default to os.uname().nodename
 nodename = os.getenv("K8S_NODE_NAME") or os.uname().nodename
 
-logging.info(f"{nodename} -- Testing {http_uri}")
+# Get our region, pod name, link speed from environment
+region = os.getenv("K8S_POD_REGION")
+pod_name = os.getenv("K8S_POD_NAME")
+link_speed = os.getenv("K8S_LINK_SPEED")
 
-kibibyte = 1 << 10
-mebibyte = 1 << 20
-gibibyte = 1 << 30
+if not args.json:
+    logging.info(f"{nodename} -- Testing {http_uri}")
 
+
+# Collect CPU data
+cpu_arch = platform.processor()
+# Read CPU name from /proc/cpuinfo
+try:
+    with open("/proc/cpuinfo") as f:
+        for line in f:
+            if line.startswith("model name"):
+                cpu_name = line.split(":")[1].strip()
+                break
+except FileNotFoundError:
+    cpu_name = platform.machine()
 
 # Collect GPU data
 try:
@@ -90,8 +117,9 @@ try:
     has_gpu = True
 except AssertionError:
     gpu_gb = 0
-    gpu_name = "CPU"
+    gpu_name = cpu_name
     has_gpu = False
+
 
 # Parse redis URI
 redis_uri = args.redis
@@ -99,6 +127,103 @@ redis_host = redis_uri.split("://")[1].split(":")[0]
 redis_port = int(redis_uri.split("://")[1].split(":")[1])
 
 redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
+
+
+def log(
+    total_sz: int,
+    start: float,
+    end: float,
+    raw_read: bool,
+    source: str,
+    force_http: Optional[bool] = None,
+    lazy_load: Optional[bool] = None,
+    plaid_mode: Optional[bool] = None,
+    verify_hash: Optional[bool] = None,
+    response_headers: Optional[dict] = None,
+    read_size: Optional[int] = None,
+    buffer_size: Optional[int] = None,
+):
+    scheme = source.split("://")[0]
+    if scheme == "s3" and not force_http:
+        scheme = "s3s"
+        source = source.replace("s3://", "s3s://")
+    scheme_pad = " " * (5 - len(scheme))
+
+    if response_headers is None:
+        response_headers = {}
+    cached_by = response_headers.get("x-cache-trace", None)
+    cached = response_headers.get("x-cache-status", False)
+
+    if cached_by is not None:
+        remote_peer = cached_by
+    elif "localhost" in source:
+        remote_peer = "localhost"
+    else:
+        remote_peer = source.split("//")[1].split("/")[0].split(":")[0]
+
+    if args.json:
+        log_json(
+            scheme=scheme,
+            start=start,
+            end=end,
+            duration=end - start,
+            total_bytes_read=total_sz,
+            rate=total_sz / (end - start),
+            source=source,
+            raw_read=raw_read,
+            force_http=force_http,
+            lazy_load=lazy_load,
+            plaid_mode=plaid_mode,
+            verify_hash=verify_hash,
+            cached=cached,
+            cached_by=cached_by,
+            remote_peer=remote_peer,
+            response_headers=dict(response_headers),
+            read_size=read_size,
+            buffer_size=buffer_size,
+        )
+        return
+
+    verb_str = "raw read" if raw_read else "deserialized"
+    postamble = ""
+    if buffer_size is not None:
+        postamble += f", {buffer_size / kibibyte} KiB buffer size"
+    if read_size is not None:
+        postamble += f", {read_size / kibibyte} KiB read size"
+    if plaid_mode is not None:
+        postamble += f", plaid: {plaid_mode}"
+    if lazy_load is not None or plaid_mode is not None:
+        postamble += f", lazy_load: {lazy_load or plaid_mode}"
+    if verify_hash is not None:
+        postamble += f", verify_hash: {verify_hash}"
+    if cached_by is not None:
+        postamble += f", cached: {cached} by {cached_by}"
+
+    logging.info(
+        f"{nodename} -- {scheme}:{scheme_pad} "
+        f"gpu: {gpu_name} ({gpu_gb} GiB), {verb_str} "
+        f"{total_sz / mebibyte:0.2f} MiB at "
+        f"{total_sz / mebibyte / (end - start):0.2f} MiB/s"
+        f"{postamble}"
+    )
+
+
+def log_json(
+    **kwargs,
+):
+    jsonl = {
+        "ts": time.time(),
+        "nodename": nodename,
+        "region": region,
+        "pod_name": pod_name,
+        "link_speed": link_speed,
+        "cpu_arch": cpu_arch,
+        "cpu_name": cpu_name,
+        "gpu_name": gpu_name,
+        "gpu_gb": gpu_gb,
+        **kwargs,
+    }
+    print(json.dumps(jsonl))
 
 
 def io_test(
@@ -120,19 +245,14 @@ def io_test(
             break
     end = time.monotonic()
 
-    resp_headers = getattr(io, "response_headers", {})
-    cached_by = resp_headers.get("x-cache-trace", None)
-    cached = resp_headers.get("x-cache-status", False)
-
-    # Print the total size of the stream, and the speed at which it was read.
-    logging.info(
-        f"{nodename} -- http:  "
-        f"gpu: {gpu_name} ({gpu_gb} GiB), raw read "
-        f"{total_sz / mebibyte:0.2f} MiB at "
-        f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
-        f"{buffer_size / kibibyte} KiB stream buffer size, "
-        f"{read_size / kibibyte} KiB read size, "
-        f"cached: {cached} by {cached_by}"
+    log(
+        total_sz,
+        start,
+        end,
+        True,
+        source,
+        buffer_size=buffer_size,
+        read_size=read_size,
     )
 
 
@@ -144,11 +264,7 @@ def deserialize_test(
     force_http=False,
     buffer_size=256 * kibibyte,
 ):
-    scheme = source.split("://")[0]
-    if scheme == "s3" and not force_http:
-        scheme = "s3s"
-    scheme_pad = " " * (5 - len(scheme))
-    source = open_stream(
+    stream = open_stream(
         source,
         s3_endpoint=default_s3_read_endpoint,
         buffer_size=buffer_size,
@@ -156,7 +272,7 @@ def deserialize_test(
     )
     start = time.monotonic()
     test_dict = TensorDeserializer(
-        source,
+        stream,
         verify_hash=verify_hash,
         plaid_mode=plaid_mode,
         lazy_load=lazy_load,
@@ -168,19 +284,18 @@ def deserialize_test(
 
     end = time.monotonic()
 
-    resp_headers = getattr(test_dict._file, "response_headers", {})
-    cached_by = resp_headers.get("x-cache-trace", None)
-    cached = resp_headers.get("x-cache-status", False)
-    total_sz = test_dict.total_bytes_read
-
-    logging.info(
-        f"{nodename} -- {scheme}:{scheme_pad} "
-        f"gpu: {gpu_name} ({gpu_gb} GiB), loaded  "
-        f" {total_sz / mebibyte:0.2f} MiB at"
-        f" {total_sz / mebibyte / (end - start):0.2f} MiB/s,"
-        f" {buffer_size / kibibyte} KiB stream buffer size, plaid:"
-        f" {plaid_mode}, verify_hash: {verify_hash}, lazy_load:"
-        f" {lazy_load or plaid_mode}, cached: {cached} by {cached_by}"
+    log(
+        test_dict.total_bytes_read,
+        start,
+        end,
+        False,
+        source,
+        buffer_size=buffer_size,
+        force_http=force_http,
+        lazy_load=lazy_load,
+        plaid_mode=plaid_mode,
+        verify_hash=verify_hash,
+        response_headers=getattr(stream, "response_headers", {}),
     )
 
     test_dict.close()
@@ -209,22 +324,25 @@ def load_redis():
     test_dict.to_redis(redis_client, model_name)
     end = time.monotonic()
     rate = test_dict.total_bytes_read / (end - start)
-    logging.info(
-        f"{nodename} -- redis: Loaded"
-        f" {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
-        f" {rate / mebibyte:0.2f} MiB/s in {end - start:0.2f}s"
-    )
+    if not args.json:
+        logging.info(
+            f"{nodename} -- redis: Loaded"
+            f" {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
+            f" {rate / mebibyte:0.2f} MiB/s in {end - start:0.2f}s"
+        )
 
 
 def bench_redis(
+    uri=f"redis://{redis_host}:{redis_port}/{model_name}",
     plaid_mode=False,
     verify_hash=False,
     lazy_load=False,
     buffer_size=256 * kibibyte,
 ):
+    start = time.monotonic()
     test_dict = TensorDeserializer(
         RedisStreamFile(
-            f"redis://{redis_host}:{redis_port}/{model_name}",
+            uri,
             buffer_size=buffer_size,
         ),
         lazy_load=lazy_load,
@@ -232,21 +350,21 @@ def bench_redis(
         verify_hash=verify_hash,
     )
 
-    start = time.monotonic()
     if lazy_load or plaid_mode:
         for name in test_dict:
             test_dict[name]
     end = time.monotonic()
-    total_sz = test_dict.total_bytes_read
 
-    logging.info(
-        f"{nodename} -- redis: "
-        f"gpu: {gpu_name} ({gpu_gb} GiB), loaded  "
-        f" {total_sz / mebibyte:0.2f} MiB at"
-        f" {total_sz / mebibyte / (end - start):0.2f} MiB/s,"
-        f" {buffer_size / kibibyte} KiB stream buffer size, plaid:"
-        f" {plaid_mode}, verify_hash: {verify_hash}, lazy_load:"
-        f" {lazy_load or plaid_mode}"
+    log(
+        test_dict.total_bytes_read,
+        start,
+        end,
+        False,
+        uri,
+        lazy_load=lazy_load,
+        plaid_mode=plaid_mode,
+        verify_hash=verify_hash,
+        buffer_size=buffer_size,
     )
 
     del test_dict
@@ -258,6 +376,7 @@ def bench_redis(
 
 def io_test_redis(buffer_size=256 * kibibyte):
     # Establish raw TCP connection to redis server.
+    start = time.monotonic()
     redis_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     redis_tcp.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 0)
     redis_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_size)
@@ -266,8 +385,6 @@ def io_test_redis(buffer_size=256 * kibibyte):
     buf = bytearray(512 * mebibyte)
 
     total_sz = 0
-
-    start = time.monotonic()
 
     # Loop over redis keys, and read them into memory.
     for key in redis_client.scan_iter(f"{model_name}:*"):
@@ -297,13 +414,7 @@ def io_test_redis(buffer_size=256 * kibibyte):
 
     end = time.monotonic()
     redis_tcp.close()
-    logging.info(
-        f"{nodename} -- redis: "
-        f"gpu: {gpu_name} ({gpu_gb} GiB), raw read "
-        f"{total_sz / mebibyte:0.2f} MiB at "
-        f"{total_sz / mebibyte / (end - start):0.2f} MiB/s, "
-        f"{buffer_size / kibibyte} KiB stream buffer size"
-    )
+    log(total_sz, start, end, True, redis_uri, buffer_size=buffer_size)
 
 
 if not args.no_load_redis:
