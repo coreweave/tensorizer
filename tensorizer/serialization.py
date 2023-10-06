@@ -1591,9 +1591,14 @@ class TensorDeserializer(
 
         def transfer() -> None:
             countdown = None
-            stream = torch.cuda.Stream()
+            is_cuda = self._device.type == "cuda"
             try:
-                with torch.cuda.stream(stream):
+                stream = torch.cuda.Stream() if is_cuda else None
+                with (
+                    torch.cuda.stream(stream)
+                    if is_cuda
+                    else contextlib.nullcontext()
+                ):
                     while True:
                         next_tensor, countdown = transfer_in_queue.get(
                             timeout=3600
