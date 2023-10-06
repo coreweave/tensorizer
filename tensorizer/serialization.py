@@ -1463,10 +1463,32 @@ class TensorDeserializer(
                 raise KeyError(f"Invalid key: {key}")
 
         # Quick route for all cached keys
-        # A later revision should more efficiently handle when some keys
-        # are cached, but not all of them
         if all(self._cache.get(key) is not None for key in keys):
             yield from map(self._cache.get, keys)
+            return
+
+        # Splice cached values with freshly loaded values
+        # when some are cached and some are not by using a recursive call
+        if any(self._cache.get(key) is not None for key in keys):
+            uncached = {
+                i: k for i, k in enumerate(keys) if self._cache.get(k) is None
+            }
+            loader = self._bulk_load(uncached.values(), verify_hash)
+            with contextlib.closing(loader):
+                for i, k in enumerate(keys):
+                    if i in uncached:
+                        yield next(loader)
+                    else:
+                        yield self._cache[k]
+                if tuple(loader):
+                    raise RuntimeError("Loaded too many tensors")
+            return
+
+        # If this function is later exposed through a public method, add another
+        # case here to optimize for unsorted keys. Otherwise, unsorted
+        # keys become disastrously slow. It could sort the list internally,
+        # read them all, unsort them, and then yield them all in their original
+        # order.
 
         # Quick route for a single key
         if len(keys) == 1:
