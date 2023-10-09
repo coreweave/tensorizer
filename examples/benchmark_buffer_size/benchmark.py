@@ -57,25 +57,25 @@ parser.add_argument(
     help="Don't load the model into redis",
 )
 parser.add_argument(
-    "--start_buffer_size",
+    "--start-buffer-size",
     type=int,
     default=18,
     help="Starting buffer size power (default: 18)",
 )
 parser.add_argument(
-    "--end_buffer_size",
+    "--end-buffer-size",
     type=int,
     default=28,
     help="Ending buffer size power (default: 28)",
 )
 parser.add_argument(
-    "--start_plaid_buffers",
+    "--start-plaid-buffers",
     type=int,
     default=1,
     help="Starting plaid buffers power (default: 1)",
 )
 parser.add_argument(
-    "--end_plaid_buffers",
+    "--end-plaid-buffers",
     type=int,
     default=4,
     help="Ending plaid buffers power (default: 4)",
@@ -170,8 +170,7 @@ plaid_sizes = [
 
 def log(
     total_sz: int,
-    start: float,
-    end: float,
+    duration: float,
     raw_read: bool,
     source: str,
     force_http: Optional[bool] = None,
@@ -206,9 +205,7 @@ def log(
             plaid_mode_buffers = None
         log_json(
             scheme=scheme,
-            start=start,
-            end=end,
-            duration=end - start,
+            duration=duration,
             total_bytes_read=total_sz,
             rate=total_sz / (end - start),
             source=source,
@@ -248,7 +245,7 @@ def log(
         f"{nodename} -- {scheme}:{scheme_pad} "
         f"gpu: {gpu_name} ({gpu_gb} GiB), {verb_str} "
         f"{total_sz / mebibyte:0.2f} MiB at "
-        f"{total_sz / mebibyte / (end - start):0.2f} MiB/s"
+        f"{total_sz / mebibyte / duration:0.2f} MiB/s"
         f"{postamble}"
     )
 
@@ -292,8 +289,7 @@ def io_test(
 
     log(
         total_sz,
-        start,
-        end,
+        end - start,
         True,
         source,
         buffer_size=buffer_size,
@@ -333,8 +329,7 @@ def deserialize_test(
 
     log(
         test_dict.total_bytes_read,
-        start,
-        end,
+        end - start,
         False,
         source,
         buffer_size=buffer_size,
@@ -407,8 +402,7 @@ def bench_redis(
 
     log(
         test_dict.total_bytes_read,
-        start,
-        end,
+        end - start,
         False,
         uri,
         lazy_load=lazy_load,
@@ -465,7 +459,7 @@ def io_test_redis(buffer_size=256 * kibibyte):
 
     end = time.monotonic()
     redis_tcp.close()
-    log(total_sz, start, end, True, redis_uri, buffer_size=buffer_size)
+    log(total_sz, end - start, True, redis_uri, buffer_size=buffer_size)
 
 
 if not args.no_load_redis:
