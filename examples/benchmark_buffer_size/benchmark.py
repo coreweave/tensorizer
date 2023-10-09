@@ -57,16 +57,40 @@ parser.add_argument(
     help="Don't load the model into redis",
 )
 parser.add_argument(
-    "--start",
+    "--start_buffer_size",
     type=int,
     default=18,
     help="Starting buffer size power (default: 18)",
 )
 parser.add_argument(
-    "--end",
+    "--end_buffer_size",
     type=int,
     default=28,
     help="Ending buffer size power (default: 28)",
+)
+parser.add_argument(
+    "--start_plaid_buffers",
+    type=int,
+    default=1,
+    help="Starting plaid buffers power (default: 1)",
+)
+parser.add_argument(
+    "--end_plaid_buffers",
+    type=int,
+    default=4,
+    help="Ending plaid buffers power (default: 4)",
+)
+parser.add_argument(
+    "--test-https",
+    action="store_true",
+    default=False,
+    help="Test HTTPS download speeds",
+)
+parser.add_argument(
+    "--test-s3",
+    action="store_true",
+    default=False,
+    help="Test S3 download speeds",
 )
 parser.add_argument(
     "--json",
@@ -128,6 +152,15 @@ redis_port = int(redis_uri.split("://")[1].split(":")[1])
 
 redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
 
+# Build range of buffer sizes to test
+buffer_sizes = [
+    1 << i for i in range(args.start_buffer_size, args.end_buffer_size)
+]
+plaid_sizes = [
+    1 << i
+    for i in range(args.start_plaid_buffers - 1, args.end_plaid_buffers + 1)
+]
+
 
 def log(
     total_sz: int,
@@ -138,6 +171,7 @@ def log(
     force_http: Optional[bool] = None,
     lazy_load: Optional[bool] = None,
     plaid_mode: Optional[bool] = None,
+    plaid_mode_buffers: Optional[int] = None,
     verify_hash: Optional[bool] = None,
     response_headers: Optional[dict] = None,
     read_size: Optional[int] = None,
@@ -162,6 +196,8 @@ def log(
         remote_peer = source.split("//")[1].split("/")[0].split(":")[0]
 
     if args.json:
+        if not plaid_mode:
+            plaid_mode_buffers = None
         log_json(
             scheme=scheme,
             start=start,
@@ -174,6 +210,7 @@ def log(
             force_http=force_http,
             lazy_load=lazy_load,
             plaid_mode=plaid_mode,
+            plaid_buffers=plaid_mode_buffers,
             verify_hash=verify_hash,
             cached=cached,
             cached_by=cached_by,
@@ -192,6 +229,8 @@ def log(
         postamble += f", {read_size / kibibyte} KiB read size"
     if plaid_mode is not None:
         postamble += f", plaid: {plaid_mode}"
+    if plaid_mode_buffers is not None and plaid_mode:
+        postamble += f", plaid_buffers: {plaid_mode_buffers}"
     if lazy_load is not None or plaid_mode is not None:
         postamble += f", lazy_load: {lazy_load or plaid_mode}"
     if verify_hash is not None:
@@ -262,6 +301,7 @@ def deserialize_test(
     verify_hash=False,
     lazy_load=False,
     force_http=False,
+    plaid_mode_buffers=4,
     buffer_size=256 * kibibyte,
 ):
     stream = open_stream(
@@ -276,6 +316,7 @@ def deserialize_test(
         verify_hash=verify_hash,
         plaid_mode=plaid_mode,
         lazy_load=lazy_load,
+        plaid_mode_buffers=plaid_mode_buffers,
     )
 
     if lazy_load or plaid_mode:
@@ -294,6 +335,7 @@ def deserialize_test(
         force_http=force_http,
         lazy_load=lazy_load,
         plaid_mode=plaid_mode,
+        plaid_mode_buffers=plaid_mode_buffers,
         verify_hash=verify_hash,
         response_headers=getattr(stream, "response_headers", {}),
     )
@@ -338,6 +380,7 @@ def bench_redis(
     verify_hash=False,
     lazy_load=False,
     buffer_size=256 * kibibyte,
+    plaid_mode_buffers=4,
 ):
     start = time.monotonic()
     test_dict = TensorDeserializer(
@@ -347,6 +390,7 @@ def bench_redis(
         ),
         lazy_load=lazy_load,
         plaid_mode=plaid_mode,
+        plaid_mode_buffers=plaid_mode_buffers,
         verify_hash=verify_hash,
     )
 
@@ -363,6 +407,7 @@ def bench_redis(
         uri,
         lazy_load=lazy_load,
         plaid_mode=plaid_mode,
+        plaid_mode_buffers=plaid_mode_buffers,
         verify_hash=verify_hash,
         buffer_size=buffer_size,
     )
@@ -419,39 +464,65 @@ def io_test_redis(buffer_size=256 * kibibyte):
 
 if not args.no_load_redis:
     load_redis()
-for buffer_size_power in range(args.start, args.end):
-    buffer_size = 1 << buffer_size_power
+for buffer_size in buffer_sizes:
     for sample in range(5):
         io_test(buffer_size=buffer_size)
         io_test_redis(buffer_size=buffer_size)
         bench_redis(buffer_size=buffer_size, lazy_load=True)
         if has_gpu:
-            bench_redis(buffer_size=buffer_size, plaid_mode=True)
+            for plaid_buffers in plaid_sizes:
+                bench_redis(
+                    buffer_size=buffer_size,
+                    plaid_mode=True,
+                    plaid_mode_buffers=plaid_buffers,
+                )
         deserialize_test(buffer_size=buffer_size, lazy_load=True)
         if has_gpu:
-            deserialize_test(buffer_size=buffer_size, plaid_mode=True)
-        deserialize_test(
-            source=https_uri, buffer_size=buffer_size, lazy_load=True
-        )
-        if has_gpu:
+            for plaid_buffers in plaid_sizes:
+                deserialize_test(
+                    buffer_size=buffer_size,
+                    plaid_mode=True,
+                    plaid_mode_buffers=plaid_buffers,
+                )
+        if args.test_https:
             deserialize_test(
-                source=https_uri, buffer_size=buffer_size, plaid_mode=True
+                source=https_uri, buffer_size=buffer_size, lazy_load=True
             )
-        deserialize_test(source=s3_uri, buffer_size=buffer_size, lazy_load=True)
-        if has_gpu:
-            deserialize_test(
-                source=s3_uri, buffer_size=buffer_size, plaid_mode=True
-            )
-        deserialize_test(
-            source=s3_uri,
-            buffer_size=buffer_size,
-            lazy_load=True,
-            force_http=True,
-        )
-        if has_gpu:
+            if has_gpu:
+                for plaid_buffers in plaid_sizes:
+                    deserialize_test(
+                        source=https_uri,
+                        buffer_size=buffer_size,
+                        plaid_mode=True,
+                        plaid_mode_buffers=plaid_buffers,
+                    )
+        if args.test_s3:
             deserialize_test(
                 source=s3_uri,
                 buffer_size=buffer_size,
-                plaid_mode=True,
+                lazy_load=True,
                 force_http=True,
             )
+            if has_gpu:
+                for plaid_buffers in plaid_sizes:
+                    deserialize_test(
+                        source=s3_uri,
+                        buffer_size=buffer_size,
+                        plaid_mode=True,
+                        plaid_mode_buffers=plaid_buffers,
+                        force_http=True,
+                    )
+            if args.test_https:
+                deserialize_test(
+                    source=s3_uri,
+                    buffer_size=buffer_size,
+                    lazy_load=True,
+                )
+                if has_gpu:
+                    for plaid_buffers in plaid_sizes:
+                        deserialize_test(
+                            source=s3_uri,
+                            buffer_size=buffer_size,
+                            plaid_mode=True,
+                            plaid_mode_buffers=plaid_buffers,
+                        )
