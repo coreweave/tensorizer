@@ -693,7 +693,7 @@ class TensorDeserializer(
         *,
         lazy_load: bool = False,
         plaid_mode: bool = False,
-        plaid_mode_buffers: int = 4,
+        plaid_mode_buffers: Optional[int] = None,
         verify_hash: bool = False,
     ):
         # Whether to verify the hashes of the tensors when they are loaded.
