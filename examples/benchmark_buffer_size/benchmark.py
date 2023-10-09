@@ -81,6 +81,12 @@ parser.add_argument(
     help="Ending plaid buffers power (default: 4)",
 )
 parser.add_argument(
+    "--iterations",
+    type=int,
+    default=5,
+    help="Number of iterations to run per permutation (default: 5)",
+)
+parser.add_argument(
     "--test-https",
     action="store_true",
     default=False,
@@ -228,11 +234,11 @@ def log(
     if read_size is not None:
         postamble += f", {read_size / kibibyte} KiB read size"
     if plaid_mode is not None:
-        postamble += f", plaid: {plaid_mode}"
+        postamble += f", plaid_mode: {plaid_mode}"
     if plaid_mode_buffers is not None and plaid_mode:
         postamble += f", plaid_buffers: {plaid_mode_buffers}"
-    if lazy_load is not None or plaid_mode is not None:
-        postamble += f", lazy_load: {lazy_load or plaid_mode}"
+    if lazy_load is not None:
+        postamble += f", lazy_load: {lazy_load}"
     if verify_hash is not None:
         postamble += f", verify_hash: {verify_hash}"
     if cached_by is not None:
@@ -319,7 +325,7 @@ def deserialize_test(
         plaid_mode_buffers=plaid_mode_buffers,
     )
 
-    if lazy_load or plaid_mode:
+    if lazy_load:
         for name in test_dict:
             test_dict[name]
 
@@ -394,7 +400,7 @@ def bench_redis(
         verify_hash=verify_hash,
     )
 
-    if lazy_load or plaid_mode:
+    if lazy_load:
         for name in test_dict:
             test_dict[name]
     end = time.monotonic()
@@ -465,9 +471,10 @@ def io_test_redis(buffer_size=256 * kibibyte):
 if not args.no_load_redis:
     load_redis()
 for buffer_size in buffer_sizes:
-    for sample in range(5):
+    for sample in range(args.iterations):
         io_test(buffer_size=buffer_size)
         io_test_redis(buffer_size=buffer_size)
+        bench_redis(buffer_size=buffer_size, lazy_load=False)
         bench_redis(buffer_size=buffer_size, lazy_load=True)
         if has_gpu:
             for plaid_buffers in plaid_sizes:
@@ -476,6 +483,7 @@ for buffer_size in buffer_sizes:
                     plaid_mode=True,
                     plaid_mode_buffers=plaid_buffers,
                 )
+        deserialize_test(buffer_size=buffer_size, lazy_load=False)
         deserialize_test(buffer_size=buffer_size, lazy_load=True)
         if has_gpu:
             for plaid_buffers in plaid_sizes:
@@ -485,6 +493,9 @@ for buffer_size in buffer_sizes:
                     plaid_mode_buffers=plaid_buffers,
                 )
         if args.test_https:
+            deserialize_test(
+                source=https_uri, buffer_size=buffer_size, lazy_load=False
+            )
             deserialize_test(
                 source=https_uri, buffer_size=buffer_size, lazy_load=True
             )
@@ -497,6 +508,12 @@ for buffer_size in buffer_sizes:
                         plaid_mode_buffers=plaid_buffers,
                     )
         if args.test_s3:
+            deserialize_test(
+                source=s3_uri,
+                buffer_size=buffer_size,
+                lazy_load=False,
+                force_http=True,
+            )
             deserialize_test(
                 source=s3_uri,
                 buffer_size=buffer_size,
@@ -513,6 +530,11 @@ for buffer_size in buffer_sizes:
                         force_http=True,
                     )
             if args.test_https:
+                deserialize_test(
+                    source=s3_uri,
+                    buffer_size=buffer_size,
+                    lazy_load=False,
+                )
                 deserialize_test(
                     source=s3_uri,
                     buffer_size=buffer_size,
