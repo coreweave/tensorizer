@@ -26,10 +26,10 @@ spec:
                 - ORD1
       containers:
         - name: benchmark
-          image: ghcr.io/coreweave/tensorizer:benchmark-e03ab78
+          image: ghcr.io/coreweave/tensorizer:benchmark-609b825
           imagePullPolicy: IfNotPresent
           command: [ "/bin/bash" ]
-          args: [ "-c", "redis-server --daemonize yes >/dev/null & python /app/benchmark.py" ]
+          args: [ "-c", "redis-server --daemonize yes >/dev/null & python /app/benchmark.py --json" ]
           #--redis redis://redis-master:6379" ]
           resources:
             requests:
@@ -47,10 +47,28 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: K8S_POD_NAME
+              valueFrom:
+                 fieldRef:
+                   fieldPath: metadata.name
+            #- name: K8S_POD_REGION
+            #  valueFrom:
+            #     fieldRef:
+            #       fieldPath: metadata.labels.topology.kubernetes.io/region
+            #- name: K8S_LINK_SPEED
+            #  valueFrom:
+            #     fieldRef:
+            #       fieldPath: metadata.labels.ethernet.coreweave.cloud/speed
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              job-name: tensorizer-benchmark-read-size
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/region
+          whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels:
               job-name: tensorizer-benchmark-read-size
