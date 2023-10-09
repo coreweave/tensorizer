@@ -627,6 +627,9 @@ class TensorDeserializer(
             buffers are going to be inconsistent due to the extreme
             naughtiness of reusing a backing buffer. This is only recommended
             for use with inference, and not training.
+        plaid_mode_buffers: The number of buffers to use in plaid mode. This
+            is only used if ``plaid_mode=True``. These buffers are used to
+            pipeline the loading and processing of tensors.
         verify_hash: If True, the hashes of each tensor will be verified
             against the hashes stored in the metadata. A `HashMismatchError`
             will be raised if any of the hashes do not match.
@@ -690,6 +693,7 @@ class TensorDeserializer(
         *,
         lazy_load: bool = False,
         plaid_mode: bool = False,
+        plaid_mode_buffers: Optional[int] = None,
         verify_hash: bool = False,
     ):
         # Whether to verify the hashes of the tensors when they are loaded.
@@ -781,7 +785,9 @@ class TensorDeserializer(
                 for name, entry in self._metadata.items()
             }
             self.total_tensor_bytes = sum(tensor_sizes.values())
-            self._plaid_mode_buffer_count = 4
+            if not self._plaid_mode and plaid_mode_buffers is not None:
+                raise ValueError("Cannot specify plaid_mode_buffers when plaid_mode=False")
+            self._plaid_mode_buffer_count = plaid_mode_buffers or 4
             single_largest_tensor = max(tensor_sizes.values())
             # Round up to the nearest multiple of the page size
             # Just so that more reads happen on page boundaries
