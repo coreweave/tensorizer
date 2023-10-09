@@ -785,7 +785,9 @@ class TensorDeserializer(
                 for name, entry in self._metadata.items()
             }
             self.total_tensor_bytes = sum(tensor_sizes.values())
-            self._plaid_mode_buffer_count = plaid_mode_buffers
+            if not self._plaid_mode and plaid_mode_buffers is not None:
+                raise ValueError("Cannot specify plaid_mode_buffers when plaid_mode=False")
+            self._plaid_mode_buffer_count = plaid_mode_buffers or 4
             single_largest_tensor = max(tensor_sizes.values())
             # Round up to the nearest multiple of the page size
             # Just so that more reads happen on page boundaries
