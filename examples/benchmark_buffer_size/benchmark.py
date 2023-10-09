@@ -207,7 +207,7 @@ def log(
             scheme=scheme,
             duration=duration,
             total_bytes_read=total_sz,
-            rate=total_sz / (end - start),
+            rate=total_sz / duration,
             source=source,
             raw_read=raw_read,
             force_http=force_http,
@@ -306,6 +306,8 @@ def deserialize_test(
     plaid_mode_buffers=4,
     buffer_size=256 * kibibyte,
 ):
+    if not plaid_mode:
+        plaid_mode_buffers = None
     stream = open_stream(
         source,
         s3_endpoint=default_s3_read_endpoint,
@@ -383,6 +385,8 @@ def bench_redis(
     buffer_size=256 * kibibyte,
     plaid_mode_buffers=4,
 ):
+    if not plaid_mode:
+        plaid_mode_buffers = None
     start = time.monotonic()
     test_dict = TensorDeserializer(
         RedisStreamFile(
