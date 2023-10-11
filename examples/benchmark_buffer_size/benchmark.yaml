@@ -4,7 +4,7 @@ metadata:
   name: tensorizer-benchmark-read-size
 spec:
   parallelism: 10
-  completions: 100
+  completions: 50
   template:
     spec:
       affinity:
@@ -26,7 +26,7 @@ spec:
                 - ORD1
       containers:
         - name: benchmark
-          image: ghcr.io/coreweave/tensorizer:benchmark-16f7465
+          image: ghcr.io/coreweave/tensorizer:benchmark-2c6cbdd
           imagePullPolicy: IfNotPresent
           command: [ "/bin/bash" ]
           args: [ "-c", "redis-server --daemonize yes >/dev/null & python /app/benchmark.py --json" ]
@@ -68,6 +68,12 @@ spec:
               job-name: tensorizer-benchmark-read-size
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/region
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              job-name: tensorizer-benchmark-read-size
+        - maxSkew: 1
+          topologyKey: kubernetes.io/instance-type
           whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels:

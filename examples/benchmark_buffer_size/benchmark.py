@@ -11,7 +11,7 @@ from typing import Optional
 import redis
 import torch
 
-from tensorizer.serialization import TensorDeserializer
+from tensorizer.serialization import TensorDeserializer, TensorSerializer
 from tensorizer.stream_io import (
     CURLStreamFile,
     RedisStreamFile,
@@ -104,6 +104,9 @@ parser.add_argument(
     default=False,
     help="Output JSON lines instead of logging",
 )
+parser.add_argument(
+    "--file-prefix", default="", help="Prefix for file names, can include path"
+)
 args = parser.parse_args()
 
 model_name: str = args.model
@@ -114,6 +117,8 @@ http_uri = (
 )
 https_uri = http_uri.replace("http://", "https://")
 s3_uri = f"s3://tensorized/{model_name}/model.tensors"
+sanitized_model_file = model_name.replace("/", "_")
+file_uri = f"{args.file_prefix}{sanitized_model_file}.tensors"
 
 # Get nodename from environment, or default to os.uname().nodename
 nodename = os.getenv("K8S_NODE_NAME") or os.uname().nodename
@@ -144,11 +149,13 @@ try:
     cudadev = torch.cuda.current_device()
     gpu_gb = torch.cuda.get_device_properties(0).total_memory // gibibyte
     gpu_name = torch.cuda.get_device_name(cudadev)
+    map_device = torch.device("cuda")
     has_gpu = True
 except AssertionError:
     gpu_gb = 0
     gpu_name = cpu_name
     has_gpu = False
+    map_device = torch.device("cpu")
 
 
 # Parse redis URI
@@ -183,6 +190,11 @@ def log(
     buffer_size: Optional[int] = None,
 ):
     scheme = source.split("://")[0]
+    if scheme not in ["http", "https", "s3", "s3s", "file", "redis"]:
+        if source.endswith(".pt"):
+            scheme = "torch"
+        else:
+            scheme = "file"
     if scheme == "s3" and not force_http:
         scheme = "s3s"
         source = source.replace("s3://", "s3s://")
@@ -198,7 +210,10 @@ def log(
     elif "localhost" in source:
         remote_peer = "localhost"
     else:
-        remote_peer = source.split("//")[1].split("/")[0].split(":")[0]
+        if "//" in source:
+            remote_peer = source.split("//")[1].split("/")[0].split(":")[0]
+        else:
+            remote_peer = "filesystem"
 
     if args.json:
         if not plaid_mode:
@@ -363,18 +378,67 @@ def test_read_performance():
             )
 
 
-def load_redis():
+def prep_local():
+    # Store on Redis
     start = time.monotonic()
-    test_dict = TensorDeserializer(http_uri, lazy_load=True)
-    test_dict.to_redis(redis_client, model_name)
+    test_dict = TensorDeserializer(http_uri)
+    if not args.no_load_redis:
+        test_dict.to_redis(redis_client, model_name)
     end = time.monotonic()
-    rate = test_dict.total_bytes_read / (end - start)
-    if not args.json:
+    bytes_read = test_dict.total_bytes_read
+    rate = bytes_read / (end - start)
+    if not args.json and not args.no_load_redis:
         logging.info(
             f"{nodename} -- redis: Loaded"
-            f" {test_dict.total_bytes_read / gibibyte:0.2f} GiB at"
+            f" {bytes_read / gibibyte:0.2f} GiB at"
             f" {rate / mebibyte:0.2f} MiB/s in {end - start:0.2f}s"
         )
+    state_dict = dict(test_dict)
+    # Serialize to local file
+    start = time.monotonic()
+    ts = TensorSerializer(file_uri)
+    ts.write_state_dict(state_dict)
+    ts.close()
+    end = time.monotonic()
+    rate = bytes_read / (end - start)
+    if not args.json:
+        logging.info(
+            f"{nodename} -- local: Serialized"
+            f" {bytes_read / gibibyte:0.2f} GiB at"
+            f" {rate / mebibyte:0.2f} MiB/s in {end - start:0.2f}s"
+        )
+    # Save using torch
+    start = time.monotonic()
+    torch.save(state_dict, f"{args.file_prefix}{sanitized_model_file}.pt")
+    end = time.monotonic()
+    rate = bytes_read / (end - start)
+    if not args.json:
+        logging.info(
+            f"{nodename} -- torch: Serialized"
+            f" {bytes_read / gibibyte:0.2f} GiB at"
+            f" {rate / mebibyte:0.2f} MiB/s in {end - start:0.2f}s"
+        )
+
+
+def bench_torch():
+    # Load from torch
+    start = time.monotonic()
+    state_dict = torch.load(
+        f"{sanitized_model_file}.pt", map_location=map_device
+    )
+    end = time.monotonic()
+    bytes_read = os.path.getsize(f"{sanitized_model_file}.pt")
+    log(
+        bytes_read,
+        end - start,
+        False,
+        f"{sanitized_model_file}.pt",
+    )
+    del state_dict
+
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    gc.collect()
 
 
 def bench_redis(
@@ -467,9 +531,20 @@ def io_test_redis(buffer_size=256 * kibibyte):
 
 
 if not args.no_load_redis:
-    load_redis()
+    prep_local()
 for buffer_size in buffer_sizes:
     for sample in range(args.iterations):
+        bench_torch()
+        deserialize_test(file_uri, buffer_size=buffer_size, lazy_load=False)
+        deserialize_test(file_uri, buffer_size=buffer_size, lazy_load=True)
+        if has_gpu:
+            for plaid_buffers in plaid_sizes:
+                deserialize_test(
+                    file_uri,
+                    buffer_size=buffer_size,
+                    plaid_mode=True,
+                    plaid_mode_buffers=plaid_buffers,
+                )
         io_test(buffer_size=buffer_size)
         io_test_redis(buffer_size=buffer_size)
         bench_redis(buffer_size=buffer_size, lazy_load=False)
