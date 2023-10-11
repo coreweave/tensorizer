@@ -786,7 +786,9 @@ class TensorDeserializer(
             }
             self.total_tensor_bytes = sum(tensor_sizes.values())
             if not self._plaid_mode and plaid_mode_buffers is not None:
-                raise ValueError("Cannot specify plaid_mode_buffers when plaid_mode=False")
+                raise ValueError(
+                    "Cannot specify plaid_mode_buffers when plaid_mode=False"
+                )
             self._plaid_mode_buffer_count = plaid_mode_buffers or 4
             single_largest_tensor = max(tensor_sizes.values())
             # Round up to the nearest multiple of the page size
@@ -2242,7 +2244,7 @@ class TensorSerializer:
         final_sz = self._file.tell()
         self._file.close()
         self._shutdown_thread_pools()
-        logger.info(f"Tensors completed serializing to {final_sz} bytes")
+        logger.debug(f"Tensors completed serializing to {final_sz} bytes")
         # if self.compress_tensors:
         #     compression_ratio = (
         #         self.total_tensor_bytes / self.total_compressed_tensor_bytes
@@ -2440,7 +2442,7 @@ class TensorSerializer:
         #     )
         # else:
         comp_report = ""
-        logger.info(
+        logger.debug(
             f"{idx}:{typ}:{name} - {dtype_bytes.decode('utf-8')} - "
             f"{tensor.shape} -> {ds_bytes}{comp_report}"
         )
