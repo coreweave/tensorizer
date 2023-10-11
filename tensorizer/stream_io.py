@@ -1184,6 +1184,8 @@ def open_stream(
         dirname = os.path.dirname(path_uri)
         if dirname:
             os.makedirs(os.path.dirname(path_uri), exist_ok=True)
-        handle: typing.BinaryIO = open(path_uri, mode)
+        if buffer_size is None:
+            buffer_size = io.DEFAULT_BUFFER_SIZE
+        handle: typing.BinaryIO = open(path_uri, mode, buffering=buffer_size)
         handle.seek(0)
         return handle
