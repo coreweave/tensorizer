@@ -1181,7 +1181,9 @@ def open_stream(
                 'Only binary modes ("rb", "wb", "wb+", etc.)'
                 " are valid when opening local file streams."
             )
-        os.makedirs(os.path.dirname(path_uri), exist_ok=True)
+        dirname = os.path.dirname(path_uri)
+        if dirname:
+            os.makedirs(os.path.dirname(path_uri), exist_ok=True)
         handle: typing.BinaryIO = open(path_uri, mode)
         handle.seek(0)
         return handle
