@@ -4,7 +4,7 @@ metadata:
   name: tensorizer-benchmark-read-size
 spec:
   parallelism: 10
-  completions: 50
+  completions: 100
   template:
     spec:
       affinity:
@@ -15,7 +15,7 @@ spec:
               - key: ethernet.coreweave.cloud/speed
                 operator: In
                 values:
-                   #- 10G
+                   - 10G
                    - 40G
                    - 100G
               - key: topology.kubernetes.io/region

@@ -530,8 +530,8 @@ def io_test_redis(buffer_size=256 * kibibyte):
     log(total_sz, end - start, True, redis_uri, buffer_size=buffer_size)
 
 
-if not args.no_load_redis:
-    prep_local()
+prep_local()
+
 for buffer_size in buffer_sizes:
     for sample in range(args.iterations):
         bench_torch()
