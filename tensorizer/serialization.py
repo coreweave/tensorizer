@@ -45,6 +45,7 @@ import torch
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 from tensorizer._NumpyTensor import _NumpyTensor
+from tensorizer.stream_io import CURLStreamFile
 
 if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
@@ -789,10 +790,14 @@ class TensorDeserializer(
                 raise ValueError(
                     "Cannot specify plaid_mode_buffers when plaid_mode=False"
                 )
-            if self._verify_hash and plaid_mode_buffers is None:
+            if plaid_mode_buffers is not None:
+                self._plaid_mode_buffer_count = plaid_mode_buffers
+            elif self._verify_hash:
                 self._plaid_mode_buffer_count = 8
+            elif isinstance(self._file, CURLStreamFile):
+                self._plaid_mode_buffer_count = 1
             else:
-                self._plaid_mode_buffer_count = plaid_mode_buffers or 2
+                self._plaid_mode_buffer_count = 2
             single_largest_tensor = max(tensor_sizes.values())
             # Round up to the nearest multiple of the page size
             # Just so that more reads happen on page boundaries

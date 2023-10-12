@@ -26,7 +26,7 @@ spec:
                 - ORD1
       containers:
         - name: benchmark
-          image: ghcr.io/coreweave/tensorizer:benchmark-2c6cbdd
+          image: ghcr.io/coreweave/tensorizer:benchmark-ba406fb
           imagePullPolicy: IfNotPresent
           command: [ "/bin/bash" ]
           args: [ "-c", "redis-server --daemonize yes >/dev/null & python /app/benchmark.py --json" ]
