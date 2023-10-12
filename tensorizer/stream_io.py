@@ -441,7 +441,7 @@ def _parse_redis_uri(uri):
 if sys.platform == "darwin":
     _MAX_TCP_BUFFER_SIZE = 1 << 20  # 1 MiB if OSX
 else:
-    _MAX_TCP_BUFFER_SIZE = 8 << 20  # 8 MiB
+    _MAX_TCP_BUFFER_SIZE = 16 << 20  # 16 MiB
 
 
 class RedisStreamFile:
