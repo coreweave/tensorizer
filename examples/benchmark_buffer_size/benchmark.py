@@ -8,6 +8,7 @@ import socket
 import time
 from typing import Optional
 
+import psutil
 import redis
 import torch
 
@@ -99,6 +100,12 @@ parser.add_argument(
     help="Test S3 download speeds",
 )
 parser.add_argument(
+    "--local-only",
+    action="store_true",
+    default=False,
+    help="Only test local speeds",
+)
+parser.add_argument(
     "--json",
     action="store_true",
     default=False,
@@ -156,7 +163,7 @@ try:
     map_device = torch.device("cuda")
     has_gpu = True
 except AssertionError:
-    gpu_gb = 0
+    gpu_gb = psutil.virtual_memory().total // gibibyte
     gpu_name = cpu_name
     has_gpu = False
     map_device = torch.device("cpu")
@@ -580,7 +587,8 @@ prep_local()
 for buffer_size in buffer_sizes:
     for sample in range(args.iterations):
         bench_torch()
-        io_test(buffer_size=buffer_size)
+        if not args.local_only:
+            io_test(buffer_size=buffer_size)
         io_test(source=local_uri, buffer_size=buffer_size)
         io_test_redis(buffer_size=buffer_size)
         deserialize_test(file_uri, buffer_size=buffer_size, lazy_load=False)
@@ -593,7 +601,6 @@ for buffer_size in buffer_sizes:
                     plaid_mode=True,
                     plaid_mode_buffers=plaid_buffers,
                 )
-
         bench_redis(buffer_size=buffer_size, lazy_load=False)
         bench_redis(buffer_size=buffer_size, lazy_load=True)
         if has_gpu:
@@ -617,16 +624,17 @@ for buffer_size in buffer_sizes:
                     plaid_mode=True,
                     plaid_mode_buffers=plaid_buffers,
                 )
-        deserialize_test(buffer_size=buffer_size, lazy_load=False)
-        deserialize_test(buffer_size=buffer_size, lazy_load=True)
-        if has_gpu:
-            for plaid_buffers in plaid_sizes:
-                deserialize_test(
-                    buffer_size=buffer_size,
-                    plaid_mode=True,
-                    plaid_mode_buffers=plaid_buffers,
-                )
-        if args.test_https:
+        if not args.local_only:
+            deserialize_test(buffer_size=buffer_size, lazy_load=False)
+            deserialize_test(buffer_size=buffer_size, lazy_load=True)
+            if has_gpu:
+                for plaid_buffers in plaid_sizes:
+                    deserialize_test(
+                        buffer_size=buffer_size,
+                        plaid_mode=True,
+                        plaid_mode_buffers=plaid_buffers,
+                    )
+        if args.test_https and not args.local_only:
             deserialize_test(
                 source=https_uri, buffer_size=buffer_size, lazy_load=False
             )
@@ -641,7 +649,7 @@ for buffer_size in buffer_sizes:
                         plaid_mode=True,
                         plaid_mode_buffers=plaid_buffers,
                     )
-        if args.test_s3:
+        if args.test_s3 and not args.local_only:
             deserialize_test(
                 source=s3_uri,
                 buffer_size=buffer_size,
