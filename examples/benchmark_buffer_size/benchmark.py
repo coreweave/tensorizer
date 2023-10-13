@@ -107,6 +107,9 @@ parser.add_argument(
 parser.add_argument(
     "--file-prefix", default="", help="Prefix for file names, can include path"
 )
+parser.add_argument(
+    "--convert-json", default="", help="Convert JSON to human readable"
+)
 args = parser.parse_args()
 
 model_name: str = args.model
@@ -138,9 +141,9 @@ cpu_arch = platform.processor()
 # Read CPU name from /proc/cpuinfo
 try:
     with open("/proc/cpuinfo") as f:
-        for line in f:
-            if line.startswith("model name"):
-                cpu_name = line.split(":")[1].strip()
+        for cpu_line in f:
+            if cpu_line.startswith("model name"):
+                cpu_name = cpu_line.split(":")[1].strip()
                 break
 except FileNotFoundError:
     cpu_name = platform.machine()
@@ -181,6 +184,11 @@ def log(
     duration: float,
     raw_read: bool,
     source: str,
+    nodename: str = nodename,
+    cpu_name: str = cpu_name,
+    cpu_arch: str = cpu_arch,
+    gpu_name: str = gpu_name,
+    gpu_gb: int = gpu_gb,
     force_http: Optional[bool] = None,
     lazy_load: Optional[bool] = None,
     plaid_mode: Optional[bool] = None,
@@ -222,6 +230,11 @@ def log(
         if not plaid_mode:
             plaid_mode_buffers = None
         log_json(
+            nodename=nodename,
+            cpu_name=cpu_name,
+            cpu_arch=cpu_arch,
+            gpu_name=gpu_name,
+            gpu_gb=gpu_gb,
             scheme=scheme,
             duration=duration,
             total_bytes_read=total_sz,
@@ -284,6 +297,31 @@ def log_json(
         **kwargs,
     }
     print(json.dumps(jsonl))
+
+
+def json_to_human(path: str):
+    with open(path) as f:
+        for line in f:
+            jsonl = json.loads(line)
+            log(
+                jsonl["total_bytes_read"],
+                jsonl["duration"],
+                jsonl["raw_read"],
+                jsonl["source"],
+                nodename=jsonl["nodename"],
+                cpu_name=jsonl["cpu_name"],
+                cpu_arch=jsonl["cpu_arch"],
+                gpu_name=jsonl["gpu_name"],
+                gpu_gb=jsonl["gpu_gb"],
+                force_http=jsonl.get("force_http", None),
+                lazy_load=jsonl.get("lazy_load", None),
+                plaid_mode=jsonl.get("plaid_mode", None),
+                plaid_mode_buffers=jsonl.get("plaid_buffers", None),
+                verify_hash=jsonl.get("verify_hash", None),
+                response_headers=jsonl.get("response_headers", {}),
+                read_size=jsonl.get("read_size", None),
+                buffer_size=jsonl.get("buffer_size", None),
+            )
 
 
 def io_test(
@@ -532,6 +570,10 @@ def io_test_redis(buffer_size=256 * kibibyte):
     redis_tcp.close()
     log(total_sz, end - start, True, redis_uri, buffer_size=buffer_size)
 
+
+if args.convert_json:
+    json_to_human(args.convert_json)
+    exit(0)
 
 prep_local()
 
