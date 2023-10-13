@@ -119,6 +119,7 @@ https_uri = http_uri.replace("http://", "https://")
 s3_uri = f"s3://tensorized/{model_name}/model.tensors"
 sanitized_model_file = model_name.replace("/", "_")
 file_uri = f"{args.file_prefix}{sanitized_model_file}.tensors"
+local_uri = f"http://localhost:3000/{sanitized_model_file}.tensors"
 
 # Get nodename from environment, or default to os.uname().nodename
 nodename = os.getenv("K8S_NODE_NAME") or os.uname().nodename
@@ -195,6 +196,8 @@ def log(
             scheme = "torch"
         else:
             scheme = "file"
+    if scheme == "http" and "localhost" in source:
+        scheme = "local"
     if scheme == "s3" and not force_http:
         scheme = "s3s"
         source = source.replace("s3://", "s3s://")
@@ -403,7 +406,7 @@ def prep_local():
     rate = bytes_read / (end - start)
     if not args.json:
         logging.info(
-            f"{nodename} -- local: Serialized"
+            f"{nodename} -- file: Serialized"
             f" {bytes_read / gibibyte:0.2f} GiB at"
             f" {rate / mebibyte:0.2f} MiB/s in {end - start:0.2f}s"
         )
@@ -535,6 +538,9 @@ prep_local()
 for buffer_size in buffer_sizes:
     for sample in range(args.iterations):
         bench_torch()
+        io_test(buffer_size=buffer_size)
+        io_test(source=local_uri, buffer_size=buffer_size)
+        io_test_redis(buffer_size=buffer_size)
         deserialize_test(file_uri, buffer_size=buffer_size, lazy_load=False)
         deserialize_test(file_uri, buffer_size=buffer_size, lazy_load=True)
         if has_gpu:
@@ -545,13 +551,26 @@ for buffer_size in buffer_sizes:
                     plaid_mode=True,
                     plaid_mode_buffers=plaid_buffers,
                 )
-        io_test(buffer_size=buffer_size)
-        io_test_redis(buffer_size=buffer_size)
+
         bench_redis(buffer_size=buffer_size, lazy_load=False)
         bench_redis(buffer_size=buffer_size, lazy_load=True)
         if has_gpu:
             for plaid_buffers in plaid_sizes:
                 bench_redis(
+                    buffer_size=buffer_size,
+                    plaid_mode=True,
+                    plaid_mode_buffers=plaid_buffers,
+                )
+        deserialize_test(
+            source=local_uri, buffer_size=buffer_size, lazy_load=False
+        )
+        deserialize_test(
+            source=local_uri, buffer_size=buffer_size, lazy_load=True
+        )
+        if has_gpu:
+            for plaid_buffers in plaid_sizes:
+                deserialize_test(
+                    source=local_uri,
                     buffer_size=buffer_size,
                     plaid_mode=True,
                     plaid_mode_buffers=plaid_buffers,

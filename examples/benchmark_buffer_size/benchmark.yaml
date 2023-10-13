@@ -29,7 +29,7 @@ spec:
           image: ghcr.io/coreweave/tensorizer:benchmark-ba406fb
           imagePullPolicy: IfNotPresent
           command: [ "/bin/bash" ]
-          args: [ "-c", "redis-server --daemonize yes >/dev/null & python /app/benchmark.py --json" ]
+          args: [ "-c", "redis-server --daemonize yes >/dev/null & lighttpd -f /app/lighttpd.conf & python /app/benchmark.py --json" ]
           #--redis redis://redis-master:6379" ]
           resources:
             requests:
