@@ -91,7 +91,7 @@ def get_max_pipe_size():
     return pipe_buf_sz
 
 
-if sys.platform != "win32":
+if sys.platform != "win32" and sys.platform != "darwin":
     # Linux uses fcntl to resize an existing pipe.
     import fcntl
 
@@ -104,7 +104,7 @@ if sys.platform != "win32":
                 f"Couldn't fcntl F_SETPIPE_SZ to {pipe_buf_sz}: {e.strerror}"
             )
 
-else:
+elif sys.platform == "win32":
     # Windows cannot change the size of a pipe after creation,
     # but it can set one's size during creation, so a context manager
     # is used to temporarily modify the creation of all pipes.

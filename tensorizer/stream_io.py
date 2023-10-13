@@ -441,7 +441,7 @@ def _parse_redis_uri(uri):
 if sys.platform == "darwin":
     _MAX_TCP_BUFFER_SIZE = 1 << 20  # 1 MiB if OSX
 else:
-    _MAX_TCP_BUFFER_SIZE = 8 << 20  # 8 MiB
+    _MAX_TCP_BUFFER_SIZE = 16 << 20  # 16 MiB
 
 
 class RedisStreamFile:
@@ -1181,7 +1181,11 @@ def open_stream(
                 'Only binary modes ("rb", "wb", "wb+", etc.)'
                 " are valid when opening local file streams."
             )
-        os.makedirs(os.path.dirname(path_uri), exist_ok=True)
-        handle: typing.BinaryIO = open(path_uri, mode)
+        dirname = os.path.dirname(path_uri)
+        if dirname:
+            os.makedirs(os.path.dirname(path_uri), exist_ok=True)
+        if buffer_size is None:
+            buffer_size = io.DEFAULT_BUFFER_SIZE
+        handle: typing.BinaryIO = open(path_uri, mode, buffering=buffer_size)
         handle.seek(0)
         return handle
