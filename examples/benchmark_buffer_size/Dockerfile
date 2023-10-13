@@ -10,6 +10,4 @@ COPY requirements.txt /app/tensorizer
 RUN pip3 install -r /app/tensorizer/requirements.txt
 ADD examples/benchmark_buffer_size/lighttpd.conf /app/lighttpd.conf
 ADD examples/benchmark_buffer_size/benchmark.py /app/benchmark.py
-CMD ["/bin/bash",
-     "-c",
-     "redis-server --daemonize yes >/dev/null & lighttpd -f /app/lighttpd.conf & python /app/benchmark.py" ]
+CMD ["/bin/bash", "-c", "redis-server --daemonize yes >/dev/null & lighttpd -f /app/lighttpd.conf & python /app/benchmark.py" ]
