@@ -2137,12 +2137,21 @@ class TensorSerializer:
         self._file.write(struct.pack("<Q", metadata_size))
         self._metadata_loc = self._file.tell()
         self._file.write(bytes(metadata_size))
+        self._flush()
         self._metadata_cur = self._metadata_loc
         self._metadata_end = self._metadata_loc + metadata_size
 
     @property
     def total_tensor_bytes(self):
         return self._file_header.tensor_size
+
+    def _flush(self):
+        if hasattr(self._file, "flush"):
+            # Don't keep anything in the buffered I/O object's write buffer,
+            # because os.pwrite calls won't update it, and an os.pwrite
+            # followed by an outdated buffer flush may overwrite good data
+            # with blank bytes
+            self._file.flush()
 
     def _sync_prologue_state(self):
         """
@@ -2167,6 +2176,7 @@ class TensorSerializer:
         # Reset our file pointer to the end of the file,
         # minus the zero-length field.
         self._file.seek(curr)
+        self._flush()
 
     def _pwrite(self, data, offset: int, verify: bool = True) -> int:
         """
