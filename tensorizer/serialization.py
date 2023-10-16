@@ -1589,7 +1589,9 @@ class TensorDeserializer(
         else:
             countdown_cycle = itertools.cycle((None,))
 
-        class Cancelled(Exception):
+        class Cancelled(BaseException):
+            # Derive from BaseException to avoid being caught by any
+            # generic "except Exception" clauses; these need to force an exit
             pass
 
         def cancel_thread(thread: threading.Thread):
@@ -1633,9 +1635,12 @@ class TensorDeserializer(
                                 countdown.trigger()
                     if stream is not None:
                         stream.synchronize()
-            except Exception:
+            except (Cancelled, Exception) as e:
                 transfer_out_queue.put_nowait(sentinel)
-                raise
+                if not isinstance(e, Cancelled):
+                    # Don't print error tracebacks for Cancelled exceptions
+                    # since those are just side effects of other exceptions
+                    raise
             finally:
                 if countdown is not None:
                     countdown.cancel()
@@ -1733,9 +1738,12 @@ class TensorDeserializer(
                         if computation_threads is not None:
                             check_hashes(name, tensor, countdown)
                         transfer_in_queue.put_nowait((tensor, countdown))
-            except Exception:
+            except (Cancelled, Exception) as e:
                 transfer_out_queue.put_nowait(sentinel)
-                raise
+                if not isinstance(e, Cancelled):
+                    # Don't print error tracebacks for Cancelled exceptions
+                    # since those are just side effects of other exceptions
+                    raise
 
         transfer_thread = threading.Thread(
             target=transfer, name="TensorizerTransfer", daemon=True
@@ -1771,11 +1779,18 @@ class TensorDeserializer(
                     computation_threads.shutdown(wait=False)
                 if transfer_thread.is_alive():
                     transfer_in_queue.put_nowait((sentinel, None))
-                    cancel_thread(transfer_thread)
-                    transfer_thread.join(timeout=3600)
+                    # A graceful exit is preferred if it can happen
+                    # in a reasonable amount of time
+                    transfer_thread.join(timeout=4)
+                    if transfer_thread.is_alive():
+                        cancel_thread(transfer_thread)
+                        transfer_thread.join(timeout=3600)
                 if read_thread.is_alive():
-                    cancel_thread(read_thread)
-                    read_thread.join(timeout=3600)
+                    # A graceful exit is again preferred, but not necessary
+                    read_thread.join(timeout=2)
+                    if read_thread.is_alive():
+                        cancel_thread(read_thread)
+                        read_thread.join(timeout=3600)
                 for check in checks:
                     check.cancel()
                 raise
