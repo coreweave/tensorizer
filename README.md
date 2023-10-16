@@ -41,6 +41,17 @@ for model deployment due to the lack of distributed caching. It is intended
 for sharing state between inference pods, or for loading data on a per-request
 basis from a Redis cache.
 
+## Speed
+
+`tensorizer`'s deserialization speed is primarily network-bound.
+
+The following graph presents data collected from the scripts and Kubernetes
+manifests in [examples/benchmark_buffer_size](examples/benchmark_buffer_size)
+comparing the various deserialization modes available in `tensorizer` release
+2.5.0—along with the raw network speed, and the speed of `torch.load()`.
+
+![A letter-value plot comparing 7 deserialization modes and their respective deserialization speeds with a granularity of 0.125 GiB/sec. For local files, "torch.load()" has a median speed between 1.875 and 2.000 GiB/sec; "tensorizer file" has a median of 2.250; "tensorizer file, plaid_mode" has a median of about 3.750; "tensorizer file, lazy_load" has a median between 1.750 and 1.875. The raw network speed is also listed on the chart with a median between 1.250 and 1.375. For HTTP streaming, "tensorizer http" has a median between 0.875 and 1.000; "tensorizer http, plaid_mode" has a median between 1.000 and 1.125; and "tensorizer http, lazy_load" has a median between 0.875 and 1.000.](https://github.com/coreweave/tensorizer/assets/24918963/2bc1ba95-e62e-4ef1-9b3e-324759fcd22d)
+
 ## Installation
 
 ### From PyPI

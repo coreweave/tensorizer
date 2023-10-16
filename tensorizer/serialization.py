@@ -45,6 +45,7 @@ import torch
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 from tensorizer._NumpyTensor import _NumpyTensor
+from tensorizer.stream_io import CURLStreamFile
 
 if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
@@ -627,6 +628,9 @@ class TensorDeserializer(
             buffers are going to be inconsistent due to the extreme
             naughtiness of reusing a backing buffer. This is only recommended
             for use with inference, and not training.
+        plaid_mode_buffers: The number of buffers to use in plaid mode. This
+            is only used if ``plaid_mode=True``. These buffers are used to
+            pipeline the loading and processing of tensors.
         verify_hash: If True, the hashes of each tensor will be verified
             against the hashes stored in the metadata. A `HashMismatchError`
             will be raised if any of the hashes do not match.
@@ -690,6 +694,7 @@ class TensorDeserializer(
         *,
         lazy_load: bool = False,
         plaid_mode: bool = False,
+        plaid_mode_buffers: Optional[int] = None,
         verify_hash: bool = False,
     ):
         # Whether to verify the hashes of the tensors when they are loaded.
@@ -781,7 +786,18 @@ class TensorDeserializer(
                 for name, entry in self._metadata.items()
             }
             self.total_tensor_bytes = sum(tensor_sizes.values())
-            self._plaid_mode_buffer_count = 4
+            if not self._plaid_mode and plaid_mode_buffers is not None:
+                raise ValueError(
+                    "Cannot specify plaid_mode_buffers when plaid_mode=False"
+                )
+            if plaid_mode_buffers is not None:
+                self._plaid_mode_buffer_count = plaid_mode_buffers
+            elif self._verify_hash:
+                self._plaid_mode_buffer_count = 8
+            elif isinstance(self._file, CURLStreamFile):
+                self._plaid_mode_buffer_count = 1
+            else:
+                self._plaid_mode_buffer_count = 2
             single_largest_tensor = max(tensor_sizes.values())
             # Round up to the nearest multiple of the page size
             # Just so that more reads happen on page boundaries
@@ -2236,7 +2252,7 @@ class TensorSerializer:
         final_sz = self._file.tell()
         self._file.close()
         self._shutdown_thread_pools()
-        logger.info(f"Tensors completed serializing to {final_sz} bytes")
+        logger.debug(f"Tensors completed serializing to {final_sz} bytes")
         # if self.compress_tensors:
         #     compression_ratio = (
         #         self.total_tensor_bytes / self.total_compressed_tensor_bytes
@@ -2434,7 +2450,7 @@ class TensorSerializer:
         #     )
         # else:
         comp_report = ""
-        logger.info(
+        logger.debug(
             f"{idx}:{typ}:{name} - {dtype_bytes.decode('utf-8')} - "
             f"{tensor.shape} -> {ds_bytes}{comp_report}"
         )
