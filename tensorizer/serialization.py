@@ -2137,12 +2137,21 @@ class TensorSerializer:
         self._file.write(struct.pack("<Q", metadata_size))
         self._metadata_loc = self._file.tell()
         self._file.write(bytes(metadata_size))
+        self._flush()
         self._metadata_cur = self._metadata_loc
         self._metadata_end = self._metadata_loc + metadata_size
 
     @property
     def total_tensor_bytes(self):
         return self._file_header.tensor_size
+
+    def _flush(self):
+        if hasattr(self._file, "flush"):
+            # Don't keep anything in the buffered I/O object's write buffer,
+            # because os.pwrite calls won't update it, and an os.pwrite
+            # followed by an outdated buffer flush may overwrite good data
+            # with blank bytes
+            self._file.flush()
 
     def _sync_prologue_state(self):
         """
@@ -2167,6 +2176,7 @@ class TensorSerializer:
         # Reset our file pointer to the end of the file,
         # minus the zero-length field.
         self._file.seek(curr)
+        self._flush()
 
     def _pwrite(self, data, offset: int, verify: bool = True) -> int:
         """
@@ -2530,6 +2540,65 @@ class TensorSerializer:
             _interrupt_transfer,
         )
 
+    class _WriteSpec(typing.NamedTuple):
+        idx: int
+        name: str
+        tensor_type: TensorType
+        tensor: torch.Tensor
+        callback: Optional[Callable]
+
+    def _bulk_write(self, tensors: Iterable[_WriteSpec]):
+        tensors = collections.deque(tensors)
+        next_pos = self._file.tell()
+
+        fallocate = getattr(os, "posix_fallocate", None)
+        if fallocate and self._fd:
+            size = sum(len(t.name) for t in tensors)
+            size += sum(t.tensor.untyped_storage().size() for t in tensors)
+            # Rough underestimate of header size
+            header_min_size = 24
+            size += header_min_size * len(tensors)
+            try:
+                fallocate(self._fd, next_pos, size)
+            except OSError:
+                pass
+
+        cuda_tensors = [
+            t.tensor for t in tensors if t.tensor.device.type == "cuda"
+        ]
+        if cuda_tensors:
+            (
+                transferred,
+                interrupt_transfer,
+            ) = self._async_bulk_device_to_host_transfer(cuda_tensors)
+        else:
+            transferred = interrupt_transfer = None
+        del cuda_tensors
+
+        try:
+            while tensors:
+                idx, name, tensor_type, tensor, callback = tensors.popleft()
+                if tensor.device.type == "cuda":
+                    tensor = next(transferred)
+                next_pos = self._write_tensor(
+                    self._idx,
+                    name,
+                    tensor_type,
+                    tensor,
+                    _synchronize=False,
+                    _start_pos=next_pos,
+                )
+                if callback is not None:
+                    callback()
+                self._idx = idx
+        except Exception:
+            if interrupt_transfer is not None:
+                interrupt_transfer()
+            raise
+        self._synchronize_pools()
+        self._file.seek(next_pos)
+        self._sync_prologue_state()
+
     def write_module(
         self, m: torch.nn.Module, remove_tensors: bool = False
     ) -> None:
@@ -2549,70 +2618,30 @@ class TensorSerializer:
                 after serializing it.
                 Deleted tensors are replaced with ``None``.
         """
-        tensors: List[torch.Tensor] = []
-        size = 0
-        chain = itertools.chain
-        repeat = itertools.repeat
-        for module_name, module in m.named_modules():
-            parameters = module.named_parameters(recurse=False)
-            buffers = module.named_buffers(recurse=False)
-            for name, tensor in chain(parameters, buffers):
-                tensors.append(tensor)
-                size += len(module_name) + 1 + len(name)
 
-        next_pos = self._file.tell()
-
-        fallocate = getattr(os, "posix_fallocate", None)
-        if fallocate and self._fd:
-            size += sum(t.untyped_storage().size() for t in tensors)
-            # Rough underestimate of header size
-            header_min_size = 24
-            size += header_min_size * len(tensors)
-            try:
-                fallocate(self._fd, next_pos, size)
-            except OSError:
-                pass
-
-        cuda_tensors = [t for t in tensors if t.device.type == "cuda"]
-        if cuda_tensors:
-            (
-                transferred,
-                interrupt_transfer,
-            ) = self._async_bulk_device_to_host_transfer(cuda_tensors)
-        else:
-            transferred = interrupt_transfer = None
-        tensors.clear()
-
-        try:
-            for module_name, module in m.named_modules():
+        def extract_tensors():
+            chain = itertools.chain
+            repeat = itertools.repeat
+            callback = None
+            for idx, (module_name, module) in enumerate(m.named_modules()):
                 parameters = module.named_parameters(recurse=False)
                 buffers = module.named_buffers(recurse=False)
-
                 for (name, tensor), tensor_type in chain(
                     zip(parameters, repeat(TensorType.PARAM)),
                     zip(buffers, repeat(TensorType.BUFFER)),
                 ):
                     label = f"{module_name}.{name}"
-                    if tensor.device.type == "cuda":
-                        tensor = next(transferred)
-                    next_pos = self._write_tensor(
-                        self._idx,
-                        label,
-                        tensor_type,
-                        tensor,
-                        _synchronize=False,
-                        _start_pos=next_pos,
-                    )
                     if remove_tensors:
-                        setattr(module, name, None)
-                self._idx += 1
-        except Exception:
-            if interrupt_transfer is not None:
-                interrupt_transfer()
-            raise
-        self._synchronize_pools()
-        self._file.seek(next_pos)
-        self._sync_prologue_state()
+                        callback = partial(setattr, module, name, None)
+                    yield TensorSerializer._WriteSpec(
+                        idx=idx,
+                        name=label,
+                        tensor_type=tensor_type,
+                        tensor=tensor,
+                        callback=callback,
+                    )
+
+        self._bulk_write(extract_tensors())
 
     def write_state_dict(self, state_dict: Dict):
         """
@@ -2624,5 +2653,13 @@ class TensorSerializer:
         TensorDeserializer.load_into_module.
         """
         idx = 0
-        for name, param in state_dict.items():
-            self.write_tensor(idx, name, TensorType.STATE_DICT, param)
+        self._bulk_write(
+            TensorSerializer._WriteSpec(
+                idx=idx,
+                name=name,
+                tensor_type=TensorType.STATE_DICT,
+                tensor=param,
+                callback=None,
+            )
+            for name, param in state_dict.items()
+        )

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `TensorSerializer.write_state_dict` has been optimized to better match the
+  speed of `TensorSerializer.write_module`
+- Improved error tracebacks reported during bulk tensor deserialization
+
+### Fixed
+
+- Serializing to a buffered file-like object with a large buffer size
+  no longer sometimes corrupts the resulting serialized file
+
 ## [2.5.0] - 2023-10-13
 
 ### Added
@@ -19,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - 2 for other streams (e.g. local files, Redis)
     - 8 when `verify_hash=True`
 - `TensorDeserializer` objects can now be used as context managers to safely
-  call `TensorDeserializer.close()` when they are done being used
+  call `TensorDeserializer.close` when they are done being used
 
 ### Changed
 
@@ -177,6 +190,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.5.0...HEAD
 [2.5.0]: https://github.com/coreweave/tensorizer/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/coreweave/tensorizer/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/coreweave/tensorizer/compare/v2.2.0...v2.3.0

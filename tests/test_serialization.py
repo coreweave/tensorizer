@@ -1,8 +1,10 @@
 import contextlib
 import ctypes
+import enum
 import functools
 import gc
 import hashlib
+import itertools
 import os
 import re
 import secrets
@@ -38,14 +40,28 @@ salt = secrets.token_bytes(4)
 default_read_endpoint = "object.ord1.coreweave.com"
 
 
-def serialize_model(model_name: str, device: str) -> Tuple[str, dict]:
+class SerializeMethod(enum.Enum):
+    Module = 1
+    StateDict = 2
+
+
+def serialize_model(
+    model_name: str,
+    device: str,
+    method: SerializeMethod = SerializeMethod.Module,
+) -> Tuple[str, dict]:
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     sd = model.state_dict()
     out_file = tempfile.NamedTemporaryFile("wb+", delete=False)
     try:
         start_time = time.monotonic()
         serializer = TensorSerializer(out_file)
-        serializer.write_module(model)
+        if method is SerializeMethod.Module:
+            serializer.write_module(model)
+        elif method is SerializeMethod.StateDict:
+            serializer.write_state_dict(sd)
+        else:
+            raise ValueError("Invalid serialization method")
         serializer.close()
         end_time = time.monotonic()
         print(f"Serialization took {end_time - start_time:.3f} seconds")
@@ -74,12 +90,15 @@ class TensorInfo(NamedTuple):
 
 
 @functools.lru_cache(maxsize=None)
-def model_digest(model_name: str) -> Mapping[str, TensorInfo]:
+def model_digest(
+    model_name: str, include_non_persistent_buffers: bool = True
+) -> Mapping[str, TensorInfo]:
     orig_model = AutoModelForCausalLM.from_pretrained(model_name)
     orig_sd = orig_model.state_dict()
     # Non-persistent buffers are serialized in tensorizer,
     # but aren't included in a state_dict() in PyTorch.
-    orig_sd.update(orig_model.named_buffers())
+    if include_non_persistent_buffers:
+        orig_sd.update(orig_model.named_buffers())
     return {k: TensorInfo.from_tensor(v) for k, v in orig_sd.items()}
 
 
@@ -88,8 +107,9 @@ def check_deserialized(
     deserialized: TensorDeserializer,
     model_name: str,
     allow_subset: bool = False,
+    include_non_persistent_buffers: bool = True,
 ):
-    orig_sd = model_digest(model_name)
+    orig_sd = model_digest(model_name, include_non_persistent_buffers)
 
     if not allow_subset:
         test_case.assertEqual(
@@ -173,21 +193,36 @@ def check_inference(
 
 class TestSerialization(unittest.TestCase):
     def test_serialization(self):
-        for device in "cuda", "cpu":
+        for device, method in itertools.product(
+            ("cuda", "cpu"),
+            (SerializeMethod.Module, SerializeMethod.StateDict),
+        ):
             if device == "cuda" and not is_cuda_available:
                 continue
-            with self.subTest(msg=f"Serializing with device {device}"):
+            include_non_persistent_buffers = method is SerializeMethod.Module
+            with self.subTest(
+                msg=f"Serializing with device {device} and method {method.name}"
+            ):
                 gc.collect()
                 before_serialization = utils.get_mem_usage()
                 print(f"\nBefore serialization: {before_serialization}")
-                serialized_model, orig_sd = serialize_model(model_name, device)
+                serialized_model, orig_sd = serialize_model(
+                    model_name, device, method
+                )
                 after_serialization = utils.get_mem_usage()
                 print(f"After serialization:  {after_serialization}")
                 del orig_sd
                 try:
                     with open(serialized_model, "rb") as in_file:
                         deserialized = TensorDeserializer(in_file, device="cpu")
-                        check_deserialized(self, deserialized, model_name)
+                        check_deserialized(
+                            self,
+                            deserialized,
+                            model_name,
+                            include_non_persistent_buffers=(
+                                include_non_persistent_buffers
+                            ),
+                        )
                         deserialized.close()
                         del deserialized
                 finally:
