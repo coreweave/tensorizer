@@ -251,6 +251,52 @@ class TestSerialization(unittest.TestCase):
 
         self.assertTrue(torch.equal(tensor, deserialized_tensor))
 
+    def test_persistent_buffers(self):
+        shape = (50, 50)
+        persistent_buffer = torch.normal(0, 0.5, shape)
+        non_persistent_buffer = torch.normal(0, 0.5, shape)
+        nested_module = torch.nn.Module()
+        nested_module.register_buffer(
+            "persistent_buffer", persistent_buffer, persistent=True
+        )
+        nested_module.register_buffer(
+            "non_persistent_buffer",
+            non_persistent_buffer,
+            persistent=False,
+        )
+        module = torch.nn.Module()
+        module.register_module("nested", nested_module)
+        model = torch.nn.Module()
+        model.register_module("module", module)
+
+        for include in (True, False):
+            with self.subTest(
+                msg=f"Testing include_non_persistent_buffers={include}"
+            ):
+                tensorized_file = tempfile.NamedTemporaryFile(
+                    "wb+", delete=False
+                )
+                try:
+                    serializer = TensorSerializer(tensorized_file)
+                    serializer.write_module(
+                        model, include_non_persistent_buffers=include
+                    )
+                    serializer.close()
+
+                    with open(tensorized_file.name, "rb") as in_file:
+                        with TensorDeserializer(
+                            in_file, device="cpu", lazy_load=True
+                        ) as deserializer:
+                            assertion = (
+                                self.assertIn if include else self.assertNotIn
+                            )
+                            assertion(
+                                "module.nested.non_persistent_buffer",
+                                deserializer.keys(),
+                            )
+                finally:
+                    os.unlink(tensorized_file.name)
+
 
 class TestDeserialization(unittest.TestCase):
     _serialized_model_path: str

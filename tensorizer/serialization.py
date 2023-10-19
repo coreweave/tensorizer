@@ -34,6 +34,7 @@ from typing import (
     List,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
 )
@@ -767,6 +768,8 @@ class TensorDeserializer(
             self._metadata, self._metadata_raw = _MetadataDeserializer.from_io(
                 self._file, self._file_header.tensor_count
             )
+            if not self._metadata:
+                raise ValueError("Tensor index in the file is empty")
             # filter_func is a test that determines the tensor names to read.
             # If filter_func is None, all tensors are read.
             if filter_func is not None:
@@ -798,7 +801,7 @@ class TensorDeserializer(
                 self._plaid_mode_buffer_count = 1
             else:
                 self._plaid_mode_buffer_count = 2
-            single_largest_tensor = max(tensor_sizes.values())
+            single_largest_tensor = max(tensor_sizes.values(), default=0)
             # Round up to the nearest multiple of the page size
             # Just so that more reads happen on page boundaries
             single_largest_tensor -= single_largest_tensor % -mmap.PAGESIZE
@@ -2600,7 +2603,11 @@ class TensorSerializer:
         self._sync_prologue_state()
 
     def write_module(
-        self, m: torch.nn.Module, remove_tensors: bool = False
+        self,
+        m: torch.nn.Module,
+        remove_tensors: bool = False,
+        *,
+        include_non_persistent_buffers: bool = True,
     ) -> None:
         """
         Serializes an entire ``torch.nn.Module`` instance at once,
@@ -2617,13 +2624,22 @@ class TensorSerializer:
             remove_tensors: Whether to delete each tensor from `m`
                 after serializing it.
                 Deleted tensors are replaced with ``None``.
+            include_non_persistent_buffers: Whether to serialize buffers
+                registered with ``persistent=False``.
+                Set to ``False`` to match the behaviour of
+                ``torch.nn.Module.state_dict()``,
+                which saves only persistent buffers.
+                The default may change to ``False`` in a later version.
         """
+
+        modules = tuple(m.named_modules())
 
         def extract_tensors():
             chain = itertools.chain
             repeat = itertools.repeat
             callback = None
-            for idx, (module_name, module) in enumerate(m.named_modules()):
+            for idx, (module_name, module) in enumerate(modules):
+                module: torch.nn.Module
                 parameters = module.named_parameters(recurse=False)
                 buffers = module.named_buffers(recurse=False)
                 for (name, tensor), tensor_type in chain(
@@ -2641,7 +2657,44 @@ class TensorSerializer:
                         callback=callback,
                     )
 
-        self._bulk_write(extract_tensors())
+        def persistent_buffers() -> Set[str]:
+            persistent_buffers_set: Set[str] = {
+                name
+                for name, _ in m.named_buffers(
+                    recurse=True, remove_duplicate=False
+                )
+            }
+            if hasattr(m, "_non_persistent_buffers_set"):
+                # Direct access to the _non_persistent_buffers_set attribute
+                # is an order of magnitude faster than generating
+                # a state_dict, but this is a private interface, and thus
+                # not guaranteed to remain stable between torch versions
+
+                for module_name, module in modules:
+                    # noinspection PyProtectedMember
+                    persistent_buffers_set.difference_update(
+                        f"{module_name}.{name}"
+                        for name in module._non_persistent_buffers_set
+                    )
+            else:
+                # Filtering down to only the buffers that appear
+                # in the state_dict() representation is the supported way
+                # to access the persistent buffer list, but is much slower
+                persistent_buffers_set.intersection_update(
+                    m.state_dict().keys()
+                )
+
+            return persistent_buffers_set
+
+        all_tensors = extract_tensors()
+
+        if not include_non_persistent_buffers:
+            persistent = persistent_buffers()
+            all_tensors = (
+                spec for spec in all_tensors if spec.name in persistent
+            )
+
+        self._bulk_write(all_tensors)
 
     def write_state_dict(self, state_dict: Dict):
         """
