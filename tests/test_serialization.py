@@ -287,6 +287,10 @@ class TestSerialization(unittest.TestCase):
                         with TensorDeserializer(
                             in_file, device="cpu", lazy_load=True
                         ) as deserializer:
+                            self.assertIn(
+                                "module.nested.persistent_buffer",
+                                deserializer.keys(),
+                            )
                             assertion = (
                                 self.assertIn if include else self.assertNotIn
                             )
