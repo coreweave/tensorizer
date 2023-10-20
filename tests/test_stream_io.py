@@ -370,3 +370,23 @@ class TestS3(unittest.TestCase):
                 s3_endpoint=endpoint,
             ) as s:
                 self.assertEqual(s.read(), long_string)
+
+    @patch.object(stream_io, "_s3_default_config_paths", ())
+    def test_download_insecure(self):
+        # Same as TestS3.test_download but with an insecure CURLStreamFile.
+        # Doesn't do anything here since the mock endpoint is http anyway
+        # and _ensure_https_endpoint() is disabled.
+        with mock_server() as endpoint:
+            key = "model.tensors"
+            long_string = b"Hello" * 1024
+            self.put_bucket_contents(key, long_string)
+            self.assert_bucket_contents(key, long_string)
+            with stream_io.open_stream(
+                f"s3://{self.BUCKET_NAME}/{key}",
+                mode="rb",
+                s3_access_key_id="X",
+                s3_secret_access_key="X",
+                s3_endpoint=endpoint,
+                allow_insecure=True,
+            ) as s:
+                self.assertEqual(s.read(), long_string)

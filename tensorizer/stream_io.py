@@ -147,6 +147,7 @@ class CURLStreamFile:
         headers: Dict[str, Any] = None,
         *,
         buffer_size: Optional[int] = None,
+        allow_insecure: Optional[bool] = False,
     ) -> None:
         if buffer_size is None:
             buffer_size = 16 << 20  # 16mb
@@ -159,8 +160,13 @@ class CURLStreamFile:
                 " and could not be found."
             )
 
+        self._optional_curl_flags = []
+        if allow_insecure:
+            self._optional_curl_flags.append("-k")
+
         cmd = [
             curl_path,
+            *self._optional_curl_flags,
             "--header",
             "Accept-Encoding: identity",
             "--include",
@@ -267,6 +273,7 @@ class CURLStreamFile:
         """
         args = [
             curl_path,
+            *self._optional_curl_flags,
             "-I",  # Only read headers
             "-XGET",  # Use a GET request (in case HEAD is not supported)
             "-A",  # Set a custom user agent
@@ -836,6 +843,7 @@ def s3_download(
     s3_endpoint: str = default_s3_read_endpoint,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
+    allow_insecure: bool = False,
 ) -> CURLStreamFile:
     url = _s3_download_url(
         path_uri=path_uri,
@@ -845,7 +853,7 @@ def s3_download(
     )
     if force_http and url.lower().startswith("https://"):
         url = "http://" + url[8:]
-    return CURLStreamFile(url, buffer_size=buffer_size)
+    return CURLStreamFile(url, buffer_size=buffer_size, allow_insecure=allow_insecure)
 
 
 def _infer_credentials(
@@ -996,6 +1004,7 @@ def open_stream(
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
+    allow_insecure: bool = False,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
     Open a file path, http(s):// URL, or s3:// URI.
@@ -1037,6 +1046,9 @@ def open_stream(
         force_http: If True, force the use of HTTP instead of HTTPS for
             S3 downloads. This will double the throughput, but at the cost
             of security.
+        allow_insecure: If True, allow curl to use insecure transfer for
+            HTTPS downloads. This allows the use of self-signed certficates
+            with HTTPS links.
 
     Returns:
         An opened file-like object representing the target resource.
@@ -1170,6 +1182,7 @@ def open_stream(
                 s3_endpoint,
                 buffer_size=buffer_size,
                 force_http=force_http,
+                allow_insecure=allow_insecure,
             )
             if error_context:
                 curl_stream_file.register_error_context(error_context)
