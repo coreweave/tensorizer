@@ -208,8 +208,21 @@ class CURLStreamFile:
         self.http_response_latencies.append(resp_begin - popen_end)
 
         if not resp.startswith((b"HTTP/1.1 2", b"HTTP/2 2")):
+            # If the error was caused by an invalid response, display that
+            explanation = f": {resp.decode('utf-8')}" if resp.strip() else ""
+            if not explanation:
+                # Otherwise, check if cURL gave a meaningful exit code
+                return_code: Optional[int] = self._curl.poll()
+                print("Return code:", return_code)
+                if isinstance(return_code, int) and return_code != 0:
+                    explanation = (
+                        f": cURL exit code {return_code:d};"
+                        f" see https://curl.se/docs/manpage.html#{return_code}"
+                    )
+
             self.close()
-            raise IOError(f"Failed to open stream: {resp.decode('utf-8')}")
+            raise IOError("Failed to open stream" + explanation)
+
         # Read the rest of the header response and parse it.
         # noinspection PyTypeChecker
         self.response_headers = http.client.parse_headers(self._curl.stdout)
