@@ -387,6 +387,6 @@ class TestS3(unittest.TestCase):
                 s3_access_key_id="X",
                 s3_secret_access_key="X",
                 s3_endpoint=endpoint,
-                allow_insecure=True,
+                allow_untrusted_certificate=True,
             ) as s:
                 self.assertEqual(s.read(), long_string)
