@@ -5,6 +5,7 @@ import os
 import re
 import select
 import subprocess
+import tempfile
 import threading
 import typing
 import unittest
@@ -16,6 +17,7 @@ import boto3
 import moto
 import moto.server
 import redis
+import werkzeug.serving
 
 from tensorizer import stream_io
 
@@ -100,16 +102,21 @@ def _moto_app():
 
 
 @contextlib.contextmanager
+def mock_certs(cn="localhost"):
+    with tempfile.TemporaryDirectory(suffix="_tensorizer_test_certs") as path:
+        yield werkzeug.serving.make_ssl_devcert(
+            base_path=os.path.join(path, "cert"), cn=cn
+        )
+
+
+@contextlib.contextmanager
 def mock_server(
     host: str = "127.0.0.1",
     port: int = 5000,
-    ssl_context: typing.Optional[typing.Literal["adhoc"]] = None,
+    ssl_context: typing.Union[
+        None, typing.Tuple[str, str], typing.Literal["adhoc"]
+    ] = None,
 ) -> str:
-    import werkzeug.serving
-
-    if ssl_context not in (None, "adhoc"):
-        raise ValueError("Unsupported SSL context")
-
     # Disable mock server logs
     werkzeug_logger = logging.getLogger("werkzeug")
     old_log_level = werkzeug_logger.getEffectiveLevel()
@@ -394,8 +401,7 @@ class TestS3(unittest.TestCase):
                 self.assertEqual(s.read(), long_string)
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
-    def test_download_insecure(self):
-        # Same as TestS3.test_download but with an insecure CURLStreamFile
+    def test_download_certificate_handling(self):
         long_string = b"Hello" * 1024
         key = "model.tensors"
 
@@ -411,33 +417,70 @@ class TestS3(unittest.TestCase):
             s3_secret_access_key="X",
         )
 
+        allow_untrusted = stream_io.CAInfo(allow_untrusted=True)
+
         with mock_server(ssl_context="adhoc") as endpoint:
             _init_bucket()
 
-            with self.subTest(msg="Testing suppressed certificate validation"):
+            with self.subTest(
+                msg="Testing suppressed certificate verification"
+            ):
                 with stream_opener(
-                    s3_endpoint=endpoint, allow_untrusted_certificate=True
+                    s3_endpoint=endpoint, certificate_handling=allow_untrusted
                 ) as s:
                     self.assertEqual(s.read(), long_string)
 
-            with self.subTest(msg="Testing normal certificate validation"):
+            with self.subTest(msg="Testing normal certificate verification"):
                 with self.assertRaisesRegex(
                     IOError, "cURL exit code 60"
                 ), stream_opener(
                     s3_endpoint=endpoint,
-                    allow_untrusted_certificate=False,
+                    certificate_handling=None,
                 ):
                     pass
 
+        with mock_certs() as (cert_file, key_file):
+            custom_cacert = stream_io.CAInfo(cacert=cert_file)
+
+            with mock_server(
+                host="localhost", ssl_context=(cert_file, key_file)
+            ) as endpoint:
+                _init_bucket()
+
+                with self.subTest(
+                    msg="Testing custom CA cert with custom handling"
+                ):
+                    with stream_opener(
+                        s3_endpoint=endpoint, certificate_handling=custom_cacert
+                    ) as s:
+                        self.assertEqual(s.read(), long_string)
+
+                with self.subTest(
+                    msg="Testing custom CA cert with normal handling"
+                ):
+                    with self.assertRaisesRegex(
+                        IOError, "cURL exit code 60"
+                    ), stream_opener(
+                        s3_endpoint=endpoint,
+                        certificate_handling=None,
+                    ):
+                        pass
+
         with mock_server(ssl_context=None) as endpoint:
-            # This test checks that allow_untrusted_certificate has no effect on
+            # This test checks that custom certificate handling has no effect on
             # regular HTTP operation, which doesn't involve certificates
             _init_bucket()
 
             with self.subTest(
-                msg="Testing suppressed certificate validation with HTTP"
+                msg="Testing suppressed certificate verification with HTTP"
             ):
                 with stream_opener(
-                    s3_endpoint=endpoint, allow_untrusted_certificate=False
+                    s3_endpoint=endpoint, certificate_handling=allow_untrusted
+                ) as s:
+                    self.assertEqual(s.read(), long_string)
+
+            with self.subTest(msg="Testing custom CA cert with HTTP"):
+                with stream_opener(
+                    s3_endpoint=endpoint, certificate_handling=custom_cacert
                 ) as s:
                     self.assertEqual(s.read(), long_string)

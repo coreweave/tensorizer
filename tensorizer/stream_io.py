@@ -23,7 +23,7 @@ import redis
 import tensorizer._version as _version
 import tensorizer._wide_pipes as _wide_pipes
 
-__all__ = ["open_stream", "CURLStreamFile", "RedisStreamFile"]
+__all__ = ["open_stream", "CURLStreamFile", "RedisStreamFile", "CAInfo"]
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +117,75 @@ def _get_s3cfg_values(
     )
 
 
+class CAInfo:
+    """
+    Configuration class for cURL's SSL certificate verification behaviour.
+
+    See Also:
+        https://curl.se/docs/sslcerts.html
+    """
+
+    __slots__ = ("_curl_flags",)
+
+    def __init__(
+        self,
+        *,
+        cacert: Optional[str] = None,
+        capath: Optional[str] = None,
+        allow_untrusted: bool = False,
+    ):
+        """
+        Creates a configuration defining custom paths to use for SSL certificate
+        verification, or disables SSL certificate verification.
+
+        Exactly one of `cacert`, `capath`, or `allow_untrusted` must be
+        specified.
+        Use None instead of an instance of this class for cURL's default
+        certificate verification behaviour.
+
+        Args:
+            cacert: Path to a PEM file to use for certificates.
+                Corresponds to ``--cacert`` or ``CURLOPT_CAINFO`` in cURL.
+            capath: Path to a directory to scan for certificates.
+                Corresponds to ``--capath`` or ``CURLOPT_CAPATH`` in cURL.
+            allow_untrusted: Skip verification of SSL certificates entirely.
+                Corresponds to ``-k``/``--insecure``
+                or setting ``CURLOPT_SSL_VERIFYPEER`` to ``FALSE`` in cURL.
+        """
+        if (cacert, capath).count(None) + (not allow_untrusted) != 2:
+            raise ValueError(
+                "Exactly one of cacert, capath, or allow_untrusted=True"
+                " must be specified. For default certificate verification"
+                " behaviour, use certificate_handling=None instead of"
+                " an explicit CAInfo instance"
+            )
+        if cacert is not None:
+            if not os.path.isfile(cacert):
+                raise ValueError(
+                    "Invalid cacert file path, see"
+                    " https://curl.se/docs/manpage.html#--cacert"
+                )
+            self._curl_flags = ("--cacert", str(cacert))
+        elif capath is not None:
+            if not os.path.isdir(capath):
+                raise ValueError(
+                    "Invalid capath directory path, see"
+                    " https://curl.se/docs/manpage.html#--capath"
+                )
+            self._curl_flags = ("--capath", str(capath))
+        elif allow_untrusted:
+            self._curl_flags = ("--insecure",)
+        else:
+            raise RuntimeError()
+
+    @property
+    def curl_flags(self):
+        return self._curl_flags
+
+    def __hash__(self):
+        return hash(self._curl_flags)
+
+
 class CURLStreamFile:
     """
     CURLStreamFile implements a file-like object around an HTTP download, the
@@ -147,7 +216,7 @@ class CURLStreamFile:
         headers: Dict[str, Any] = None,
         *,
         buffer_size: Optional[int] = None,
-        allow_untrusted_certificate: bool = False,
+        certificate_handling: Optional[CAInfo] = None,
     ) -> None:
         if buffer_size is None:
             buffer_size = 16 << 20  # 16mb
@@ -161,8 +230,18 @@ class CURLStreamFile:
             )
 
         self._optional_curl_flags = []
-        if allow_untrusted_certificate:
-            self._optional_curl_flags.append("-k")
+        if certificate_handling is not None:
+            if isinstance(certificate_handling, CAInfo):
+                self._optional_curl_flags.extend(
+                    certificate_handling.curl_flags
+                )
+            else:
+                raise TypeError(
+                    "certificate_handling must either be None"
+                    " (for cURL's default SSL certificate verification),"
+                    " or a CAInfo object,"
+                    f" not {certificate_handling.__class__.__name__}"
+                )
 
         cmd = [
             curl_path,
@@ -856,7 +935,7 @@ def s3_download(
     s3_endpoint: str = default_s3_read_endpoint,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
-    allow_untrusted_certificate: bool = False,
+    certificate_handling: Optional[CAInfo] = None,
 ) -> CURLStreamFile:
     url = _s3_download_url(
         path_uri=path_uri,
@@ -869,7 +948,7 @@ def s3_download(
     return CURLStreamFile(
         url,
         buffer_size=buffer_size,
-        allow_untrusted_certificate=allow_untrusted_certificate,
+        certificate_handling=certificate_handling,
     )
 
 
@@ -1021,7 +1100,8 @@ def open_stream(
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
-    allow_untrusted_certificate: bool = False,
+    *,
+    certificate_handling: Optional[CAInfo] = None,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
     Open a file path, http(s):// URL, or s3:// URI.
@@ -1063,9 +1143,12 @@ def open_stream(
         force_http: If True, force the use of HTTP instead of HTTPS for
             S3 downloads. This will double the throughput, but at the cost
             of security.
-        allow_untrusted_certificate: If True, skip verification of SSL
-            certificates during HTTPS downloads.
-            This allows the use of self-signed certificates.
+        certificate_handling: Customize handling of SSL CA certificates for
+            HTTPS and S3 downloads.
+            Pass None to use default certificate verification, or an instance of
+            `tensorizer.stream_io.CAInfo` to use a different CA bundle
+            or to disable certificate verification entirely.
+            This option is useful when working with self-signed certificates.
 
     Returns:
         An opened file-like object representing the target resource.
@@ -1105,6 +1188,15 @@ def open_stream(
                 "https://raw.githubusercontent.com/EleutherAI/gpt-neo/master/README.md"
             ) as stream:
                 print(stream.read(128))
+
+        Opening an https:// URI for reading,
+        while skipping SSL certificate verification::
+
+            with open_stream(
+                "https://127.0.0.1/my-model.tensors",
+                certificate_handling=CAInfo(allow_untrusted=True),
+            ) as stream:
+                print(stream.read(128))
     """
     if isinstance(path_uri, os.PathLike):
         path_uri = os.fspath(path_uri)
@@ -1119,7 +1211,11 @@ def open_stream(
             raise ValueError(
                 'Only the mode "rb" is valid when opening http(s):// streams.'
             )
-        return CURLStreamFile(path_uri, buffer_size=buffer_size)
+        return CURLStreamFile(
+            path_uri,
+            buffer_size=buffer_size,
+            certificate_handling=certificate_handling,
+        )
     elif scheme == "redis":
         if normalized_mode != "br":
             raise ValueError(
@@ -1199,7 +1295,7 @@ def open_stream(
                 s3_endpoint,
                 buffer_size=buffer_size,
                 force_http=force_http,
-                allow_untrusted_certificate=allow_untrusted_certificate,
+                certificate_handling=certificate_handling,
             )
             if error_context:
                 curl_stream_file.register_error_context(error_context)
