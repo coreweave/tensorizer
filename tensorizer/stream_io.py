@@ -292,7 +292,6 @@ class CURLStreamFile:
             if not explanation:
                 # Otherwise, check if cURL gave a meaningful exit code
                 return_code: Optional[int] = self._curl.poll()
-                print("Return code:", return_code)
                 if isinstance(return_code, int) and return_code != 0:
                     explanation = (
                         f": cURL exit code {return_code:d};"
