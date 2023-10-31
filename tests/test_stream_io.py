@@ -417,6 +417,7 @@ class TestS3(unittest.TestCase):
             s3_secret_access_key="X",
         )
 
+        rejected_cert_regex = "Failed to open stream|cURL exit code 60"
         allow_untrusted = stream_io.CAInfo(allow_untrusted=True)
 
         with mock_server(ssl_context="adhoc") as endpoint:
@@ -432,7 +433,7 @@ class TestS3(unittest.TestCase):
 
             with self.subTest(msg="Testing normal certificate verification"):
                 with self.assertRaisesRegex(
-                    IOError, "cURL exit code 60"
+                    IOError, rejected_cert_regex
                 ), stream_opener(
                     s3_endpoint=endpoint,
                     certificate_handling=None,
@@ -459,7 +460,7 @@ class TestS3(unittest.TestCase):
                     msg="Testing custom CA cert with normal handling"
                 ):
                     with self.assertRaisesRegex(
-                        IOError, "cURL exit code 60"
+                        IOError, rejected_cert_regex
                     ), stream_opener(
                         s3_endpoint=endpoint,
                         certificate_handling=None,
