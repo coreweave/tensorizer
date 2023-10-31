@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     buffers
   - The default (`include_non_persistent_buffers=True`) matches the old
     behaviour
+- `stream_io.open_stream` and `stream_io.CURLStreamFile` now accept an
+  additional, optional `certificate_handling` argument to customize
+  the verification of SSL certificates
+  - This corresponds to the flags
+    [`--cacert`](https://curl.se/docs/manpage.html#--cacert),
+    [`--capath`](https://curl.se/docs/manpage.html#--capath), and
+    [`-k`/`--insecure`](https://curl.se/docs/manpage.html#-k) in `curl`
+  - Customization is achieved by passing an instance of `stream_io.CAInfo`
+    to `open_stream` or the `CURLStreamFile` constructor
+  - Example usages:
+    - `open_stream("https://localhost/model.tensors", certificate_handling=CAInfo(cacert="./localhost.pem")`
+    - `open_stream("https://127.0.0.1/model.tensors", certificate_handling=CAInfo(allow_untrusted=True)`
+  - Pass `certificate_handling=None` (the default) to use default certificate
+    verification as compiled into cURL
 
 ## [2.5.1] - 2023-10-17
 
