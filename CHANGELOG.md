@@ -30,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Customization is achieved by passing an instance of `stream_io.CAInfo`
     to `open_stream` or the `CURLStreamFile` constructor
   - Example usages:
-    - `open_stream("https://localhost/model.tensors`, certificate_handling=CAInfo(cacert="./localhost.pem")`
-    - `open_stream("https://127.0.0.1/model.tensors`, certificate_handling=CAInfo(allow_untrusted=True)`
+    - `open_stream("https://localhost/model.tensors", certificate_handling=CAInfo(cacert="./localhost.pem")`
+    - `open_stream("https://127.0.0.1/model.tensors", certificate_handling=CAInfo(allow_untrusted=True)`
   - Pass `certificate_handling=None` (the default) to use default certificate
     verification as compiled into cURL
 
