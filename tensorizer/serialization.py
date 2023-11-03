@@ -2570,13 +2570,15 @@ class TensorSerializer:
             tensor_bytes = memoryview(tensor_memory.tobytes())
             setup_end = time.monotonic()
 
+            chunk_repr = ""
+
             for i in range(num_chunks):
                 # We XOR the nonce with the chunk index to avoid nonce reuse.
                 step_nonce = nonce_int ^ i
                 step_nonce_bytes = step_nonce.to_bytes(
                     nacl.secret.SecretBox.NONCE_SIZE, "big", signed=False
                 )
-                plaintext_begin = i * self._crypt_chunk_size
+                plaintext_begin = i * self._cleartext_chunk_size
                 plaintext_end = plaintext_begin + self._cleartext_chunk_size
                 if plaintext_end > tensor_memory.nbytes:
                     plaintext_end = tensor_memory.nbytes
@@ -2584,23 +2586,19 @@ class TensorSerializer:
                 chunk = self._lockbox.encrypt(
                     to_encrypt,
                     step_nonce_bytes,
-                )
+                ).ciphertext
                 cryptotext_begin = i * self._crypt_chunk_size
                 cryptotext_end = cryptotext_begin + len(chunk)
                 cryptotext[cryptotext_begin:cryptotext_end] = chunk
                 encryption_header_size = len(chunk) - len(to_encrypt)
-                if i == 0:
-                    print(chunk)
             end = time.monotonic()
             duration_setup_ms = (setup_end - start) * 1000
             duration_ms = (end - start) * 1000
             print(
-                f"Salt: {self._salt} - Key: {self._crypto_key} - Nonce: {nonce}"
-            )
-            print(
-                f"Encryption time: {duration_ms:.2f}ms, "
-                f"setup: {duration_setup_ms:.2f}ms, "
-                f"{cryptotext_end} bytes, {encryption_header_size} header size"
+                f"Pos: {tensor_pos} - Size: {tensor_size} - Encryption time:"
+                f" {duration_ms:.2f}ms, setup: {duration_setup_ms:.2f}ms,"
+                f" {cryptotext_end} bytes, {encryption_header_size} header"
+                f" size, {chunk_repr}"
             )
 
             return nonce, cryptotext[:cryptotext_end]
@@ -2632,8 +2630,6 @@ class TensorSerializer:
         self._jobs.extend(
             (encrypt_task, crc32_task, sha256_task, commit_header_task)
         )
-
-        encrypt_task = self._computation_pool.submit(encrypt_tensor)
 
         # This task is I/O-bound and has no prerequisites,
         # so it goes into the regular writer pool.

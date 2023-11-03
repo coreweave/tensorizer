@@ -205,9 +205,7 @@ class DecryptedStream(io.RawIOBase):
         self._lockbox = nacl.secret.SecretBox(key)
         self._nonce_int = int.from_bytes(nonce, "big", signed=False)
         self._chunk_size = chunk_size
-        self._ciphertext_chunk_sz = (
-            chunk_size + self._lockbox.MACBYTES + self._lockbox.NONCE_SIZE
-        )
+        self._ciphertext_chunk_sz = chunk_size + self._lockbox.MACBYTES
         self._ciphertext_buffer = bytearray(self._ciphertext_chunk_sz)
 
     def __enter__(self):
@@ -233,9 +231,7 @@ class DecryptedStream(io.RawIOBase):
         num_chunks = goal // self._chunk_size
         if goal % self._chunk_size:
             num_chunks += 1
-        ciphertext_goal = goal + (
-            num_chunks * (self._lockbox.MACBYTES + self._lockbox.NONCE_SIZE)
-        )
+        ciphertext_goal = goal + (num_chunks * self._lockbox.MACBYTES)
 
         step = 0
         while ciphertext_offset < ciphertext_goal:
@@ -260,6 +256,7 @@ class DecryptedStream(io.RawIOBase):
             ba[plaintext_offset : plaintext_offset + plaintext_sz] = (
                 self._lockbox.decrypt(ciphertext, step_nonce_bytes)
             )
+            step += 1
             ciphertext_offset += ciphertext_read_sz
             plaintext_offset += plaintext_sz
 
