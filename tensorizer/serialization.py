@@ -12,6 +12,7 @@ import hashlib
 import io
 import itertools
 import logging
+import math
 import mmap
 import os
 import queue
@@ -39,6 +40,8 @@ from typing import (
     Union,
 )
 
+import nacl.secret
+import nacl.utils
 import numpy
 import redis
 import torch
@@ -46,7 +49,7 @@ import torch
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 from tensorizer._NumpyTensor import _NumpyTensor
-from tensorizer.stream_io import CURLStreamFile
+from tensorizer.stream_io import CURLStreamFile, DecryptedStream
 
 if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
@@ -82,6 +85,7 @@ OPAQUE_DTYPE_SEP = "\0"
 class HashType(Enum):
     CRC32 = 0
     SHA256 = 1
+    XSALSA20 = 2
 
 
 @dataclasses.dataclass(order=True)
@@ -193,7 +197,7 @@ class _TensorHeaderSerializer:
         "B"  # Hash count (fixed for a particular tensorizer version)
     )
     hash_header_offset: int
-    hash_count: ClassVar[int] = 2
+    hash_count: int
 
     crc32_hash_segment: ClassVar[struct.Struct] = struct.Struct(
         "<"
@@ -210,6 +214,16 @@ class _TensorHeaderSerializer:
         "32s"  # SHA256 hash value
     )
     sha256_hash_offset: int
+
+    xsalsa20_hash_segment: ClassVar[struct.Struct] = struct.Struct(
+        "<"
+        "B"  # XSalsa20 hash type
+        "B"  # XSalsa20 length
+        "32s"  # 32-byte salt
+        "24s"  # 24-byte nonce
+        "B"  # Crypto block size in # of shifts
+    )
+    xsalsa20_hash_offset: int
 
     data_length_segment: ClassVar[struct.Struct] = struct.Struct(
         "<q"  # Signed tensor data length
@@ -250,6 +264,7 @@ class _TensorHeaderSerializer:
         shape: Sequence[int],
         data_length: int,
         file_offset: int,
+        encrypted: bool = False,
     ):
         # Calculate the variable length segment
         name_len = len(name)
@@ -265,24 +280,47 @@ class _TensorHeaderSerializer:
             )
         )
 
-        # Calculate offsets
-        (
-            self.variable_length_offset,
-            self.hash_header_offset,
-            self.crc32_hash_offset,
-            self.sha256_hash_offset,
-            self.data_length_offset,
-            self.data_offset,
-        ) = itertools.accumulate(
+        if encrypted:
+            self.hash_count = 3
             (
-                self.start_segment.size,
-                self.variable_length_segment.size,
-                self.hash_header_segment.size,
-                self.crc32_hash_segment.size,
-                self.sha256_hash_segment.size,
-                self.data_length_segment.size,
+                self.variable_length_offset,
+                self.hash_header_offset,
+                self.crc32_hash_offset,
+                self.sha256_hash_offset,
+                self.xsalsa20_hash_offset,
+                self.data_length_offset,
+                self.data_offset,
+            ) = itertools.accumulate(
+                (
+                    self.start_segment.size,
+                    self.variable_length_segment.size,
+                    self.hash_header_segment.size,
+                    self.crc32_hash_segment.size,
+                    self.sha256_hash_segment.size,
+                    self.xsalsa20_hash_segment.size,
+                    self.data_length_segment.size,
+                )
             )
-        )
+        else:
+            self.hash_count = 2
+            (
+                self.variable_length_offset,
+                self.hash_header_offset,
+                self.crc32_hash_offset,
+                self.sha256_hash_offset,
+                self.data_length_offset,
+                self.data_offset,
+            ) = itertools.accumulate(
+                (
+                    self.start_segment.size,
+                    self.variable_length_segment.size,
+                    self.hash_header_segment.size,
+                    self.crc32_hash_segment.size,
+                    self.sha256_hash_segment.size,
+                    self.data_length_segment.size,
+                )
+            )
+
         self.size = self.data_offset
 
         self.buffer = bytearray(self.size)
@@ -359,6 +397,23 @@ class _TensorHeaderSerializer:
             HashType.SHA256.value,  # Hash type
             32,  # SHA256 hash length
             value,  # Hash value
+        )
+
+    def add_xsalsa20(self, salt: bytes, nonce: bytes, block_size: int):
+        shifts = int(math.log2(block_size))
+        self.xsalsa20_hash_segment.pack_into(
+            self.buffer,
+            self.xsalsa20_hash_offset,
+            HashType.XSALSA20.value,  # Hash type
+            57,  # XSalsa20 metadata length
+            salt,  # Salt
+            nonce,  # Nonce
+            shifts,  # Crypto block size in # of shifts
+        )
+
+    def update_data_length(self, value: int):
+        self.data_length_segment.pack_into(
+            self.buffer, self.data_length_offset, value
         )
 
 
@@ -635,6 +690,8 @@ class TensorDeserializer(
         verify_hash: If True, the hashes of each tensor will be verified
             against the hashes stored in the metadata. A `HashMismatchError`
             will be raised if any of the hashes do not match.
+        passphrase: The passphrase to use to decrypt the tensors. If None,
+            the tensors will not be decrypted.
 
     Raises:
         HashMismatchError: If ``verify_hash=True`` and a deserialized tensor
@@ -697,6 +754,7 @@ class TensorDeserializer(
         plaid_mode: bool = False,
         plaid_mode_buffers: Optional[int] = None,
         verify_hash: bool = False,
+        passphrase: Optional[str] = None,
     ):
         # Whether to verify the hashes of the tensors when they are loaded.
         # This value is used when no verify_hash argument is passed to the
@@ -707,6 +765,7 @@ class TensorDeserializer(
         # pre-emptively and cancel it if __init__ is successful
         with self._cleanup:
             self._verify_hash = verify_hash
+            self._passphrase = passphrase
 
             if isinstance(file_obj, (str, bytes, os.PathLike, int)):
                 self._file = stream_io.open_stream(file_obj, "rb")
@@ -1049,6 +1108,20 @@ class TensorDeserializer(
         return self._metadata.keys()
 
     @staticmethod
+    def _get_salt_nonce(hashes: List[TensorHash]) -> Tuple[bytes, bytes, int]:
+        salt = None
+        nonce = None
+        block_sz = None
+        for hash_entry in hashes:
+            if hash_entry.type == HashType.XSALSA20:
+                salt = hash_entry.hash[:32]
+                nonce = hash_entry.hash[32:56]
+                shifts = struct.unpack("<B", hash_entry.hash[56:57])[0]
+                block_sz = 1 << shifts
+                break
+        return salt, nonce, block_sz
+
+    @staticmethod
     def _verify_hashes(
         name: str,
         hashes: Iterable[TensorHash],
@@ -1083,6 +1156,9 @@ class TensorDeserializer(
                         f"Tensor '{name}' failed SHA256 verification. "
                         f"Expected {hash_body.hex()}, got {sha_digest.hex()}."
                     )
+            elif hash_type == HashType.XSALSA20:
+                # Verification is done as part of decryption
+                pass
             else:
                 raise ValueError(
                     f"Tensor '{name}' has an invalid hash type: {hash_type}"
@@ -1163,6 +1239,31 @@ class TensorDeserializer(
 
                 self._metadata[header.name].hashes = header.hashes
 
+                # Encryption handling
+                salt, nonce, block_size = self._get_salt_nonce(header.hashes)
+                if self._passphrase is None and salt is not None:
+                    # We are an encrypted tensor and we were not provided
+                    # a passphrase to decrypt with
+                    raise ValueError(
+                        "Tensor is encrypted, but no passphrase was provided"
+                    )
+                elif self._passphrase is not None and salt is None:
+                    raise ValueError(
+                        "Tensor is not encrypted, but a passphrase was provided"
+                    )
+                elif self._passphrase is not None:
+                    if isinstance(self._passphrase, str):
+                        passphrase = self._passphrase.encode("utf-8")
+                    else:
+                        passphrase = self._passphrase
+                    key = hashlib.sha256(passphrase + salt).digest()
+
+                    wrapped_io = DecryptedStream(
+                        self._file, key, nonce, block_size
+                    )
+                else:
+                    wrapped_io = self._file
+
                 # Store our raw headers with hashes zeroed out
                 # for model verification
                 self._metadata[header.name].raw_headers = header.buffer
@@ -1175,7 +1276,7 @@ class TensorDeserializer(
                     # all the tensors. We just need to slice out the
                     # memoryview for the current tensor.
                     mv = self._buffers[header.name]
-                    self._file.readinto(mv)
+                    wrapped_io.readinto(mv)
                     self._allocated += header.data_length
                 elif self._plaid_mode:
                     # In plaid_mode, we don't allocate a buffer, we just
@@ -1185,7 +1286,7 @@ class TensorDeserializer(
                     # the buffer contents after we yield the tensor, which
                     # is loaded straight into the GPU memory.
                     mv = self._buffers[header.name]
-                    self._file.readinto(mv)
+                    wrapped_io.readinto(mv)
                 else:
                     # In lazy_load mode, we allocate a new buffer for each
                     # tensor. This is a bit slower, but it's the only way
@@ -1194,7 +1295,7 @@ class TensorDeserializer(
                     if len(buffer) != header.data_length:
                         raise RuntimeError("Header data length mismatch")
                     mv = memoryview(buffer)
-                    self._file.readinto(mv)
+                    wrapped_io.readinto(mv)
 
                 if verify_hash:
                     try:
@@ -1990,6 +2091,10 @@ class TensorSerializer:
     Args:
         file_obj: A file-like object or path to a file to write to. The path
             can be a S3 URI.
+        passphrase: A passphrase to use for encryption. If None, no encryption
+            will be used.
+        salt: A salt to use for encryption. If None, a random salt will be
+            generated.
         compress_tensors: If True, compress the tensors using lz4. This
             exists as an internal curiosity as it doesn't seem to make
             much of a difference in practice.
@@ -2034,12 +2139,33 @@ class TensorSerializer:
             int,
         ],
         compress_tensors: bool = False,
+        passphrase: Optional[Union[str, bytes]] = None,
+        salt: Optional[Union[str, bytes]] = None,
+        crypt_chunk_size: int = 2048,
     ) -> None:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "wb+")
         else:
             self._mode_check(file_obj)
             self._file = file_obj
+
+        self._cleartext_chunk_size = crypt_chunk_size
+        self._crypt_chunk_size = (
+            crypt_chunk_size + nacl.secret.SecretBox.MACBYTES
+        )
+        if passphrase is not None:
+            if salt is None:
+                salt = os.urandom(32)
+            elif isinstance(salt, str):
+                salt = salt.encode("utf-8")
+            self._salt = salt
+            # Convert our passphrase to bytes
+            if isinstance(passphrase, str):
+                passphrase = passphrase.encode("utf-8")
+            self._crypto_key = hashlib.sha256(passphrase + salt).digest()
+            self._lockbox = nacl.secret.SecretBox(self._crypto_key)
+        else:
+            self._lockbox = None
 
         # Get information about the file object's capabilities
         _fd_getter = getattr(self._file, "fileno", None)
@@ -2390,6 +2516,7 @@ class TensorSerializer:
             shape,
             tensor_size,
             header_pos,
+            self._lockbox is not None,
         )
 
         tensor_pos = header_pos + header.data_offset
@@ -2423,35 +2550,109 @@ class TensorSerializer:
             sha256.update(tensor_memory)
             return sha256.digest()
 
+        def encrypt_tensor() -> Tuple[Optional[bytes], Optional[bytes]]:
+            start = time.monotonic()
+            if self._lockbox is None:
+                return None, None
+            nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
+            nonce_int = int.from_bytes(
+                nonce,
+                "big",
+                signed=False,
+            )
+
+            num_chunks = math.ceil(
+                tensor_memory.nbytes / self._cleartext_chunk_size
+            )
+            cryptotext_size = num_chunks * self._crypt_chunk_size
+            cryptotext = bytearray(cryptotext_size)
+            cryptotext_end = 0
+            tensor_bytes = memoryview(tensor_memory.tobytes())
+            setup_end = time.monotonic()
+
+            for i in range(num_chunks):
+                # We XOR the nonce with the chunk index to avoid nonce reuse.
+                step_nonce = nonce_int ^ i
+                step_nonce_bytes = step_nonce.to_bytes(
+                    nacl.secret.SecretBox.NONCE_SIZE, "big", signed=False
+                )
+                plaintext_begin = i * self._crypt_chunk_size
+                plaintext_end = plaintext_begin + self._cleartext_chunk_size
+                if plaintext_end > tensor_memory.nbytes:
+                    plaintext_end = tensor_memory.nbytes
+                to_encrypt = tensor_bytes[plaintext_begin:plaintext_end]
+                chunk = self._lockbox.encrypt(
+                    to_encrypt,
+                    step_nonce_bytes,
+                )
+                cryptotext_begin = i * self._crypt_chunk_size
+                cryptotext_end = cryptotext_begin + len(chunk)
+                cryptotext[cryptotext_begin:cryptotext_end] = chunk
+                encryption_header_size = len(chunk) - len(to_encrypt)
+                if i == 0:
+                    print(chunk)
+            end = time.monotonic()
+            duration_setup_ms = (setup_end - start) * 1000
+            duration_ms = (end - start) * 1000
+            print(
+                f"Salt: {self._salt} - Key: {self._crypto_key} - Nonce: {nonce}"
+            )
+            print(
+                f"Encryption time: {duration_ms:.2f}ms, "
+                f"setup: {duration_setup_ms:.2f}ms, "
+                f"{cryptotext_end} bytes, {encryption_header_size} header size"
+            )
+
+            return nonce, cryptotext[:cryptotext_end]
+
         # This task is I/O-bound and dependent on the previous two tasks,
         # so it goes into the header writer pool.
         def commit_header(
             crc32_future: concurrent.futures.Future,
             sha256_future: concurrent.futures.Future,
+            encrypt_future: concurrent.futures.Future,
         ):
             crc32 = crc32_future.result(3600)
             sha256 = sha256_future.result(3600)
+            nonce, encrypted = encrypt_future.result(3600)
             header.add_crc32(crc32)
             header.add_sha256(sha256)
+            if encrypted is not None:
+                header.add_xsalsa20(self._salt, nonce, self._crypt_chunk_size)
+                header.update_data_length(len(encrypted))
             self._pwrite(header.buffer, header_pos)
 
         crc32_task = self._computation_pool.submit(compute_crc32)
         sha256_task = self._computation_pool.submit(compute_sha256)
+        encrypt_task = self._computation_pool.submit(encrypt_tensor)
+
         commit_header_task = self._header_writer_pool.submit(
-            commit_header, crc32_task, sha256_task
+            commit_header, crc32_task, sha256_task, encrypt_task
         )
-        self._jobs.extend((crc32_task, sha256_task, commit_header_task))
+        self._jobs.extend(
+            (encrypt_task, crc32_task, sha256_task, commit_header_task)
+        )
+
+        encrypt_task = self._computation_pool.submit(encrypt_tensor)
 
         # This task is I/O-bound and has no prerequisites,
         # so it goes into the regular writer pool.
         def write_tensor_data():
-            bytes_written = self._pwrite(tensor_memory, tensor_pos)
+            _, encrypted = encrypt_task.result(3600)
+            if encrypted is not None:
+                self._pwrite(encrypted, tensor_pos)
+            else:
+                self._pwrite(tensor_memory, tensor_pos)
             with self._tensor_count_update_lock:
                 self._file_header.tensor_count += 1
-                self._file_header.tensor_size += bytes_written
+                self._file_header.tensor_size += tensor_memory.nbytes
 
         self._jobs.append(self._writer_pool.submit(write_tensor_data))
-        tensor_endpos = tensor_pos + tensor_size
+        tensor_encrypted_payload = encrypt_task.result(3600)[1]
+        if tensor_encrypted_payload is not None:
+            tensor_endpos = tensor_pos + len(tensor_encrypted_payload)
+        else:
+            tensor_endpos = tensor_pos + tensor_size
 
         # Update our prologue.
         if _synchronize:

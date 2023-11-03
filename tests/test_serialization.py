@@ -43,6 +43,8 @@ default_read_endpoint = "object.ord1.coreweave.com"
 class SerializeMethod(enum.Enum):
     Module = 1
     StateDict = 2
+    EncryptedModule = 3
+    EncryptedStateDict = 4
 
 
 def serialize_model(
@@ -55,10 +57,16 @@ def serialize_model(
     out_file = tempfile.NamedTemporaryFile("wb+", delete=False)
     try:
         start_time = time.monotonic()
-        serializer = TensorSerializer(out_file)
-        if method is SerializeMethod.Module:
+        if method is SerializeMethod.EncryptedModule:
+            serializer = TensorSerializer(out_file, passphrase="test")
+        else:
+            serializer = TensorSerializer(out_file)
+        if method in (SerializeMethod.Module, SerializeMethod.EncryptedModule):
             serializer.write_module(model)
-        elif method is SerializeMethod.StateDict:
+        elif method in (
+            SerializeMethod.StateDict,
+            SerializeMethod.EncryptedStateDict,
+        ):
             serializer.write_state_dict(sd)
         else:
             raise ValueError("Invalid serialization method")
@@ -109,7 +117,10 @@ def check_deserialized(
     allow_subset: bool = False,
     include_non_persistent_buffers: bool = True,
 ):
-    orig_sd = model_digest(model_name, include_non_persistent_buffers)
+    orig_sd = model_digest(
+        model_name,
+        include_non_persistent_buffers,
+    )
 
     if not allow_subset:
         test_case.assertEqual(
@@ -227,6 +238,30 @@ class TestSerialization(unittest.TestCase):
                         del deserialized
                 finally:
                     os.unlink(serialized_model)
+
+    def test_encryption(self):
+        unencrypted_model, orig_sd = serialize_model(
+            model_name, "cpu", method=SerializeMethod.Module
+        )
+        encrypted_model, orig_sd = serialize_model(
+            model_name, "cpu", method=SerializeMethod.EncryptedModule
+        )
+        try:
+            with open(encrypted_model, "rb") as in_file:
+                deserialized = TensorDeserializer(
+                    in_file, device="cpu", passphrase="test"
+                )
+                check_deserialized(
+                    self,
+                    deserialized,
+                    model_name,
+                    include_non_persistent_buffers=(True),
+                )
+                deserialized.close()
+                del deserialized
+        finally:
+            os.unlink(unencrypted_model)
+            os.unlink(encrypted_model)
 
     def test_bfloat16(self):
         shape = (50, 50)
