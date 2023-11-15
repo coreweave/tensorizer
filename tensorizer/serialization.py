@@ -2557,7 +2557,7 @@ class TensorSerializer:
         fallocate = getattr(os, "posix_fallocate", None)
         if fallocate and self._fd:
             size = sum(len(t.name) for t in tensors)
-            size += sum(t.tensor.untyped_storage().size() for t in tensors)
+            size += sum(t.tensor.element_size() * t.tensor.nelement() for t in tensors)
             # Rough underestimate of header size
             header_min_size = 24
             size += header_min_size * len(tensors)
