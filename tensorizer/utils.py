@@ -22,10 +22,13 @@ import psutil
 try:
     import pynvml
 
-    try:
-        pynvml.nvmlInit()
-    except pynvml.nvml.NVMLError_LibraryNotFound:
+    if not hasattr(pynvml, "nvml"):
         pynvml = None
+    else:
+        try:
+            pynvml.nvmlInit()
+        except pynvml.nvml.NVMLError_LibraryNotFound:
+            pynvml = None
 except ImportError:
     pynvml = None
 
