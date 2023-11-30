@@ -20,6 +20,7 @@ import struct
 import threading
 import time
 import typing
+import weakref
 import zlib
 from collections import OrderedDict
 from enum import Enum
@@ -2807,6 +2808,11 @@ class TensorSerializer:
 
         # Tracks work submitted to all pools to wait for pending work to finish.
         self._jobs: List[concurrent.futures.Future] = []
+        # Tracks work submitted to the decryption pool to prevent conflicting,
+        # overlapping in-place operations on tensors using shared storage.
+        self._decryption_jobs: typing.MutableMapping[
+            int, concurrent.futures.Future
+        ] = (weakref.WeakValueDictionary() if self._encrypted else {})
 
         if self.compress_tensors:
             import lz4.frame
@@ -2970,6 +2976,7 @@ class TensorSerializer:
         for j in self._jobs:
             j.result(timeout=_TIMEOUT)
         self._jobs.clear()
+        self._decryption_jobs.clear()
 
     def close(self) -> None:
         """
@@ -3190,11 +3197,15 @@ class TensorSerializer:
 
         # These two tasks are CPU-bound and don't block the GIL,
         # so they go into the computation thread pool.
-        def compute_crc32():
+        def compute_crc32(prerequisite: Optional[concurrent.futures.Future]):
+            if prerequisite is not None:
+                prerequisite.result(_TIMEOUT)
             crc32 = header.compute_crc32()
             return zlib.crc32(tensor_memory, crc32)
 
-        def compute_sha256():
+        def compute_sha256(prerequisite: Optional[concurrent.futures.Future]):
+            if prerequisite is not None:
+                prerequisite.result(_TIMEOUT)
             sha256 = header.compute_sha256()
             sha256.update(tensor_memory)
             return sha256.digest()
@@ -3225,12 +3236,25 @@ class TensorSerializer:
             self._pwrite(header.buffer, header_pos)
 
         hash_tasks = []
+        if self._encrypted and not _temporary_buffer:
+            # If multiple tensors share memory, and were encrypted in-place,
+            # then this must not start hashing until any previous decryption
+            # tasks have restored this memory to its original state
+            mem_pointer = tensor.__array_interface__["data"][0]
+            pending_decryption = self._decryption_jobs.get(mem_pointer, None)
+        else:
+            mem_pointer = None
+            pending_decryption = None
         if include_crc32:
-            crc32_task = self._computation_pool.submit(compute_crc32)
+            crc32_task = self._computation_pool.submit(
+                compute_crc32, pending_decryption
+            )
             hash_tasks.append(crc32_task)
         else:
             crc32_task = None
-        sha256_task = self._computation_pool.submit(compute_sha256)
+        sha256_task = self._computation_pool.submit(
+            compute_sha256, pending_decryption
+        )
         hash_tasks.append(sha256_task)
         self._jobs.extend(hash_tasks)
 
@@ -3275,9 +3299,16 @@ class TensorSerializer:
                         return_when=concurrent.futures.ALL_COMPLETED,
                     )
                 except _crypt.CryptographyError as e:
+                    try:
+                        original_exc = prerequisite.exception(timeout=0)
+                    except (
+                        concurrent.futures.TimeoutError,
+                        concurrent.futures.CancelledError,
+                    ):
+                        original_exc = None
                     raise CryptographyError(
                         "Restoring encrypted tensor data in memory failed"
-                    ) from e
+                    ) from (original_exc if original_exc is not None else e)
 
         # Encrypt the tensor memory in-place before writing
         if self._encrypted:
@@ -3296,7 +3327,10 @@ class TensorSerializer:
         self._jobs.append(write_task)
         # Decrypt the memory after writing is finished, if it was encrypted
         if self._encrypted and not _temporary_buffer:
-            self._jobs.append(self._decryption_pool.submit(decrypt, write_task))
+            decrypt_task = self._decryption_pool.submit(decrypt, write_task)
+            self._jobs.append(decrypt_task)
+            assert mem_pointer is not None
+            self._decryption_jobs[mem_pointer] = decrypt_task
 
         tensor_endpos = tensor_pos + tensor_size
 
@@ -3427,11 +3461,38 @@ class TensorSerializer:
             transferred = interrupt_transfer = None
         del cuda_tensors
 
+        if self._encrypted:
+            shared = []
+            seen_addresses = set()
+            for t in reversed(tensors):
+                if t.tensor.device.type == "cuda":
+                    shared.append(False)
+                else:
+                    address = t.tensor.data_ptr()
+                    shared.append(address in seen_addresses)
+                    seen_addresses.add(address)
+            del seen_addresses
+        else:
+            shared = [False] * len(tensors)
+
         try:
             while tensors:
                 idx, name, tensor_type, tensor, callback = tensors.popleft()
+                is_shared = shared.pop()
                 if tensor.device.type == "cuda":
                     tensor = next(transferred)
+                    temp_tensor = True
+                elif is_shared and self._encrypted:
+                    # Un-shares tensor memory in preparation for in-place
+                    # operations on the buffer that would otherwise conflict
+                    # with one another. Full support for shared-memory tensors
+                    # (e.g. if they were only written once) could make
+                    # this unnecessary, once implemented.
+                    # Another option would be to reuse the same encrypted
+                    # weights and decrypt them at the end. This would require
+                    # confirming that the tensor data regions are actually
+                    # identical, and don't just overlap.
+                    tensor = tensor.clone().detach()
                     temp_tensor = True
                 else:
                     temp_tensor = False

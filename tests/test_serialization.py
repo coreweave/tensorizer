@@ -264,11 +264,12 @@ class TestSerialization(unittest.TestCase):
         incorrect_decryption = serialization.DecryptionParams.from_passphrase(
             passphrase="tset"
         )
+        device = default_device
 
         def _serialize(enc: Optional[serialization.EncryptionParams]):
             return serialize_model_temp(
                 model_name,
-                default_device,
+                device,
                 method=SerializeMethod.Module,
                 encryption=enc,
             )
@@ -279,20 +280,27 @@ class TestSerialization(unittest.TestCase):
                 raise RuntimeError()
 
         with _serialize(encryption) as encrypted_model:
-            for lazy_load, plaid_mode in (
-                (False, False),
-                (False, True),
-                (True, True),
-            ):
+            if device == "cuda":
+                modes = (
+                    (False, False),
+                    (False, True),
+                    (True, True),
+                )
+            else:
+                modes = (
+                    (False, False),
+                    (True, False),
+                )
+            for lazy_load, plaid_mode in modes:
                 # Ensure that it works when given a passphrase
                 with self.subTest(
                     msg="Deserializing with a correct passphrase",
-                    device=default_device,
+                    device=device,
                     lazy_load=lazy_load,
                     plaid_mode=plaid_mode,
                 ), open(encrypted_model, "rb") as in_file, TensorDeserializer(
                     in_file,
-                    device=default_device,
+                    device=device,
                     lazy_load=lazy_load,
                     plaid_mode=plaid_mode,
                     verify_hash=True,
@@ -313,7 +321,7 @@ class TestSerialization(unittest.TestCase):
                 encrypted_model, "rb"
             ) as in_file, TensorDeserializer(
                 in_file,
-                device=default_device,
+                device=device,
                 lazy_load=True,
                 encryption=None,
             ) as deserialized:
@@ -328,7 +336,7 @@ class TestSerialization(unittest.TestCase):
                 encrypted_model, "rb"
             ) as in_file, TensorDeserializer(
                 in_file,
-                device=default_device,
+                device=device,
                 lazy_load=True,
                 encryption=incorrect_decryption,
             ) as deserialized:
@@ -345,7 +353,7 @@ class TestSerialization(unittest.TestCase):
                 unencrypted_model, "rb"
             ) as in_file, TensorDeserializer(
                 in_file,
-                device=default_device,
+                device=device,
                 lazy_load=True,
                 encryption=decryption,
             ) as deserialized:
