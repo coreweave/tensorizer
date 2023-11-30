@@ -11,7 +11,7 @@ import secrets
 import tempfile
 import time
 import unittest
-from typing import Mapping, NamedTuple, Tuple
+from typing import Mapping, NamedTuple, Optional
 from unittest.mock import patch
 
 import torch
@@ -29,8 +29,13 @@ from tensorizer import (
     stream_io,
     utils,
 )
+from tensorizer._crypt import available as encryption_available
 from tensorizer.serialization import TensorHash, TensorType
-from test_stream_io import start_redis, teardown_redis
+
+try:
+    from test_stream_io import start_redis, teardown_redis
+except ImportError:
+    from .test_stream_io import start_redis, teardown_redis
 
 model_name = "EleutherAI/gpt-neo-125M"
 num_hellos = 400
@@ -43,30 +48,28 @@ default_read_endpoint = "object.ord1.coreweave.com"
 class SerializeMethod(enum.Enum):
     Module = 1
     StateDict = 2
-    EncryptedModule = 3
-    EncryptedStateDict = 4
+
+
+class SerializationResult(NamedTuple):
+    filename: str
+    orig_sd: dict
 
 
 def serialize_model(
     model_name: str,
     device: str,
     method: SerializeMethod = SerializeMethod.Module,
-) -> Tuple[str, dict]:
+    encryption: Optional[serialization.EncryptionParams] = None,
+) -> SerializationResult:
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     sd = model.state_dict()
     out_file = tempfile.NamedTemporaryFile("wb+", delete=False)
     try:
         start_time = time.monotonic()
-        if method is SerializeMethod.EncryptedModule:
-            serializer = TensorSerializer(out_file, passphrase="test")
-        else:
-            serializer = TensorSerializer(out_file)
-        if method in (SerializeMethod.Module, SerializeMethod.EncryptedModule):
+        serializer = TensorSerializer(out_file, encryption=encryption)
+        if method is SerializeMethod.Module:
             serializer.write_module(model)
-        elif method in (
-            SerializeMethod.StateDict,
-            SerializeMethod.EncryptedStateDict,
-        ):
+        elif method is SerializeMethod.StateDict:
             serializer.write_state_dict(sd)
         else:
             raise ValueError("Invalid serialization method")
@@ -76,7 +79,17 @@ def serialize_model(
     except Exception:
         os.unlink(out_file.name)
         raise
-    return out_file.name, sd
+    return SerializationResult(out_file.name, sd)
+
+
+@contextlib.contextmanager
+@functools.wraps(serialize_model)
+def serialize_model_temp(*args, **kwargs):
+    filename = serialize_model(*args, **kwargs).filename
+    try:
+        yield filename
+    finally:
+        os.unlink(filename)
 
 
 # Reducing a tensor to a hash makes it faster to compare against the reference
@@ -117,10 +130,7 @@ def check_deserialized(
     allow_subset: bool = False,
     include_non_persistent_buffers: bool = True,
 ):
-    orig_sd = model_digest(
-        model_name,
-        include_non_persistent_buffers,
-    )
+    orig_sd = model_digest(model_name, include_non_persistent_buffers)
 
     if not allow_subset:
         test_case.assertEqual(
@@ -239,29 +249,109 @@ class TestSerialization(unittest.TestCase):
                 finally:
                     os.unlink(serialized_model)
 
+    @unittest.skipUnless(
+        encryption_available,
+        reason="libsodium must be installed to test encryption",
+    )
     def test_encryption(self):
-        unencrypted_model, orig_sd = serialize_model(
-            model_name, "cpu", method=SerializeMethod.Module
+        fixed_salt = bytes(32)
+        encryption = serialization.EncryptionParams.from_passphrase_fast(
+            passphrase="test", salt=fixed_salt
         )
-        encrypted_model, orig_sd = serialize_model(
-            model_name, "cpu", method=SerializeMethod.EncryptedModule
+        decryption = serialization.DecryptionParams.from_passphrase(
+            passphrase="test"
         )
-        try:
-            with open(encrypted_model, "rb") as in_file:
-                deserialized = TensorDeserializer(
-                    in_file, device="cpu", passphrase="test"
-                )
-                check_deserialized(
-                    self,
-                    deserialized,
-                    model_name,
-                    include_non_persistent_buffers=(True),
-                )
-                deserialized.close()
+        incorrect_decryption = serialization.DecryptionParams.from_passphrase(
+            passphrase="tset"
+        )
+
+        def _serialize(enc: Optional[serialization.EncryptionParams]):
+            return serialize_model_temp(
+                model_name,
+                default_device,
+                method=SerializeMethod.Module,
+                encryption=enc,
+            )
+
+        def _test_first_key(obj):
+            k = next(iter(deserialized.keys()))
+            if obj[k] is not None:
+                raise RuntimeError()
+
+        with _serialize(encryption) as encrypted_model:
+            for lazy_load, plaid_mode in (
+                (False, False),
+                (False, True),
+                (True, True),
+            ):
+                # Ensure that it works when given a passphrase
+                with self.subTest(
+                    msg="Deserializing with a correct passphrase",
+                    device=default_device,
+                    lazy_load=lazy_load,
+                    plaid_mode=plaid_mode,
+                ), open(encrypted_model, "rb") as in_file, TensorDeserializer(
+                    in_file,
+                    device=default_device,
+                    lazy_load=lazy_load,
+                    plaid_mode=plaid_mode,
+                    verify_hash=True,
+                    encryption=decryption,
+                ) as deserialized:
+                    check_deserialized(
+                        self,
+                        deserialized,
+                        model_name,
+                    )
+                    del deserialized
+                gc.collect()
+
+            # Ensure that it fails to load when not given a passphrase
+            with self.subTest(
+                msg="Deserializing with a missing passphrase"
+            ), self.assertRaises(serialization.CryptographyError), open(
+                encrypted_model, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file,
+                device=default_device,
+                lazy_load=True,
+                encryption=None,
+            ) as deserialized:
+                _test_first_key(deserialized)
                 del deserialized
-        finally:
-            os.unlink(unencrypted_model)
-            os.unlink(encrypted_model)
+            gc.collect()
+
+            # Ensure that it fails to load when given the wrong passphrase
+            with self.subTest(
+                msg="Deserializing with an incorrect passphrase"
+            ), self.assertRaises(serialization.CryptographyError), open(
+                encrypted_model, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file,
+                device=default_device,
+                lazy_load=True,
+                encryption=incorrect_decryption,
+            ) as deserialized:
+                _test_first_key(deserialized)
+                del deserialized
+            gc.collect()
+
+        with _serialize(None) as unencrypted_model:
+            # Ensure that it fails to load an unencrypted model
+            # when expecting encryption
+            with self.subTest(
+                msg="Deserializing an unencrypted model with a passphrase"
+            ), self.assertRaises(serialization.CryptographyError), open(
+                unencrypted_model, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file,
+                device=default_device,
+                lazy_load=True,
+                encryption=decryption,
+            ) as deserialized:
+                _test_first_key(deserialized)
+                del deserialized
+            gc.collect()
 
     def test_bfloat16(self):
         shape = (50, 50)
@@ -342,8 +432,7 @@ class TestDeserialization(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        serialized_model_path, sd = serialize_model(model_name, "cpu")
-        del sd
+        serialized_model_path = serialize_model(model_name, "cpu").filename
         cls._serialized_model_path = serialized_model_path
         gc.collect()
 
@@ -562,7 +651,7 @@ class TestVerification(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        serialized_model_path = serialize_model(model_name, "cpu")[0]
+        serialized_model_path = serialize_model(model_name, "cpu").filename
         cls._serialized_model_path = serialized_model_path
         gc.collect()
 

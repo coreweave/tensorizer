@@ -8,11 +8,11 @@ import concurrent.futures
 import contextlib
 import ctypes
 import dataclasses
+import functools
 import hashlib
 import io
 import itertools
 import logging
-import math
 import mmap
 import os
 import queue
@@ -40,16 +40,21 @@ from typing import (
     Union,
 )
 
-import nacl.secret
-import nacl.utils
 import numpy
 import redis
 import torch
 
+import tensorizer._crypt as _crypt
+import tensorizer._crypt_info as _crypt_info
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
+from tensorizer._crypt._cgroup_cpu_count import (
+    effective_cpu_count as _effective_cpu_count,
+)
+from tensorizer._internal_utils import Chunked as _Chunked
+from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor
-from tensorizer.stream_io import CURLStreamFile, DecryptedStream
+from tensorizer.stream_io import CURLStreamFile
 
 if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
@@ -58,10 +63,49 @@ else:
 
 lz4 = None
 
-__all__ = ["TensorSerializer", "TensorDeserializer", "TensorType"]
+__all__ = [
+    "TensorSerializer",
+    "TensorDeserializer",
+    "TensorType",
+    "CryptographyError",
+    "EncryptionParams",
+    "DecryptionParams",
+]
 
 # Setup logger
 logger = logging.getLogger(__name__)
+
+
+# Get CPU count
+cpu_count: int = _effective_cpu_count()
+
+
+class CryptographyError(_crypt.CryptographyError):
+    pass
+
+
+def _require_libsodium() -> None:
+    if not _crypt.available:
+        raise RuntimeError(
+            "libsodium shared object library not found or outdated."
+            " libsodium is a required dependency when using tensor encryption."
+            " Install an up-to-date version using the instructions at"
+            " https://doc.libsodium.org/installation or through"
+            ' a package manager (e.g. "apt-get install libsodium23")'
+        )
+
+
+def _requires_libsodium(func):
+    if _crypt.available:
+        return func
+    else:
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            _require_libsodium()
+            return func(*args, **kwargs)
+
+        return wrapper
 
 
 # Whether the tensor is a parameter or a buffer on the model.
@@ -74,18 +118,20 @@ class TensorType(Enum):
 # If tensors with "opaque" dtypes (those that are not supported by numpy) are
 # saved, then a tensorizer data version of 2 is required to (de)serialize the
 # file. Otherwise, the file is compatible with tensorizer data version 1
-TENSORIZER_VERSION = 2
+TENSORIZER_VERSION = 3
+OPAQUE_TENSORIZER_VERSION = 2
 NON_OPAQUE_TENSORIZER_VERSION = 1
 
 TENSORIZER_MAGIC = b"|TZR|"
 
 OPAQUE_DTYPE_SEP = "\0"
 
+_TIMEOUT: typing.Final[int] = 3600
+
 
 class HashType(Enum):
     CRC32 = 0
     SHA256 = 1
-    XSALSA20 = 2
 
 
 @dataclasses.dataclass(order=True)
@@ -106,7 +152,7 @@ class TensorEntry:
         "data_offset",
         "data_length",
         "hashes",
-        "raw_headers",
+        "header_hashes",
     )
     name: str
     type: TensorType
@@ -116,7 +162,7 @@ class TensorEntry:
     data_offset: int
     data_length: int
     hashes: Optional[List[TensorHash]]
-    raw_headers: Optional[bytes]
+    header_hashes: Optional[Dict[HashType, Any]]
 
 
 @dataclasses.dataclass
@@ -136,6 +182,13 @@ class _FileHeader:
     tensor_size: int
     tensor_count: int
 
+    class InvalidVersionError(ValueError):
+        version: int
+
+        def __init__(self, *args, version: int):
+            super().__init__(*args)
+            self.version = version
+
     def to_bytes(self) -> bytes:
         return self.version_number_format.pack(
             self.version_number
@@ -149,12 +202,14 @@ class _FileHeader:
             reader.read(cls.version_number_format.size)
         )[0]
         if version_number not in accepted_versions:
-            raise ValueError(
+            message = (
                 "Unsupported version: this data stream uses tensorizer"
                 f" data version {version_number}, which is not supported"
-                " in this release of tensorizer."
+                " in this release of tensorizer, or"
+                " for the serialization/deserialization features selected."
                 f"\nSupported data versions: {tuple(accepted_versions)}"
             )
+            raise cls.InvalidVersionError(message, version=version_number)
         data = reader.read(cls.format.size)
         if len(data) < cls.format.size:
             raise ValueError(
@@ -206,6 +261,7 @@ class _TensorHeaderSerializer:
         "I"  # CRC32 hash value
     )
     crc32_hash_offset: int
+    has_crc32: bool
 
     sha256_hash_segment: ClassVar[struct.Struct] = struct.Struct(
         "<"
@@ -214,16 +270,10 @@ class _TensorHeaderSerializer:
         "32s"  # SHA256 hash value
     )
     sha256_hash_offset: int
+    has_sha256: bool
 
-    xsalsa20_hash_segment: ClassVar[struct.Struct] = struct.Struct(
-        "<"
-        "B"  # XSalsa20 hash type
-        "B"  # XSalsa20 length
-        "32s"  # 32-byte salt
-        "24s"  # 24-byte nonce
-        "B"  # Crypto block size in # of shifts
-    )
-    xsalsa20_hash_offset: int
+    crypt_info: Optional[_crypt_info.CryptInfo]
+    crypt_info_offset: int
 
     data_length_segment: ClassVar[struct.Struct] = struct.Struct(
         "<q"  # Signed tensor data length
@@ -264,7 +314,9 @@ class _TensorHeaderSerializer:
         shape: Sequence[int],
         data_length: int,
         file_offset: int,
-        encrypted: bool = False,
+        include_crc32: bool = True,
+        include_sha256: bool = True,
+        crypt_info: Optional[_crypt_info.CryptInfo] = None,
     ):
         # Calculate the variable length segment
         name_len = len(name)
@@ -272,6 +324,11 @@ class _TensorHeaderSerializer:
         # NB: shape_len is the number of dimensions,
         # not the encoded byte length
         shape_len = len(shape)
+        self.crypt_info = crypt_info
+        if crypt_info is None:
+            crypt_info_len = 0
+        else:
+            crypt_info_len = crypt_info.sized_size
         self.variable_length_segment = struct.Struct(
             self.variable_length_segment_template.format(
                 name_len=name_len,
@@ -279,48 +336,36 @@ class _TensorHeaderSerializer:
                 shape_len=shape_len,
             )
         )
+        crc32_len = sha256_len = self.hash_count = 0
+        self.has_crc32 = include_crc32
+        self.has_sha256 = include_sha256
+        if include_crc32:
+            crc32_len = self.crc32_hash_segment.size
+            self.hash_count += 1
+        if include_sha256:
+            sha256_len = self.sha256_hash_segment.size
+            self.hash_count += 1
 
-        if encrypted:
-            self.hash_count = 3
+        # Calculate offsets
+        (
+            self.variable_length_offset,
+            self.hash_header_offset,
+            self.crc32_hash_offset,
+            self.sha256_hash_offset,
+            self.crypt_info_offset,
+            self.data_length_offset,
+            self.data_offset,
+        ) = itertools.accumulate(
             (
-                self.variable_length_offset,
-                self.hash_header_offset,
-                self.crc32_hash_offset,
-                self.sha256_hash_offset,
-                self.xsalsa20_hash_offset,
-                self.data_length_offset,
-                self.data_offset,
-            ) = itertools.accumulate(
-                (
-                    self.start_segment.size,
-                    self.variable_length_segment.size,
-                    self.hash_header_segment.size,
-                    self.crc32_hash_segment.size,
-                    self.sha256_hash_segment.size,
-                    self.xsalsa20_hash_segment.size,
-                    self.data_length_segment.size,
-                )
+                self.start_segment.size,
+                self.variable_length_segment.size,
+                self.hash_header_segment.size,
+                crc32_len,
+                sha256_len,
+                crypt_info_len,
+                self.data_length_segment.size,
             )
-        else:
-            self.hash_count = 2
-            (
-                self.variable_length_offset,
-                self.hash_header_offset,
-                self.crc32_hash_offset,
-                self.sha256_hash_offset,
-                self.data_length_offset,
-                self.data_offset,
-            ) = itertools.accumulate(
-                (
-                    self.start_segment.size,
-                    self.variable_length_segment.size,
-                    self.hash_header_segment.size,
-                    self.crc32_hash_segment.size,
-                    self.sha256_hash_segment.size,
-                    self.data_length_segment.size,
-                )
-            )
-
+        )
         self.size = self.data_offset
 
         self.buffer = bytearray(self.size)
@@ -341,9 +386,9 @@ class _TensorHeaderSerializer:
             shape_len,  # Tensor shape length
             *shape,  # Tensor shape I array
         )
-        self.hash_segment_size = (
-            self.data_length_offset - self.hash_header_offset - 2
-        )
+
+        after_hashes = self.crypt_info_offset
+        self.hash_segment_size = after_hashes - self.hash_header_offset - 2
         self.hash_header_segment.pack_into(
             self.buffer,
             self.hash_header_offset,
@@ -352,8 +397,12 @@ class _TensorHeaderSerializer:
         )
 
         # Placeholders
-        self.add_crc32(0)
-        self.add_sha256(b"")
+        if include_crc32:
+            self.add_crc32(0)
+        if include_sha256:
+            self.add_sha256(b"")
+        if crypt_info is not None:
+            crypt_info.sized_pack_into(self.buffer, self.crypt_info_offset)
 
         self.data_length_segment.pack_into(
             self.buffer, self.data_length_offset, data_length
@@ -381,7 +430,33 @@ class _TensorHeaderSerializer:
             data_length,  # Tensor length
         )
 
+    def _hashable_segment_views(self):
+        if self.crypt_info is None:
+            yield memoryview(self.buffer)
+        else:
+            yield memoryview(self.buffer)[: self.crypt_info_offset]
+            # Skip crypt_info
+            yield memoryview(self.buffer)[self.data_length_offset :]
+
+    def compute_crc32(self) -> int:
+        crc32 = 0
+        for view in self._hashable_segment_views():
+            with view:
+                crc32 = zlib.crc32(view, crc32)
+        return crc32
+
+    def compute_sha256(self):
+        sha256 = hashlib.sha256()
+        for view in self._hashable_segment_views():
+            with view:
+                sha256.update(view)
+        return sha256
+
     def add_crc32(self, value: int):
+        if not self.has_crc32:
+            raise ValueError(
+                "Cannot add CRC32 to header defined without a CRC32 field"
+            )
         self.crc32_hash_segment.pack_into(
             self.buffer,
             self.crc32_hash_offset,
@@ -391,6 +466,10 @@ class _TensorHeaderSerializer:
         )
 
     def add_sha256(self, value: bytes):
+        if not self.has_sha256:
+            raise ValueError(
+                "Cannot add SHA256 to header defined without a SHA256 field"
+            )
         self.sha256_hash_segment.pack_into(
             self.buffer,
             self.sha256_hash_offset,
@@ -399,52 +478,9 @@ class _TensorHeaderSerializer:
             value,  # Hash value
         )
 
-    def add_xsalsa20(self, salt: bytes, nonce: bytes, block_size: int):
-        shifts = int(math.log2(block_size))
-        self.xsalsa20_hash_segment.pack_into(
-            self.buffer,
-            self.xsalsa20_hash_offset,
-            HashType.XSALSA20.value,  # Hash type
-            57,  # XSalsa20 metadata length
-            salt,  # Salt
-            nonce,  # Nonce
-            shifts,  # Crypto block size in # of shifts
-        )
-
-    def update_data_length(self, value: int):
-        self.data_length_segment.pack_into(
-            self.buffer, self.data_length_offset, value
-        )
-
-
-def _variable_read(
-    data: bytes, offset: int = 0, length_fmt: str = "B", data_fmt: str = "s"
-) -> Tuple[Union[memoryview, Tuple], int]:
-    """
-    Reads a variable-length field preceded by a length from a buffer.
-
-    Returns:
-        A tuple of the data read, and the offset in the buffer
-        following the end of the field.
-    """
-    assert length_fmt in ("B", "H", "I", "Q")
-    if length_fmt == "B":
-        length: int = data[offset]
-        offset += 1
-    else:
-        length_struct = struct.Struct("<" + length_fmt)
-        length: int = length_struct.unpack_from(data, offset)[0]
-        offset += length_struct.size
-    if data_fmt == "s":
-        # When the data is read as bytes, just return a memoryview
-        end = offset + length
-        with memoryview(data) as mv:
-            return mv[offset:end], end
-    else:
-        data_struct = struct.Struct(f"<{length:d}{data_fmt}")
-        data = data_struct.unpack_from(data, offset)
-        offset += data_struct.size
-        return data, offset
+    def update_crypt_info(self):
+        if self.crypt_info is not None:
+            self.crypt_info.sized_pack_into(self.buffer, self.crypt_info_offset)
 
 
 @dataclasses.dataclass(init=False)
@@ -456,7 +492,10 @@ class _TensorHeaderDeserializer:
     dtype: str
     shape: Tuple[int, ...]
     hashes: List[TensorHash]
+    crypt_info: Optional[_crypt_info.CryptInfo]
     data_length: int
+
+    _hashable_segments: Sequence[slice]
 
     header_len_segment: ClassVar[struct.Struct] = struct.Struct("<Q")
     tensor_info_segment: ClassVar[struct.Struct] = struct.Struct(
@@ -467,12 +506,18 @@ class _TensorHeaderDeserializer:
     read_dtype = partial(_variable_read, length_fmt="B", data_fmt="s")
     read_shape = partial(_variable_read, length_fmt="B", data_fmt="I")
     read_hash_block = partial(_variable_read, length_fmt="H", data_fmt="s")
+    read_crypt_info_block = partial(
+        _variable_read, length_fmt="Q", data_fmt="s"
+    )
 
     data_length_segment: ClassVar[struct.Struct] = struct.Struct("<q")
 
     @classmethod
     def from_io(
-        cls, reader: io.BufferedIOBase, zero_hashes: bool = True
+        cls,
+        reader: io.BufferedIOBase,
+        zero_hashes: bool = True,
+        check_crypt_info: bool = False,
     ) -> Optional["_TensorHeaderDeserializer"]:
         # We read the entire header into memory rather than reading
         # it piecewise to avoid the overhead of many small reads,
@@ -486,9 +531,16 @@ class _TensorHeaderDeserializer:
         buffer[:offset] = header_len_bytes
         with memoryview(buffer) as mv:
             reader.readinto(mv[offset:])
-        return cls(buffer, zero_hashes=zero_hashes)
+        return cls(
+            buffer, zero_hashes=zero_hashes, check_crypt_info=check_crypt_info
+        )
 
-    def __init__(self, buffer: bytearray, zero_hashes: bool = True):
+    def __init__(
+        self,
+        buffer: bytearray,
+        zero_hashes: bool = True,
+        check_crypt_info: bool = False,
+    ):
         self.buffer = buffer
         offset = self.header_len_segment.size
         self.module_idx, tensor_type = self.tensor_info_segment.unpack_from(
@@ -517,11 +569,57 @@ class _TensorHeaderDeserializer:
             if zero_hashes:
                 self._zero_hashes(hashes_slice)
 
+        if check_crypt_info:
+            crypt_info_start = offset
+            crypt_info_slice, offset = self.read_crypt_info_block(
+                buffer, offset
+            )
+            self._hashable_segments = (
+                slice(None, crypt_info_start),
+                slice(offset, None),
+            )
+            with crypt_info_slice:
+                self.crypt_info = _crypt_info.CryptInfo.unpack_from(
+                    crypt_info_slice
+                )
+        else:
+            self.crypt_info = None
+            self._hashable_segments = (slice(None, None),)
+
         # Finally, get the tensor data length.
         offset = len(buffer) - self.data_length_segment.size
         self.data_length = self.data_length_segment.unpack_from(buffer, offset)[
             0
         ]
+
+    def _hashable_segment_views(self):
+        for segment_slice in self._hashable_segments:
+            yield memoryview(self.buffer)[segment_slice]
+
+    def compute_crc32(self) -> int:
+        crc32 = 0
+        for view in self._hashable_segment_views():
+            with view:
+                crc32 = zlib.crc32(view, crc32)
+        return crc32
+
+    def compute_sha256(self):
+        sha256 = hashlib.sha256()
+        for view in self._hashable_segment_views():
+            with view:
+                sha256.update(view)
+        return sha256
+
+    def compute_hashes(self) -> Dict[HashType, Any]:
+        hashes = {}
+        for hash_type in self.hashes:
+            if hash_type.type in hashes:
+                continue
+            elif hash_type.type == HashType.CRC32:
+                hashes[hash_type.type] = self.compute_crc32()
+            elif hash_type.type == HashType.SHA256:
+                hashes[hash_type.type] = self.compute_sha256()
+        return hashes
 
     @staticmethod
     def _decode_hashes(b: memoryview) -> List[TensorHash]:
@@ -646,7 +744,7 @@ class _MetadataDeserializer(dict):
                 data_length=data_length,
                 # The following fields are only available in the per-tensor headers
                 hashes=None,
-                raw_headers=None,
+                header_hashes=None,
             ),
             offset,
         )
@@ -654,6 +752,307 @@ class _MetadataDeserializer(dict):
 
 class HashMismatchError(Exception):
     pass
+
+
+@dataclasses.dataclass(init=False)
+class EncryptionParams:
+    """
+    Defines encryption parameters for a TensorSerializer.
+
+    There are three ways to use this class, mainly using its factory functions:
+
+    #. Using `EncryptionParams.random()`
+
+    This will generate a random encryption key.
+    This is the fastest and most secure option, but you must
+    save it somewhere to be able to use it for decryption later.
+
+    #. Using `EncryptionParams.from_passphrase_fast()`
+
+    This will generate a reproducible encryption key from a passphrase string,
+    using a fast algorithm (one round of SHA256 with salt).
+    This is a good choice if your passphrase is already strong,
+    such as when using a long randomly-generated string.
+    This does not provide the same protection against brute-force attempts
+    as an intentionally slow password hashing function.
+
+    #. Using `EncryptionParams(key=...)` directly
+
+    You can supply an exact key to use for encryption by directly invoking
+    the `EncryptionParams` constructor. This must be a `bytes` object of the
+    correct length to be used as an XSalsa20 cipher key.
+    This is more complicated and risky to use than the other options.
+    Do not use this with an insecure key.
+
+    Examples:
+
+        Using `EncryptionParams.from_passphrase_fast()` with
+        an environment variable::
+
+            passphrase: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
+            encryption_params = EncryptionParams.from_passphrase_fast(
+                passphrase
+            )
+
+            # Use this to encrypt something:
+            serializer = TensorSerializer(
+                "model.tensors", encryption=encryption_params
+            )
+            serializer.write_module(...)
+            serializer.close()
+
+            # Then decrypt it again
+            decryption_params = DecryptionParams.from_passphrase(passphrase)
+            deserializer = TensorDeserializer(
+                "model.tensors", encryption=decryption_params
+            )
+            deserializer.load_into_module(...)
+            deserializer.close()
+
+
+        Using `EncryptionParams.random()`::
+
+            encryption_params = EncryptionParams.random()
+
+            # Use this to encrypt something:
+            serializer = TensorSerializer(
+                "model.tensors", encryption=encryption_params
+            )
+            serializer.write_module(...)
+            serializer.close()
+
+            # Then decrypt it again
+            key: bytes = encryption_params.key
+            decryption_params = DecryptionParams.from_key(key)
+            deserializer = TensorDeserializer(
+                "model.tensors", encryption=decryption_params
+            )
+            deserializer.load_into_module(...)
+            deserializer.close()
+    """
+
+    # Not yet fully implemented:
+    # #. Using `EncryptionParams.from_passphrase_slow(passphrase)`
+    #
+    # This will generate a reproducible encryption key from a passphrase string,
+    # using a slow algorithm that is resistant against brute-force attacks.
+    # This should be used if the source passphrase is weak (or human-written).
+    #
+    # This algorithm is intentionally very slow and will slow down decryption
+    # and deserialization later. Use `EncryptionParams.from_passphrase_fast()`
+    # instead with a strong passphrase for better performance.
+
+    key: bytes
+    salt: Optional[bytes]
+    _method: int
+
+    _METHOD_FROM_PASSPHRASE_FAST: ClassVar[int] = 1
+
+    @_requires_libsodium
+    def __init__(self, key: bytes):
+        if not isinstance(key, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                "Encryption key must be binary (bytes type)."
+                " To derive an encryption key from a string or passphrase,"
+                " use EncryptionParams.from_passphrase_fast()"
+            )
+
+        if len(key) != _crypt.ChunkedEncryption.KEY_BYTES:
+            raise ValueError(
+                "Invalid encryption key length,"
+                f" should be {_crypt.ChunkedEncryption.KEY_BYTES} bytes;"
+                f" got {len(key)} bytes instead."
+                " To generate a valid encryption key from any string"
+                " or bytes object,"
+                " use EncryptionParams.from_passphrase_fast()"
+            )
+        self.key = bytes(key)
+        self.salt = None
+        self._method = 0
+
+    @classmethod
+    @_requires_libsodium
+    def random(cls) -> "EncryptionParams":
+        return cls(_crypt.random_bytes(_crypt.ChunkedEncryption.KEY_BYTES))
+
+    @staticmethod
+    @_requires_libsodium
+    def _derive_salt(
+        salt: Union[str, bytes, bytearray, memoryview, None],
+        encoding,
+        fallback_size: int = 32,
+    ) -> bytes:
+        if salt is None:
+            return _crypt.random_bytes(fallback_size)
+        elif isinstance(salt, (bytes, bytearray, memoryview)):
+            return salt
+        elif isinstance(salt, str):
+            return salt.encode(encoding)
+        else:
+            raise TypeError("Invalid object type provided for salt")
+
+    @_requires_libsodium
+    def _crypt_info_chunk(self) -> Optional[_crypt_info.CryptInfoChunk]:
+        if self._method == self._METHOD_FROM_PASSPHRASE_FAST:
+            return _crypt_info.FastKeyDerivationChunk(self.salt)
+        else:
+            return None
+
+    @classmethod
+    @_requires_libsodium
+    def from_passphrase_fast(
+        cls,
+        passphrase: Union[str, bytes],
+        salt: Union[str, bytes, None] = None,
+        encoding="utf-8",
+    ) -> "EncryptionParams":
+        """
+        Generates an encryption key from a password and salt.
+
+        Args:
+            passphrase: The source passphrase from which to derive a key.
+            salt: A non-secret cryptographic salt to be stored in the model.
+                If None (the default), a secure random salt is used.
+            encoding: The encoding to use to convert `passphrase` to bytes
+                if provided as a ``str``. Defaults to UTF-8.
+
+        Returns:
+
+        """
+        if not passphrase:
+            raise ValueError("Passphrase cannot be empty")
+        salt = cls._derive_salt(salt, encoding)
+        if isinstance(passphrase, str):
+            passphrase = passphrase.encode(encoding)
+        key_hash = hashlib.sha256(passphrase)
+        key_hash.update(salt)
+        params = cls(key=key_hash.digest())
+        params.salt = salt
+        params._method = cls._METHOD_FROM_PASSPHRASE_FAST
+        return params
+
+    # @classmethod
+    # def from_passphrase_slow(
+    #     cls,
+    #     passphrase: Union[str, bytes],
+    #     encoding="utf-8",
+    # ) -> "EncryptionParams":
+    #     if not passphrase:
+    #         raise ValueError("Passphrase cannot be empty")
+    #     salt = _crypt.random_bytes(_crypt.crypto_pwhash_SALTBYTES)
+    #     if isinstance(passphrase, str):
+    #         passphrase = passphrase.encode(encoding)
+    #     key, params = _crypt.pwhash(passphrase, salt)
+    #     return cls(key=key, salt=salt)
+
+
+@dataclasses.dataclass(init=False)
+class DecryptionParams:
+    """
+    Defines decryption parameters for a TensorDeserializer.
+
+    There are two ways to use this class, using its factory functions:
+
+    #. Using `DecryptionParams.from_passphrase()`
+
+    This will decrypt tensors using the specified passphrase string.
+    This may be used if `EncryptionParams.from_passphrase_fast()`
+    was used during encryption.
+
+    #. Using `DecryptionParams.from_key()`
+
+    This will decrypt tensors using an exact binary key.
+    This may always be used with the `key` from an `EncryptionParams` object,
+    regardless of whether the key was generated with
+    `EncryptionParams.from_passphrase_fast()`, `EncryptionParams.random()`, etc.
+
+    Examples:
+
+        Using `DecryptionParams.from_passphrase()` with
+        an environment variable::
+
+            passphrase: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
+            encryption_params = EncryptionParams.from_passphrase_fast(
+                passphrase
+            )
+
+            # Use this to encrypt something:
+            serializer = TensorSerializer(
+                "model.tensors", encryption=encryption_params
+            )
+            serializer.write_module(...)
+            serializer.close()
+
+            # Then decrypt it again
+            decryption_params = DecryptionParams.from_passphrase(passphrase)
+            deserializer = TensorDeserializer(
+                "model.tensors", encryption=decryption_params
+            )
+            deserializer.load_into_module(...)
+            deserializer.close()
+
+
+        Using `DecryptionParams.from_key()`::
+
+            encryption_params = EncryptionParams.random()
+
+            # Use this to encrypt something:
+            serializer = TensorSerializer(
+                "model.tensors", encryption=encryption_params
+            )
+            serializer.write_module(...)
+            serializer.close()
+
+            # Then decrypt it again
+            key: bytes = encryption_params.key
+            decryption_params = DecryptionParams.from_key(key)
+            deserializer = TensorDeserializer(
+                "model.tensors", encryption=decryption_params
+            )
+            deserializer.load_into_module(...)
+            deserializer.close()
+    """
+
+    key: Optional[bytes]
+    passphrase: Optional[bytes]
+
+    def __init__(self):
+        self.key = None
+        self.passphrase = None
+
+    @classmethod
+    @_requires_libsodium
+    def from_passphrase(
+        cls, passphrase: Union[str, bytes], encoding="utf-8"
+    ) -> "DecryptionParams":
+        if not passphrase:
+            raise ValueError("Passphrase cannot be empty")
+        if isinstance(passphrase, str):
+            passphrase = passphrase.encode(encoding)
+        elif not isinstance(passphrase, bytes):
+            raise TypeError("Invalid passphrase type: must be str or bytes")
+        params = cls()
+        params.passphrase = passphrase
+        return params
+
+    @classmethod
+    @_requires_libsodium
+    def from_key(cls, key: bytes) -> "DecryptionParams":
+        if not key:
+            raise ValueError("Key cannot be empty")
+        elif len(key) != _crypt.ChunkedEncryption.KEY_BYTES:
+            raise ValueError(
+                "Invalid decryption key length,"
+                f" should be {_crypt.ChunkedEncryption.KEY_BYTES} bytes;"
+                f" got {len(key)} bytes instead."
+                " DecryptionParams.from_key() should be used with a key"
+                " read from EncryptionParams.key."
+                " To decrypt with a passphrase instead of a binary key,"
+                " use DecryptionParams.from_passphrase() instead."
+            )
+        params = cls()
+        params.key = key
+        return params
 
 
 class TensorDeserializer(
@@ -690,8 +1089,8 @@ class TensorDeserializer(
         verify_hash: If True, the hashes of each tensor will be verified
             against the hashes stored in the metadata. A `HashMismatchError`
             will be raised if any of the hashes do not match.
-        passphrase: The passphrase to use to decrypt the tensors. If None,
-            the tensors will not be decrypted.
+        encryption: A `DecryptionParams` object holding a password or key
+            to use for decryption. ``None`` (the default) means no decryption.
 
     Raises:
         HashMismatchError: If ``verify_hash=True`` and a deserialized tensor
@@ -754,7 +1153,7 @@ class TensorDeserializer(
         plaid_mode: bool = False,
         plaid_mode_buffers: Optional[int] = None,
         verify_hash: bool = False,
-        passphrase: Optional[str] = None,
+        encryption: Optional[DecryptionParams] = None,
     ):
         # Whether to verify the hashes of the tensors when they are loaded.
         # This value is used when no verify_hash argument is passed to the
@@ -765,7 +1164,23 @@ class TensorDeserializer(
         # pre-emptively and cancel it if __init__ is successful
         with self._cleanup:
             self._verify_hash = verify_hash
-            self._passphrase = passphrase
+            if encryption is not None and not isinstance(
+                encryption, DecryptionParams
+            ):
+                raise TypeError(
+                    "encryption parameter: expected DecryptionParams instance"
+                    f" or None, {encryption.__class__.__name__} found"
+                )
+            self._encryption = encryption
+            self._encrypted = encryption is not None
+            if self._encrypted:
+                _require_libsodium()
+                self._decryption_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=cpu_count,
+                    thread_name_prefix="TensorizerDecryption",
+                )
+            else:
+                self._decryption_pool = None
 
             if isinstance(file_obj, (str, bytes, os.PathLike, int)):
                 self._file = stream_io.open_stream(file_obj, "rb")
@@ -806,12 +1221,35 @@ class TensorDeserializer(
                 raise ValueError("Not a tensorizer file")
 
             # Read the file header
-            self._file_header = _FileHeader.from_io(
-                self._file,
-                accepted_versions=(
+            if self._encrypted:
+                accepted_versions = (TENSORIZER_VERSION,)
+            else:
+                accepted_versions = (
                     NON_OPAQUE_TENSORIZER_VERSION,
+                    OPAQUE_TENSORIZER_VERSION,
                     TENSORIZER_VERSION,
-                ),
+                )
+            try:
+                self._file_header = _FileHeader.from_io(
+                    self._file, accepted_versions=accepted_versions
+                )
+            except _FileHeader.InvalidVersionError as e:
+                if self._encrypted and e.version in (
+                    NON_OPAQUE_TENSORIZER_VERSION,
+                    OPAQUE_TENSORIZER_VERSION,
+                ):
+                    raise CryptographyError(
+                        "Tensor decryption was requested,"
+                        " but the file provided comes from a tensorizer version"
+                        " predating encryption, so it must not be encrypted."
+                        " Either set encryption=None on the TensorDeserializer,"
+                        " or ensure that the correct file was provided."
+                    ) from e
+                else:
+                    raise
+
+            self._has_crypt_info: bool = (
+                self._file_header.version_number >= TENSORIZER_VERSION
             )
 
             # The total size of the file.
@@ -1108,24 +1546,10 @@ class TensorDeserializer(
         return self._metadata.keys()
 
     @staticmethod
-    def _get_salt_nonce(hashes: List[TensorHash]) -> Tuple[bytes, bytes, int]:
-        salt = None
-        nonce = None
-        block_sz = None
-        for hash_entry in hashes:
-            if hash_entry.type == HashType.XSALSA20:
-                salt = hash_entry.hash[:32]
-                nonce = hash_entry.hash[32:56]
-                shifts = struct.unpack("<B", hash_entry.hash[56:57])[0]
-                block_sz = 1 << shifts
-                break
-        return salt, nonce, block_sz
-
-    @staticmethod
     def _verify_hashes(
         name: str,
         hashes: Iterable[TensorHash],
-        headers: bytes,
+        header_hashes: Dict[HashType, Any],
         mv: Union[memoryview, bytes],
     ) -> None:
         """
@@ -1140,7 +1564,7 @@ class TensorDeserializer(
             hash_type = tensor_hash.type
             hash_body = tensor_hash.hash
             if hash_type == HashType.CRC32:
-                crc = zlib.crc32(mv, zlib.crc32(headers))
+                crc = zlib.crc32(mv, header_hashes[hash_type])
                 hash_crc = struct.unpack("<I", hash_body)[0]
                 if crc != hash_crc:
                     raise HashMismatchError(
@@ -1148,7 +1572,7 @@ class TensorDeserializer(
                         f"Expected {hash_crc}, got {crc}."
                     )
             elif hash_type == HashType.SHA256:
-                sha = hashlib.sha256(headers)
+                sha = header_hashes[hash_type].copy()
                 sha.update(mv)
                 sha_digest = sha.digest()
                 if sha_digest != hash_body:
@@ -1156,13 +1580,136 @@ class TensorDeserializer(
                         f"Tensor '{name}' failed SHA256 verification. "
                         f"Expected {hash_body.hex()}, got {sha_digest.hex()}."
                     )
-            elif hash_type == HashType.XSALSA20:
-                # Verification is done as part of decryption
-                pass
             else:
                 raise ValueError(
                     f"Tensor '{name}' has an invalid hash type: {hash_type}"
                 )
+
+    @staticmethod
+    def _get_encryption_method(
+        crypt_info: _crypt_info.CryptInfo,
+    ) -> _crypt_info.CryptInfoChunk:
+        encryption_method = crypt_info.find_chunks(
+            (
+                _crypt_info.XSalsa20ParallelChunk,
+                _crypt_info.XSalsa20SequentialChunk,
+            )
+        )
+        if not encryption_method:
+            raise CryptographyError("No known encryption method found in file")
+        elif len(encryption_method) > 1:
+            raise CryptographyError(
+                "Could not interpret encryption method of the file"
+            )
+        return encryption_method[0]
+
+    def _derive_encryption_key(
+        self, crypt_info: _crypt_info.CryptInfo
+    ) -> bytes:
+        if self._encryption.key is not None:
+            return self._encryption.key
+        # Requires key derivation from a passphrase
+        if self._encryption.passphrase is None:
+            raise ValueError("Invalid DecryptionParams")
+        # Check for a KeyDerivationChunk
+        kd = crypt_info.find_chunks(_crypt_info.KeyDerivationChunk)
+        if not kd:
+            raise CryptographyError(
+                "Passphrase was provided, but the tensor was"
+                " not originally encrypted using a passphrase"
+                " (i.e. EncryptionParams.from_passphrase_*)"
+            )
+        elif len(kd) > 1:
+            raise CryptographyError(
+                "Could not interpret encryption key derivation"
+                " method of the file"
+            )
+        else:
+            method = kd[0]
+            if isinstance(
+                method,
+                _crypt_info.FastKeyDerivationChunk,
+            ):
+                return EncryptionParams.from_passphrase_fast(
+                    passphrase=self._encryption.passphrase,
+                    salt=method.salt,
+                ).key
+            else:
+                # Only FastKeyDerivationChunk is currently
+                # recognized
+                raise CryptographyError("Unknown key derivation method")
+
+    def _get_decryption_manager(
+        self, encryption_method: _crypt_info.CryptInfoChunk, key: bytes, buffer
+    ) -> Union["_crypt.ChunkedEncryption", "_crypt.SequentialEncryption"]:
+        if isinstance(encryption_method, _crypt_info.XSalsa20ParallelChunk):
+            if encryption_method.num_macs == 1:
+                return _crypt.SequentialEncryption(
+                    key=key,
+                    buffer=buffer,
+                    nonce=encryption_method.nonce,
+                    mac=encryption_method.macs[0],
+                    intent=_crypt.SequentialEncryption.INTENT.DECRYPTION,
+                )
+            else:
+                nonces = _crypt.ChunkedEncryption.sequential_nonces(
+                    initial_nonce=encryption_method.nonce,
+                    count=encryption_method.num_macs,
+                )
+                return _crypt.ChunkedEncryption(
+                    key=key,
+                    buffer=buffer,
+                    chunk_size=encryption_method.chunk_size,
+                    nonces=nonces,
+                    macs=encryption_method.macs,
+                    executor=self._decryption_pool,
+                    intent=_crypt.ChunkedEncryption.INTENT.DECRYPTION,
+                )
+        elif isinstance(encryption_method, _crypt_info.XSalsa20SequentialChunk):
+            return _crypt.SequentialEncryption(
+                key=key,
+                buffer=buffer,
+                nonce=encryption_method.nonce,
+                mac=encryption_method.mac,
+                intent=_crypt.SequentialEncryption.INTENT.DECRYPTION,
+            )
+        else:
+            raise CryptographyError("Unknown encryption method")
+
+    def _stream_decrypt(
+        self, encryption_method: _crypt_info.CryptInfoChunk, key: bytes, buffer
+    ):
+        try:
+            with self._get_decryption_manager(
+                encryption_method, key, buffer
+            ) as crypto:
+                if isinstance(crypto, _crypt.ChunkedEncryption):
+                    fs = []
+                    for chunk in range(crypto.num_chunks):
+                        with crypto.chunk_view(chunk) as view:
+                            self._file.readinto(view)
+                        fs.append(crypto.decrypt_chunk(chunk))
+                    crypto.wait_or_raise(fs, timeout=_TIMEOUT)
+                else:
+                    self._file.readinto(buffer)
+                    crypto.decrypt()
+        except _crypt.CryptographyError as e:
+            raise CryptographyError("Tensor decryption failed") from e
+        finally:
+            del crypto
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _release_on_exc(mv: memoryview):
+        try:
+            yield mv
+        except GeneratorExit:
+            del mv
+            raise
+        except BaseException:
+            mv.release()
+            del mv
+            raise
 
     def _read_numpytensors(
         self,
@@ -1208,7 +1755,9 @@ class TensorDeserializer(
             tensors_read = 0
             while num_tensors == -1 or tensors_read < num_tensors:
                 header = _TensorHeaderDeserializer.from_io(
-                    self._file, zero_hashes=True
+                    self._file,
+                    zero_hashes=True,
+                    check_crypt_info=self._has_crypt_info,
                 )
 
                 if header is None:
@@ -1239,34 +1788,30 @@ class TensorDeserializer(
 
                 self._metadata[header.name].hashes = header.hashes
 
-                # Encryption handling
-                salt, nonce, block_size = self._get_salt_nonce(header.hashes)
-                if self._passphrase is None and salt is not None:
-                    # We are an encrypted tensor and we were not provided
-                    # a passphrase to decrypt with
-                    raise ValueError(
-                        "Tensor is encrypted, but no passphrase was provided"
-                    )
-                elif self._passphrase is not None and salt is None:
-                    raise ValueError(
-                        "Tensor is not encrypted, but a passphrase was provided"
-                    )
-                elif self._passphrase is not None:
-                    if isinstance(self._passphrase, str):
-                        passphrase = self._passphrase.encode("utf-8")
-                    else:
-                        passphrase = self._passphrase
-                    key = hashlib.sha256(passphrase + salt).digest()
+                header_hashes = header.compute_hashes()
+                self._metadata[header.name].header_hashes = header_hashes
 
-                    wrapped_io = DecryptedStream(
-                        self._file, key, nonce, block_size
+                is_encrypted: bool = (
+                    header.crypt_info is not None
+                    and header.crypt_info.num_chunks != 0
+                )
+                if self._encrypted and not is_encrypted:
+                    raise CryptographyError(
+                        "Tensor is not encrypted, but decryption was requested"
                     )
+                elif is_encrypted and not self._encrypted:
+                    raise CryptographyError(
+                        "Tensor is encrypted, but decryption was not requested"
+                    )
+                elif self._encrypted or is_encrypted:
+                    assert self._encrypted and is_encrypted
+                    encryption_method = self._get_encryption_method(
+                        header.crypt_info
+                    )
+                    key = self._derive_encryption_key(header.crypt_info)
                 else:
-                    wrapped_io = self._file
-
-                # Store our raw headers with hashes zeroed out
-                # for model verification
-                self._metadata[header.name].raw_headers = header.buffer
+                    key = None
+                    encryption_method = None
 
                 # We use memoryview to avoid copying the data.
                 mv: memoryview
@@ -1276,7 +1821,6 @@ class TensorDeserializer(
                     # all the tensors. We just need to slice out the
                     # memoryview for the current tensor.
                     mv = self._buffers[header.name]
-                    wrapped_io.readinto(mv)
                     self._allocated += header.data_length
                 elif self._plaid_mode:
                     # In plaid_mode, we don't allocate a buffer, we just
@@ -1286,7 +1830,6 @@ class TensorDeserializer(
                     # the buffer contents after we yield the tensor, which
                     # is loaded straight into the GPU memory.
                     mv = self._buffers[header.name]
-                    wrapped_io.readinto(mv)
                 else:
                     # In lazy_load mode, we allocate a new buffer for each
                     # tensor. This is a bit slower, but it's the only way
@@ -1295,17 +1838,20 @@ class TensorDeserializer(
                     if len(buffer) != header.data_length:
                         raise RuntimeError("Header data length mismatch")
                     mv = memoryview(buffer)
-                    wrapped_io.readinto(mv)
+
+                if not self._encrypted or mv.nbytes == 0:
+                    self._file.readinto(mv)
+                elif self._encrypted and mv.nbytes > 0:
+                    with self._release_on_exc(mv):
+                        self._stream_decrypt(encryption_method, key, mv)
 
                 if verify_hash:
-                    try:
+                    with self._release_on_exc(mv):
+                        # Releasing on an exception is necessary to prevent
+                        # a BufferError on close()
                         self._verify_hashes(
-                            header.name, header.hashes, header.buffer, mv
+                            header.name, header.hashes, header_hashes, mv
                         )
-                    except HashMismatchError:
-                        # Necessary to prevent a BufferError on close()
-                        mv.release()
-                        raise
 
                 if raw:
                     tensor = mv
@@ -1578,6 +2124,8 @@ class TensorDeserializer(
                 self._buffers = unoptimized_buffers
 
     class _AtomicCountdown:
+        __slots__ = ("_count", "_condition", "_cancelled", "_initial")
+
         def __init__(self, count: int, initial: Optional[int] = None):
             if count <= 0:
                 raise ValueError("Invalid count.")
@@ -1610,10 +2158,12 @@ class TensorDeserializer(
                 if self._count == 0:
                     self._condition.notify_all()
 
-        def reset(self) -> None:
+        def reset(self, count: Optional[int] = None) -> None:
             """Resets the internal counter."""
+            if count is not None and count <= 0:
+                raise ValueError("Invalid count.")
             with self._condition:
-                self._count = self._initial
+                self._count = self._initial if count is None else count
                 self._cancelled = False
 
         def cancel(self) -> None:
@@ -1678,17 +2228,17 @@ class TensorDeserializer(
         transfer_out_queue = queue.SimpleQueue()
         sentinel = object()
 
-        num_hash_tasks = 2
+        max_num_hash_tasks = 2
         tasks_per_tensor = 1
         if verify_hash:
-            tasks_per_tensor += num_hash_tasks
+            tasks_per_tensor += max_num_hash_tasks
 
         atomic_countdown: typing.Type = TensorDeserializer._AtomicCountdown
         if self._plaid_mode:
-            countdowns = [
-                atomic_countdown(tasks_per_tensor, 0)
+            countdowns = tuple(
+                atomic_countdown(tasks_per_tensor, initial=0)
                 for _ in range(self._plaid_mode_buffer_count)
-            ]
+            )
             countdown_cycle = itertools.cycle(countdowns)
         else:
             countdown_cycle = itertools.cycle((None,))
@@ -1705,7 +2255,7 @@ class TensorDeserializer(
                 ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, exc) == 1
             )
 
-        def receive_and_check(timeout: int = 3600) -> torch.nn.Parameter:
+        def receive_and_check(timeout: int) -> torch.nn.Parameter:
             outcome = transfer_out_queue.get(timeout=timeout)
             if outcome is sentinel:
                 raise RuntimeError("Loading failed")
@@ -1723,7 +2273,7 @@ class TensorDeserializer(
                 ):
                     while True:
                         next_tensor, countdown = transfer_in_queue.get(
-                            timeout=3600
+                            timeout=_TIMEOUT
                         )
                         next_tensor: torch.Tensor
                         countdown: Optional[atomic_countdown]
@@ -1732,7 +2282,7 @@ class TensorDeserializer(
                         try:
                             transfer_out_queue.put(
                                 self._to_torch_parameter(next_tensor),
-                                timeout=3600,
+                                timeout=_TIMEOUT,
                             )
                         finally:
                             if countdown is not None:
@@ -1777,7 +2327,7 @@ class TensorDeserializer(
 
         if verify_hash:
             computation_threads = concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(len(keys) * 2, os.cpu_count()),
+                max_workers=min(len(keys) * max_num_hash_tasks, cpu_count),
                 thread_name_prefix="TensorizerComputation",
             )
         else:
@@ -1792,7 +2342,7 @@ class TensorDeserializer(
             with memoryview(data).cast("B") as mv:
                 try:
                     self._verify_hashes(
-                        metadata.name, hashes, metadata.raw_headers, mv
+                        metadata.name, hashes, metadata.header_hashes, mv
                     )
                 finally:
                     if countdown is not None:
@@ -1828,7 +2378,9 @@ class TensorDeserializer(
                             break
                         metadata: TensorEntry = self._metadata[name]
                         self._file.seek(metadata.offset)
-                        if countdown is not None and not countdown.wait():
+                        if countdown is not None and not countdown.wait(
+                            _TIMEOUT
+                        ):
                             break
                         for *_, tensor in self.read_tensors(
                             num_tensors=1, verify_hash=False
@@ -1837,9 +2389,12 @@ class TensorDeserializer(
                         if stop:
                             break
                         tensor: torch.Tensor
+                        hashing_required = computation_threads is not None
                         if countdown is not None:
-                            countdown.reset()
-                        if computation_threads is not None:
+                            countdown.reset(
+                                1 + len(metadata.hashes) * hashing_required
+                            )
+                        if hashing_required:
                             check_hashes(name, tensor, countdown)
                         transfer_in_queue.put_nowait((tensor, countdown))
             except (Cancelled, Exception) as e:
@@ -1860,22 +2415,22 @@ class TensorDeserializer(
 
             try:
                 for key in keys[:-1]:
-                    self._cache[key] = receive_and_check()
+                    self._cache[key] = receive_and_check(_TIMEOUT)
                     yield self._cache[key]
                 # Stop before yielding the final tensor
                 # to catch up on hash verification
-                read_thread.join(timeout=3600)
+                read_thread.join(timeout=_TIMEOUT)
                 if computation_threads is not None:
                     # At this point, all checks have been added to `checks`
                     computation_threads.shutdown(wait=True)
                     # At this point, all checks have finished
                     for check in checks:
                         # This will raise if any of the checks failed
-                        check.result(timeout=3600)
+                        check.result(timeout=_TIMEOUT)
                     checks.clear()
-                self._cache[keys[-1]] = receive_and_check()
+                self._cache[keys[-1]] = receive_and_check(_TIMEOUT)
                 transfer_in_queue.put_nowait((sentinel, None))
-                transfer_thread.join(timeout=3600)
+                transfer_thread.join(timeout=_TIMEOUT)
                 yield self._cache[keys[-1]]
             except Exception:
                 stop = True
@@ -1888,13 +2443,13 @@ class TensorDeserializer(
                     transfer_thread.join(timeout=4)
                     if transfer_thread.is_alive():
                         cancel_thread(transfer_thread)
-                        transfer_thread.join(timeout=3600)
+                        transfer_thread.join(timeout=_TIMEOUT)
                 if read_thread.is_alive():
                     # A graceful exit is again preferred, but not necessary
                     read_thread.join(timeout=2)
                     if read_thread.is_alive():
                         cancel_thread(read_thread)
-                        read_thread.join(timeout=3600)
+                        read_thread.join(timeout=_TIMEOUT)
                 for check in checks:
                     check.cancel()
                 raise
@@ -2032,7 +2587,7 @@ class TensorDeserializer(
                     self._verify_hashes(
                         name,
                         entry.hashes,
-                        entry.raw_headers,
+                        entry.header_hashes,
                         mv,
                     )
                 results.append((name, True))
@@ -2091,11 +2646,10 @@ class TensorSerializer:
     Args:
         file_obj: A file-like object or path to a file to write to. The path
             can be a S3 URI.
-        passphrase: A passphrase to use for encryption. If None, no encryption
-            will be used.
-        salt: A salt to use for encryption. If None, a random salt will be
-            generated.
-        compress_tensors: If True, compress the tensors using lz4. This
+        encryption: An `EncryptionParams` object holding a password or key
+            to use for encryption. If None, no encryption will be used.
+        compress_tensors: Not implemented. Specifying this option does nothing.
+            Previously, if True, compress the tensors using lz4. This
             exists as an internal curiosity as it doesn't seem to make
             much of a difference in practice.
 
@@ -2139,9 +2693,8 @@ class TensorSerializer:
             int,
         ],
         compress_tensors: bool = False,
-        passphrase: Optional[Union[str, bytes]] = None,
-        salt: Optional[Union[str, bytes]] = None,
-        crypt_chunk_size: int = 2048,
+        *,
+        encryption: Optional[EncryptionParams] = None,
     ) -> None:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "wb+")
@@ -2149,23 +2702,23 @@ class TensorSerializer:
             self._mode_check(file_obj)
             self._file = file_obj
 
-        self._cleartext_chunk_size = crypt_chunk_size
-        self._crypt_chunk_size = (
-            crypt_chunk_size + nacl.secret.SecretBox.MACBYTES
-        )
-        if passphrase is not None:
-            if salt is None:
-                salt = os.urandom(32)
-            elif isinstance(salt, str):
-                salt = salt.encode("utf-8")
-            self._salt = salt
-            # Convert our passphrase to bytes
-            if isinstance(passphrase, str):
-                passphrase = passphrase.encode("utf-8")
-            self._crypto_key = hashlib.sha256(passphrase + salt).digest()
-            self._lockbox = nacl.secret.SecretBox(self._crypto_key)
+        if encryption is not None and not isinstance(
+            encryption, EncryptionParams
+        ):
+            raise TypeError(
+                "encryption parameter: expected EncryptionParams instance"
+                f" or None, {encryption.__class__.__name__} found"
+            )
+        self._encryption = encryption
+        self._encrypted = encryption is not None
+        self._used_nonces: Optional[Set[bytes]]
+        if self._encrypted:
+            _require_libsodium()
+            self._crypt_chunk_size = 2 << 20
+            self._used_nonces = set()
         else:
-            self._lockbox = None
+            self._crypt_chunk_size = None
+            self._used_nonces = None
 
         # Get information about the file object's capabilities
         _fd_getter = getattr(self._file, "fileno", None)
@@ -2201,7 +2754,7 @@ class TensorSerializer:
         # multithreading in spite of the GIL because CPython's hash function
         # implementations release the GIL during longer hash computations.
         self._computation_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=os.cpu_count(),
+            max_workers=cpu_count,
             thread_name_prefix="TensorizerComputation",
         )
 
@@ -2229,6 +2782,19 @@ class TensorSerializer:
             thread_name_prefix="TensorizerHeaderWriter",
         )
 
+        if self._encrypted:
+            self._encryption_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_concurrent_writers,
+                thread_name_prefix="TensorizerEncryption",
+            )
+
+            self._decryption_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_concurrent_writers,
+                thread_name_prefix="TensorizerDecryption",
+            )
+        else:
+            self._encryption_pool = self._decryption_pool = None
+
         # Implementation detail for CPython: ThreadPoolExecutor objects
         # use an instance of queue.SimpleQueue as a FIFO work queue,
         # so the order that tasks are started (but not necessarily finished)
@@ -2253,15 +2819,23 @@ class TensorSerializer:
         self._file.write(TENSORIZER_MAGIC)
 
         # Write file header metadata
+        if not self._encrypted:
+            # Can't tell if OPAQUE_TENSORIZER_VERSION is needed
+            # until a tensor is written later with an opaque dtype,
+            # so assume it is non-opaque until then.
+            version_number = NON_OPAQUE_TENSORIZER_VERSION
+        else:
+            # File encryption requires a newer tensorizer version
+            version_number = TENSORIZER_VERSION
         self._file_header_loc = self._file.tell()
         self._file_header = _FileHeader(
-            version_number=NON_OPAQUE_TENSORIZER_VERSION,
+            version_number=version_number,
             tensor_size=0,
             tensor_count=0,
         )
         self._file.write(self._file_header.to_bytes())
 
-        # Reserve 256kb for metadata.
+        # Reserve 256 KiB for metadata.
         metadata_size = 256 * 1024
         self._file.write(struct.pack("<Q", metadata_size))
         self._metadata_loc = self._file.tell()
@@ -2394,7 +2968,7 @@ class TensorSerializer:
 
     def _synchronize_pools(self):
         for j in self._jobs:
-            j.result(timeout=3600)
+            j.result(timeout=_TIMEOUT)
         self._jobs.clear()
 
     def close(self) -> None:
@@ -2414,6 +2988,28 @@ class TensorSerializer:
         #     logger.info(f"Uncomp'd bytes: {self.total_tensor_bytes}")
         #     logger.info(f"Comp'd bytes: {self.total_compressed_tensor_bytes}")
         #     logger.info(f"Ratio: {compression_ratio:.2f}")
+
+    def _new_nonces(self, count: int) -> Tuple[bytes, ...]:
+        if count < 0:
+            raise ValueError("Invalid nonce count")
+        elif count == 0:
+            return ()
+        elif self._used_nonces is None:
+            raise RuntimeError(
+                "Tried to create cryptographic nonces while"
+                " encryption is disabled"
+            )
+        nonces = tuple(
+            _crypt.ChunkedEncryption.sequential_nonces(
+                initial_nonce=_crypt.ChunkedEncryption.random_nonce(),
+                count=count,
+            )
+        )
+
+        if self._used_nonces.intersection(nonces):
+            raise RuntimeError("Illegal nonce reuse")
+        self._used_nonces.update(nonces)
+        return nonces
 
     def write_tensor(
         self,
@@ -2468,6 +3064,7 @@ class TensorSerializer:
         *,
         _synchronize: bool = True,
         _start_pos: Optional[int] = None,
+        _temporary_buffer: bool = False,
     ) -> int:
         """
         Underlying implementation for `write_tensor()`,
@@ -2488,16 +3085,31 @@ class TensorSerializer:
                 writes starting at the current file offset.
         """
         if isinstance(tensor, torch.Tensor):
-            numpy_tensor = _NumpyTensor.from_tensor(tensor)
+            if not tensor.is_contiguous():
+                _temporary_buffer = True
+            numpy_tensor = _NumpyTensor.from_tensor(tensor.contiguous())
         else:
-            numpy_tensor = _NumpyTensor.from_array(tensor)
+            if (
+                isinstance(tensor, numpy.ndarray)
+                and not tensor.flags.c_contiguous
+                and hasattr(numpy, "ascontiguousarray")
+            ):
+                numpy_tensor = _NumpyTensor.from_array(
+                    numpy.ascontiguousarray(tensor)
+                )
+                _temporary_buffer = True
+            else:
+                numpy_tensor = _NumpyTensor.from_array(tensor)
 
         dtype_name = numpy_tensor.numpy_dtype
         if numpy_tensor.is_opaque:
             # The datatype name needs to contain both the numpy dtype that the
             # data is serialized as and the original torch dtype.
             dtype_name += OPAQUE_DTYPE_SEP + numpy_tensor.torch_dtype
-            self._file_header.version_number = TENSORIZER_VERSION
+            self._file_header.version_number = max(
+                OPAQUE_TENSORIZER_VERSION,
+                self._file_header.version_number,
+            )
 
         tensor = numpy_tensor.data
         tensor_memory = numpy_tensor.data.data
@@ -2508,6 +3120,41 @@ class TensorSerializer:
             raise ValueError("dtype name length should be less than 256")
         shape = tensor.shape
         header_pos = self._file.tell() if _start_pos is None else _start_pos
+
+        if self._encrypted:
+            chunks = _Chunked(
+                total_size=tensor_memory.nbytes,
+                chunk_size=self._crypt_chunk_size,
+            )
+            nonces = self._new_nonces(chunks.count)
+            encryptor = _crypt.ChunkedEncryption(
+                key=self._encryption.key,
+                buffer=tensor_memory,
+                chunk_size=self._crypt_chunk_size,
+                nonces=nonces,
+                executor=self._computation_pool,
+            )
+
+            key_derivation_chunk = self._encryption._crypt_info_chunk()
+            encryption_algorithm_chunk = _crypt_info.XSalsa20ParallelChunk(
+                chunk_size=self._crypt_chunk_size,
+                nonce=nonces[0],
+                macs=encryptor.macs,
+            )
+            if key_derivation_chunk is not None:
+                chunks = (key_derivation_chunk, encryption_algorithm_chunk)
+            else:
+                chunks = (encryption_algorithm_chunk,)
+            crypt_info = _crypt_info.CryptInfo(chunks)
+        else:
+            encryptor = None
+            if self._file_header.version_number == TENSORIZER_VERSION:
+                crypt_info = _crypt_info.CryptInfo()
+            else:
+                crypt_info = None
+
+        include_crc32: bool = not self._encrypted
+
         header = _TensorHeaderSerializer(
             idx,
             tensor_type,
@@ -2516,7 +3163,9 @@ class TensorSerializer:
             shape,
             tensor_size,
             header_pos,
-            self._lockbox is not None,
+            include_crc32=include_crc32,
+            include_sha256=True,
+            crypt_info=crypt_info,
         )
 
         tensor_pos = header_pos + header.data_offset
@@ -2542,113 +3191,114 @@ class TensorSerializer:
         # These two tasks are CPU-bound and don't block the GIL,
         # so they go into the computation thread pool.
         def compute_crc32():
-            crc32 = zlib.crc32(header.buffer)
+            crc32 = header.compute_crc32()
             return zlib.crc32(tensor_memory, crc32)
 
         def compute_sha256():
-            sha256 = hashlib.sha256(header.buffer)
+            sha256 = header.compute_sha256()
             sha256.update(tensor_memory)
             return sha256.digest()
-
-        def encrypt_tensor() -> Tuple[Optional[bytes], Optional[bytes]]:
-            start = time.monotonic()
-            if self._lockbox is None:
-                return None, None
-            nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
-            nonce_int = int.from_bytes(
-                nonce,
-                "big",
-                signed=False,
-            )
-
-            num_chunks = math.ceil(
-                tensor_memory.nbytes / self._cleartext_chunk_size
-            )
-            cryptotext_size = num_chunks * self._crypt_chunk_size
-            cryptotext = bytearray(cryptotext_size)
-            cryptotext_end = 0
-            tensor_bytes = memoryview(tensor_memory.tobytes())
-            setup_end = time.monotonic()
-
-            chunk_repr = ""
-
-            for i in range(num_chunks):
-                # We XOR the nonce with the chunk index to avoid nonce reuse.
-                step_nonce = nonce_int ^ i
-                step_nonce_bytes = step_nonce.to_bytes(
-                    nacl.secret.SecretBox.NONCE_SIZE, "big", signed=False
-                )
-                plaintext_begin = i * self._cleartext_chunk_size
-                plaintext_end = plaintext_begin + self._cleartext_chunk_size
-                if plaintext_end > tensor_memory.nbytes:
-                    plaintext_end = tensor_memory.nbytes
-                to_encrypt = tensor_bytes[plaintext_begin:plaintext_end]
-                chunk = self._lockbox.encrypt(
-                    to_encrypt,
-                    step_nonce_bytes,
-                ).ciphertext
-                cryptotext_begin = i * self._crypt_chunk_size
-                cryptotext_end = cryptotext_begin + len(chunk)
-                cryptotext[cryptotext_begin:cryptotext_end] = chunk
-                encryption_header_size = len(chunk) - len(to_encrypt)
-            end = time.monotonic()
-            duration_setup_ms = (setup_end - start) * 1000
-            duration_ms = (end - start) * 1000
-            print(
-                f"Pos: {tensor_pos} - Size: {tensor_size} - Encryption time:"
-                f" {duration_ms:.2f}ms, setup: {duration_setup_ms:.2f}ms,"
-                f" {cryptotext_end} bytes, {encryption_header_size} header"
-                f" size, {chunk_repr}"
-            )
-
-            return nonce, cryptotext[:cryptotext_end]
 
         # This task is I/O-bound and dependent on the previous two tasks,
         # so it goes into the header writer pool.
         def commit_header(
-            crc32_future: concurrent.futures.Future,
-            sha256_future: concurrent.futures.Future,
-            encrypt_future: concurrent.futures.Future,
+            crc32_future: Optional[concurrent.futures.Future],
+            sha256_future: Optional[concurrent.futures.Future],
+            encrypt_future: Optional[concurrent.futures.Future],
         ):
-            crc32 = crc32_future.result(3600)
-            sha256 = sha256_future.result(3600)
-            nonce, encrypted = encrypt_future.result(3600)
-            header.add_crc32(crc32)
-            header.add_sha256(sha256)
-            if encrypted is not None:
-                header.add_xsalsa20(self._salt, nonce, self._crypt_chunk_size)
-                header.update_data_length(len(encrypted))
+            crc32 = sha256 = None
+            if crc32_future is not None:
+                crc32 = crc32_future.result(_TIMEOUT)
+            if sha256_future is not None:
+                sha256 = sha256_future.result(_TIMEOUT)
+            if encrypt_future is not None:
+                encrypt_future.result(_TIMEOUT)
+            # These must be written only after all other futures complete
+            # to prevent a race condition from other threads hashing
+            # a partially-filled-in hash section
+            if crc32_future is not None:
+                header.add_crc32(crc32)
+            if sha256_future is not None:
+                header.add_sha256(sha256)
+            if encrypt_future is not None:
+                header.update_crypt_info()
             self._pwrite(header.buffer, header_pos)
 
-        crc32_task = self._computation_pool.submit(compute_crc32)
+        hash_tasks = []
+        if include_crc32:
+            crc32_task = self._computation_pool.submit(compute_crc32)
+            hash_tasks.append(crc32_task)
+        else:
+            crc32_task = None
         sha256_task = self._computation_pool.submit(compute_sha256)
-        encrypt_task = self._computation_pool.submit(encrypt_tensor)
+        hash_tasks.append(sha256_task)
+        self._jobs.extend(hash_tasks)
+
+        def encrypt(prerequisites: Iterable[concurrent.futures.Future]):
+            fs = concurrent.futures.wait(prerequisites, timeout=_TIMEOUT)
+            for f in fs.done:
+                # Raise exceptions
+                f.result()
+            for f in fs.not_done:
+                # Raise timeouts
+                f.result(0)
+            try:
+                encryptor.encrypt_all(
+                    wait=True,
+                    timeout=_TIMEOUT,
+                )
+            except _crypt.CryptographyError as e:
+                raise CryptographyError("Tensor encryption failed") from e
+
+        # This task is I/O-bound, so it goes into the regular writer pool.
+        def write_tensor_data(
+            prerequisite: Optional[concurrent.futures.Future],
+        ):
+            if prerequisite is not None:
+                prerequisite.result(_TIMEOUT)
+            bytes_written = self._pwrite(tensor_memory, tensor_pos)
+            with self._tensor_count_update_lock:
+                self._file_header.tensor_count += 1
+                self._file_header.tensor_size += bytes_written
+
+        def decrypt(prerequisite: concurrent.futures.Future):
+            try:
+                prerequisite.result(_TIMEOUT)
+            finally:
+                # Try to decrypt again even if writing to disk failed
+                # to avoid exiting with the tensor memory in a modified state
+                fs = encryptor.decrypt_all(wait=False)
+                try:
+                    _crypt.ChunkedEncryption.wait_or_raise(
+                        fs,
+                        timeout=_TIMEOUT,
+                        return_when=concurrent.futures.ALL_COMPLETED,
+                    )
+                except _crypt.CryptographyError as e:
+                    raise CryptographyError(
+                        "Restoring encrypted tensor data in memory failed"
+                    ) from e
+
+        # Encrypt the tensor memory in-place before writing
+        if self._encrypted:
+            encrypt_task = self._encryption_pool.submit(encrypt, hash_tasks)
+            self._jobs.append(encrypt_task)
+        else:
+            encrypt_task = None
 
         commit_header_task = self._header_writer_pool.submit(
             commit_header, crc32_task, sha256_task, encrypt_task
         )
-        self._jobs.extend(
-            (encrypt_task, crc32_task, sha256_task, commit_header_task)
-        )
+        self._jobs.append(commit_header_task)
 
-        # This task is I/O-bound and has no prerequisites,
-        # so it goes into the regular writer pool.
-        def write_tensor_data():
-            _, encrypted = encrypt_task.result(3600)
-            if encrypted is not None:
-                self._pwrite(encrypted, tensor_pos)
-            else:
-                self._pwrite(tensor_memory, tensor_pos)
-            with self._tensor_count_update_lock:
-                self._file_header.tensor_count += 1
-                self._file_header.tensor_size += tensor_memory.nbytes
+        # Write the potentially-encrypted tensor memory to the file
+        write_task = self._writer_pool.submit(write_tensor_data, encrypt_task)
+        self._jobs.append(write_task)
+        # Decrypt the memory after writing is finished, if it was encrypted
+        if self._encrypted and not _temporary_buffer:
+            self._jobs.append(self._decryption_pool.submit(decrypt, write_task))
 
-        self._jobs.append(self._writer_pool.submit(write_tensor_data))
-        tensor_encrypted_payload = encrypt_task.result(3600)[1]
-        if tensor_encrypted_payload is not None:
-            tensor_endpos = tensor_pos + len(tensor_encrypted_payload)
-        else:
-            tensor_endpos = tensor_pos + tensor_size
+        tensor_endpos = tensor_pos + tensor_size
 
         # Update our prologue.
         if _synchronize:
@@ -2713,7 +3363,7 @@ class TensorSerializer:
                 for t in tensors:
                     if transfer_finished:
                         break
-                    transferred.put(t.cpu().detach(), timeout=3600)
+                    transferred.put(t.cpu().detach(), timeout=_TIMEOUT)
                 else:
                     # Sentinel
                     transferred.put(None)
@@ -2736,7 +3386,7 @@ class TensorSerializer:
                     pass
 
         return (
-            iter(lambda: transferred.get(timeout=3600), None),
+            iter(lambda: transferred.get(timeout=_TIMEOUT), None),
             _interrupt_transfer,
         )
 
@@ -2754,7 +3404,9 @@ class TensorSerializer:
         fallocate = getattr(os, "posix_fallocate", None)
         if fallocate and self._fd:
             size = sum(len(t.name) for t in tensors)
-            size += sum(t.tensor.untyped_storage().size() for t in tensors)
+            size += sum(
+                t.tensor.element_size() * t.tensor.nelement() for t in tensors
+            )
             # Rough underestimate of header size
             header_min_size = 24
             size += header_min_size * len(tensors)
@@ -2780,6 +3432,9 @@ class TensorSerializer:
                 idx, name, tensor_type, tensor, callback = tensors.popleft()
                 if tensor.device.type == "cuda":
                     tensor = next(transferred)
+                    temp_tensor = True
+                else:
+                    temp_tensor = False
                 next_pos = self._write_tensor(
                     self._idx,
                     name,
@@ -2787,6 +3442,7 @@ class TensorSerializer:
                     tensor,
                     _synchronize=False,
                     _start_pos=next_pos,
+                    _temporary_buffer=temp_tensor,
                 )
                 if callback is not None:
                     callback()

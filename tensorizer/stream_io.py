@@ -18,7 +18,6 @@ from urllib.parse import urlparse
 
 import boto3
 import botocore
-import nacl.secret
 import redis
 
 import tensorizer._version as _version
@@ -185,104 +184,6 @@ class CAInfo:
 
     def __hash__(self):
         return hash(self._curl_flags)
-
-
-class DecryptedStream(io.RawIOBase):
-    """
-    This class is a file-like object that wraps a mixed stream of encrypted and
-    decrypted data. It is intended to be called when it is known that the next
-    read is going to be a decryption operation.
-    """
-
-    def __init__(
-        self,
-        stream: io.RawIOBase,
-        key: bytes,
-        nonce: bytes,
-        chunk_size: int = 1024 << 8,
-    ):
-        self._stream = stream
-        self._lockbox = nacl.secret.SecretBox(key)
-        self._nonce_int = int.from_bytes(nonce, "big", signed=False)
-        self._chunk_size = chunk_size
-        self._ciphertext_chunk_sz = chunk_size + self._lockbox.MACBYTES
-        self._ciphertext_buffer = bytearray(self._ciphertext_chunk_sz)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def __del__(self):
-        self.close()
-
-    def tell(self) -> int:
-        return self._stream.tell()
-
-    def readinto(self, ba: bytearray) -> int:
-        goal = len(ba)
-        if goal == 0:
-            return 0
-        # Read in chunks of self._chunk_size and decrypt them into ba
-        # until we have enough bytes.
-        ciphertext_offset = 0
-        plaintext_offset = 0
-        num_chunks = goal // self._chunk_size
-        if goal % self._chunk_size:
-            num_chunks += 1
-        ciphertext_goal = goal + (num_chunks * self._lockbox.MACBYTES)
-
-        step = 0
-        while ciphertext_offset < ciphertext_goal:
-            step_nonce = self._nonce_int ^ step
-            step_nonce_bytes = step_nonce.to_bytes(
-                nacl.secret.SecretBox.NONCE_SIZE, "big", signed=False
-            )
-            if ciphertext_offset + self._ciphertext_chunk_sz > ciphertext_goal:
-                ciphertext_read_sz = ciphertext_goal - ciphertext_offset
-                ciphertext = memoryview(self._ciphertext_buffer)[
-                    :ciphertext_read_sz
-                ]
-            else:
-                ciphertext_read_sz = self._ciphertext_chunk_sz
-                ciphertext = self._ciphertext_buffer
-            if ciphertext_read_sz == 0:
-                break
-            plaintext_sz = self._chunk_size
-            if goal - plaintext_offset < plaintext_sz:
-                plaintext_sz = goal - plaintext_offset
-            self._stream.readinto(ciphertext)
-            ba[plaintext_offset : plaintext_offset + plaintext_sz] = (
-                self._lockbox.decrypt(ciphertext, step_nonce_bytes)
-            )
-            step += 1
-            ciphertext_offset += ciphertext_read_sz
-            plaintext_offset += plaintext_sz
-
-    def read(self, size=-1) -> bytes:
-        buf = bytearray(size)
-        bytes_read = self.readinto(buf)
-        return bytes(buf[:bytes_read])
-
-    def writable(self) -> bool:
-        return False
-
-    def fileno(self) -> int:
-        return self._stream.fileno()
-
-    def close(self):
-        # We are a passive wrapper, so we don't close the underlying stream.
-        pass
-
-    def closed(self):
-        return self._stream.closed
-
-    def readline(self, size=-1) -> bytes:
-        return self._stream.readline(size)
-
-    def seek(self, position, whence=SEEK_SET):
-        self._stream.seek(position, whence)
 
 
 class CURLStreamFile(io.RawIOBase):
@@ -589,6 +490,7 @@ class CURLStreamFile(io.RawIOBase):
                 self._curl.stdout.close()
             self._curl = None
 
+    @property
     def closed(self):
         return self._closed
 

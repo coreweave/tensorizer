@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Tensor encryption
+  - Encrypts all tensor weights in a file with minimal overhead
+  - Doesn't encrypt tensor metadata, such as:
+    - Tensor name
+    - Tensor `dtype`
+    - Tensor shape & size
+  - Requires an up-to-date version of `libsodium`
+    - Use `apt-get install libsodium23` on Ubuntu or Debian
+    - On other platforms, follow the
+      [installation instructions from the libsodium documentation](https://doc.libsodium.org/installation)
+    - Takes up less than 500 KiB once installed
+  - Uses a parallelized version of XSalsa20-Poly1305 as its encryption algorithm
+    - Splits each tensor's weights into &leq; 2 MiB chunks, encrypted separately
+  - Example usage: see [examples/encryption.py](examples/encryption.py)
+
 ## [2.6.0] - 2023-10-30
 
 ### Added
@@ -220,6 +239,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.6.0...HEAD
 [2.6.0]: https://github.com/coreweave/tensorizer/compare/v2.5.1...v2.6.0
 [2.5.1]: https://github.com/coreweave/tensorizer/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/coreweave/tensorizer/compare/v2.4.0...v2.5.0
