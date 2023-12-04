@@ -48,10 +48,12 @@ class CryptInfoChunk(abc.ABC):
         return buffer.getvalue()
 
     def sized_pack_into(self, buffer, offset: int = 0) -> int:
-        start = offset
+        length_offset = offset
         offset += CryptInfoChunk._length_segment.size
         ret = self.pack_into(buffer, offset)
-        CryptInfoChunk._length_segment.pack_into(buffer, start, ret - start)
+        CryptInfoChunk._length_segment.pack_into(
+            buffer, length_offset, ret - offset
+        )
         return ret
 
     @property
@@ -336,8 +338,8 @@ class CryptInfo:
                 chunk_size: int = CryptInfo._chunk_length_segment.unpack_from(
                     buffer, offset
                 )[0]
-                chunk_end: int = offset + chunk_size
                 offset += CryptInfo._chunk_length_segment.size
+                chunk_end: int = offset + chunk_size
                 with mv[offset:chunk_end] as chunk_mv:
                     # Blocks out-of-bounds accesses
                     chunks.append(CryptInfoChunk.unpack_from(chunk_mv))
