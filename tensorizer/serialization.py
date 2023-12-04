@@ -2767,6 +2767,7 @@ class TensorSerializer:
         self.total_compressed_tensor_bytes = 0
         self.compress_tensors = compress_tensors
 
+        self._pools = []
         # This thread pool handles CPU-bound tasks like hashing.
         # Hashing from the Python standard library can benefit from
         # multithreading in spite of the GIL because CPython's hash function
@@ -2775,6 +2776,7 @@ class TensorSerializer:
             max_workers=cpu_count,
             thread_name_prefix="TensorizerComputation",
         )
+        self._pools.append(self._computation_pool)
 
         # There is no use spawning many writer threads when they share a lock.
         max_concurrent_writers = 4 if concurrent_writes_possible else 1
@@ -2785,6 +2787,7 @@ class TensorSerializer:
             max_workers=max_concurrent_writers,
             thread_name_prefix="TensorizerWriter",
         )
+        self._pools.append(self._writer_pool)
 
         self._tensor_count_update_lock = threading.Lock()
 
@@ -2799,17 +2802,20 @@ class TensorSerializer:
             max_workers=max_concurrent_writers,
             thread_name_prefix="TensorizerHeaderWriter",
         )
+        self._pools.append(self._header_writer_pool)
 
         if self._encrypted:
             self._encryption_pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_concurrent_writers,
                 thread_name_prefix="TensorizerEncryption",
             )
+            self._pools.append(self._encryption_pool)
 
             self._decryption_pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_concurrent_writers,
                 thread_name_prefix="TensorizerDecryption",
             )
+            self._pools.append(self._decryption_pool)
         else:
             self._encryption_pool = self._decryption_pool = None
 
@@ -2982,12 +2988,10 @@ class TensorSerializer:
             self._file.close()
 
     def _shutdown_thread_pools(self):
-        for pool in "_computation_pool", "_writer_pool", "_header_writer_pool":
-            thread_pool = getattr(self, pool, None)
-            if thread_pool is not None:
-                for j in self._jobs:
-                    j.cancel()
-                thread_pool.shutdown(wait=False)
+        for j in getattr(self, "_jobs", ()):
+            j.cancel()
+        for thread_pool in getattr(self, "_pools", ()):
+            thread_pool.shutdown(wait=False)
 
     def _synchronize_pools(self):
         for j in self._jobs:
