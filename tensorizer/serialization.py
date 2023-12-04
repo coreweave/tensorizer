@@ -3500,6 +3500,7 @@ class TensorSerializer:
             while tensors:
                 idx, name, tensor_type, tensor, callback = tensors.popleft()
                 is_shared = shared.pop()
+                self._idx = idx
                 if tensor.device.type == "cuda":
                     tensor = next(transferred)
                     temp_tensor = True
@@ -3518,7 +3519,7 @@ class TensorSerializer:
                 else:
                     temp_tensor = False
                 next_pos = self._write_tensor(
-                    self._idx,
+                    idx,
                     name,
                     tensor_type,
                     tensor,
@@ -3528,7 +3529,6 @@ class TensorSerializer:
                 )
                 if callback is not None:
                     callback()
-                self._idx = idx
         except Exception:
             if interrupt_transfer is not None:
                 interrupt_transfer()
