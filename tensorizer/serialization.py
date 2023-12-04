@@ -874,6 +874,16 @@ class EncryptionParams:
     @classmethod
     @_requires_libsodium
     def random(cls) -> "EncryptionParams":
+        """
+        Generates a random encryption key with no associated passphrase.
+
+        This is the fastest and most secure option, but you must
+        save the resulting key (from ``EncryptionParams.key``)
+        somewhere to be able to use it for decryption later.
+
+        Returns:
+            An `EncryptionParams` instance to pass to a `TensorSerializer`.
+        """
         return cls(_crypt.random_bytes(_crypt.ChunkedEncryption.KEY_BYTES))
 
     @staticmethod
@@ -910,6 +920,13 @@ class EncryptionParams:
         """
         Generates an encryption key from a password and salt.
 
+        This will generate a reproducible encryption key from a passphrase
+        string, using a fast algorithm (one round of SHA256 with salt).
+        This is a good choice if your passphrase is already strong,
+        such as when using a long randomly-generated string.
+        This does not provide the same protection against brute-force attempts
+        as an intentionally slow password hashing function.
+
         Args:
             passphrase: The source passphrase from which to derive a key.
             salt: A non-secret cryptographic salt to be stored in the model.
@@ -918,7 +935,7 @@ class EncryptionParams:
                 if provided as a ``str``. Defaults to UTF-8.
 
         Returns:
-
+            An `EncryptionParams` instance to pass to a `TensorSerializer`.
         """
         if not passphrase:
             raise ValueError("Passphrase cannot be empty")
@@ -932,19 +949,32 @@ class EncryptionParams:
         params._method = cls._METHOD_FROM_PASSPHRASE_FAST
         return params
 
-    # @classmethod
-    # def from_passphrase_slow(
-    #     cls,
-    #     passphrase: Union[str, bytes],
-    #     encoding="utf-8",
-    # ) -> "EncryptionParams":
-    #     if not passphrase:
-    #         raise ValueError("Passphrase cannot be empty")
-    #     salt = _crypt.random_bytes(_crypt.crypto_pwhash_SALTBYTES)
-    #     if isinstance(passphrase, str):
-    #         passphrase = passphrase.encode(encoding)
-    #     key, params = _crypt.pwhash(passphrase, salt)
-    #     return cls(key=key, salt=salt)
+    @classmethod
+    def from_passphrase_slow(
+        cls,
+        passphrase: Union[str, bytes],
+        encoding="utf-8",
+    ) -> "EncryptionParams":
+        """
+        Generates an encryption key from a password and salt.
+
+        Args:
+            passphrase: The source passphrase from which to derive a key.
+            salt: A non-secret cryptographic salt to be stored in the model.
+                If None (the default), a secure random salt is used.
+            encoding: The encoding to use to convert `passphrase` to bytes
+                if provided as a ``str``. Defaults to UTF-8.
+
+        Returns:
+            An `EncryptionParams` instance to pass to a `TensorSerializer`
+        """
+        if not passphrase:
+            raise ValueError("Passphrase cannot be empty")
+        salt = _crypt.random_bytes(_crypt.crypto_pwhash_SALTBYTES)
+        if isinstance(passphrase, str):
+            passphrase = passphrase.encode(encoding)
+        key, params = _crypt.pwhash(passphrase, salt)
+        return cls(key=key, salt=salt)
 
 
 @dataclasses.dataclass(init=False)
