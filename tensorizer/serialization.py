@@ -1479,6 +1479,25 @@ class TensorDeserializer(
         else:
             return None
 
+    def _read_single_tensor(
+        self, expected_name: str, *args, **kwargs
+    ) -> torch.Tensor:
+        tensors = tuple(self.read_tensors(*args, **kwargs, num_tensors=1))
+        num_tensors = len(tensors)
+        if num_tensors == 0:
+            raise RuntimeError("Tensor not found")
+        elif num_tensors > 1:
+            raise RuntimeError(
+                f"Found too many tensors: expected 1, found {num_tensors}"
+            )
+        *_, name, tensor = tensors[0]
+        if name != expected_name:
+            raise RuntimeError(
+                "Encountered unexpected tensor:"
+                f" expected {expected_name!r}, found {name!r}"
+            )
+        return tensor
+
     def __getitem__(self, name) -> torch.nn.Parameter:
         if name in self._cache and self._cache[name] is not None:
             return self._cache[name]
@@ -1489,8 +1508,8 @@ class TensorDeserializer(
         # forward in a stream works well even for HTTP/HTTPS streams.
         if name in self._metadata:
             self._file.seek(self._metadata[name].offset)
-            tensor_arr = tuple(self.read_tensors(num_tensors=1))[0][3]
-            self._cache[name] = self._to_torch_parameter(tensor_arr)
+            tensor = self._read_single_tensor(name)
+            self._cache[name] = self._to_torch_parameter(tensor)
             return self._cache[name]
         else:
             raise KeyError(f"Tensor {name} not found")
@@ -2383,13 +2402,11 @@ class TensorDeserializer(
                             _TIMEOUT
                         ):
                             break
-                        for *_, tensor in self.read_tensors(
-                            num_tensors=1, verify_hash=False
-                        ):
-                            pass
+                        tensor = self._read_single_tensor(
+                            name, verify_hash=False
+                        )
                         if stop:
                             break
-                        tensor: torch.Tensor
                         hashing_required = computation_threads is not None
                         if countdown is not None:
                             countdown.reset(
