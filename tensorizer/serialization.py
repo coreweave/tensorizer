@@ -2910,7 +2910,9 @@ class TensorSerializer:
         self._file.seek(curr)
         self._flush()
 
-    def _pwrite(self, data, offset: int, verify: bool = True) -> int:
+    def _pwrite(
+        self, data, offset: int, verify: Union[bool, int] = True
+    ) -> int:
         """
         Thread-safe file write that leaves the file offset unchanged.
 
@@ -2930,15 +2932,21 @@ class TensorSerializer:
         # based on the capabilities of the platform and the file object used
         raise RuntimeError("pwrite was called before being initialized")
 
-    def _pwrite_syscall(self, data, offset: int, verify: bool = True) -> int:
+    def _pwrite_syscall(
+        self, data, offset: int, verify: Union[bool, int] = True
+    ) -> int:
         # This implementation of pwrite uses a Unix syscall, and is safe to
         # run even between normal file writes.
         bytes_written = os.pwrite(self._fd, data, offset)
-        if verify:
-            self._verify_bytes_written(bytes_written, data)
+        if isinstance(verify, int):
+            self._verify_bytes_written(bytes_written, verify)
+        elif verify:
+            self._verify_bytes_written(bytes_written, self._buffer_size(data))
         return bytes_written
 
-    def _pwrite_fallback(self, data, offset: int, verify: bool = True) -> int:
+    def _pwrite_fallback(
+        self, data, offset: int, verify: Union[bool, int] = True
+    ) -> int:
         # This implementation of pwrite uses a lock shared with all writers
         # for the entire file object. It is not safe to run this
         # concurrently with any other code that could modify the file offset
@@ -2949,16 +2957,19 @@ class TensorSerializer:
                 self._file.seek(offset)
             bytes_written = self._file.write(data)
             self._file.seek(old_pos)
-        if verify:
-            self._verify_bytes_written(bytes_written, data)
+        if isinstance(verify, int):
+            self._verify_bytes_written(bytes_written, verify)
+        elif verify:
+            self._verify_bytes_written(bytes_written, self._buffer_size(data))
         return bytes_written
 
     @staticmethod
-    def _verify_bytes_written(bytes_written: int, data_written):
+    def _buffer_size(buffer: Union[memoryview, Any]) -> int:
         # For typed buffers (e.g. arrays) the len() isn't the number of bytes
-        expected_bytes_written = getattr(
-            data_written, "nbytes", len(data_written)
-        )
+        return getattr(buffer, "nbytes", len(buffer))
+
+    @staticmethod
+    def _verify_bytes_written(bytes_written: int, expected_bytes_written: int):
         if bytes_written != expected_bytes_written:
             raise OSError(
                 f"pwrite failed to write correctly: {bytes_written} bytes were"
@@ -3139,9 +3150,15 @@ class TensorSerializer:
                 self._file_header.version_number,
             )
 
-        tensor = numpy_tensor.data
-        tensor_memory = numpy_tensor.data.data
-        tensor_size = tensor.nbytes
+        tensor: numpy.ndarray = numpy_tensor.data
+        tensor_memory: memoryview = numpy_tensor.data.data
+        tensor_size: int = tensor.nbytes
+        if tensor_memory.nbytes != tensor_size:
+            raise ValueError(
+                f"Cannot serialize tensor {name!r}:"
+                f" buffer size of underlying memory ({tensor_memory.nbytes})"
+                f" doesn't match reported size ({tensor_size})"
+            )
         name_bytes = name.encode("utf-8")
         dtype_bytes = dtype_name.encode("utf-8")
         if len(dtype_bytes) >= 256:
@@ -3205,12 +3222,13 @@ class TensorSerializer:
             raise RuntimeError("Metadata overflow")
 
         metadata_pos = self._metadata_cur
-        self._metadata_cur += len(metadata)
+        metadata_len = len(metadata)
+        self._metadata_cur += metadata_len
 
         # This task is I/O-bound and has no prerequisites,
         # so it goes into the regular writer pool.
         def write_metadata():
-            self._pwrite(metadata, metadata_pos)
+            self._pwrite(metadata, metadata_pos, verify=metadata_len)
 
         self._jobs.append(self._writer_pool.submit(write_metadata))
 
@@ -3254,7 +3272,7 @@ class TensorSerializer:
                 header.add_sha256(sha256)
             if encrypt_future is not None:
                 header.update_crypt_info()
-            self._pwrite(header.buffer, header_pos)
+            self._pwrite(header.buffer, header_pos, verify=header.data_offset)
 
         hash_tasks = []
         if self._encrypted and not _temporary_buffer:
@@ -3297,11 +3315,11 @@ class TensorSerializer:
 
         # This task is I/O-bound, so it goes into the regular writer pool.
         def write_tensor_data(
-            prerequisite: Optional[concurrent.futures.Future],
+            prerequisite: Optional[concurrent.futures.Future], size: int
         ):
             if prerequisite is not None:
                 prerequisite.result(_TIMEOUT)
-            bytes_written = self._pwrite(tensor_memory, tensor_pos)
+            bytes_written = self._pwrite(tensor_memory, tensor_pos, verify=size)
             with self._tensor_count_update_lock:
                 self._file_header.tensor_count += 1
                 self._file_header.tensor_size += bytes_written
@@ -3344,7 +3362,9 @@ class TensorSerializer:
         self._jobs.append(commit_header_task)
 
         # Write the potentially-encrypted tensor memory to the file
-        write_task = self._writer_pool.submit(write_tensor_data, encrypt_task)
+        write_task = self._writer_pool.submit(
+            write_tensor_data, encrypt_task, tensor_size
+        )
         self._jobs.append(write_task)
         # Decrypt the memory after writing is finished, if it was encrypted
         if self._encrypted and not _temporary_buffer:
