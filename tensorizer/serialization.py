@@ -854,14 +854,6 @@ class EncryptionParams:
             ...
 
     @dataclasses.dataclass
-    class _FromPassphraseFastAlgorithm(_Algorithm):
-        __slots__ = ("salt",)
-        salt: bytes
-
-        def chunk(self) -> _crypt_info.KeyDerivationChunk:
-            return _crypt_info.FastKeyDerivationChunk(salt=self.salt)
-
-    @dataclasses.dataclass
     class _FromPassphraseSlowAlgorithm(_Algorithm):
         __slots__ = ("pwhash_params",)
         pwhash_params: "_crypt.PWHash"
@@ -883,7 +875,7 @@ class EncryptionParams:
             raise TypeError(
                 "Encryption key must be binary (bytes type)."
                 " To derive an encryption key from a string or passphrase,"
-                " use EncryptionParams.from_passphrase_fast()"
+                " use EncryptionParams.from_passphrase_slow()"
             )
 
         if len(key) != _crypt.ChunkedEncryption.KEY_BYTES:
@@ -893,7 +885,7 @@ class EncryptionParams:
                 f" got {len(key)} bytes instead."
                 " To generate a valid encryption key from any string"
                 " or bytes object,"
-                " use EncryptionParams.from_passphrase_fast()"
+                " use EncryptionParams.from_passphrase_slow()"
             )
         self.key = bytes(key)
         self._algorithm = None
@@ -935,49 +927,6 @@ class EncryptionParams:
             return None
         else:
             return self._algorithm.chunk()
-
-    @classmethod
-    @_requires_libsodium
-    def from_passphrase_fast(
-        cls,
-        passphrase: Union[str, bytes],
-        salt: Union[str, bytes, None] = None,
-        *,
-        encoding="utf-8",
-    ) -> "EncryptionParams":
-        """
-        Generates an encryption key from a password and salt.
-
-        This will generate a reproducible encryption key from a passphrase
-        string, using a fast algorithm (one round of SHA256 with salt).
-        This is a good choice if your passphrase is already strong,
-        such as when using a long randomly-generated string.
-        This does not provide the same protection against brute-force attempts
-        as an intentionally slow password hashing function.
-
-        Args:
-            passphrase: The source passphrase from which to derive a key.
-            salt: A non-secret cryptographic salt to be stored
-                in the serialized file.
-                If None (the default), a secure random salt is used.
-            encoding: The encoding to use to convert `passphrase` to ``bytes``
-                if provided as a ``str``. Defaults to UTF-8.
-
-        Returns:
-            An `EncryptionParams` instance to pass to a `TensorSerializer`.
-        """
-        if not passphrase:
-            raise ValueError("Passphrase cannot be empty")
-        salt = cls._derive_salt(salt, encoding)
-        if isinstance(passphrase, str):
-            passphrase = passphrase.encode(encoding)
-        key_hash = hashlib.sha256(passphrase)
-        key_hash.update(salt)
-        encryption_params = cls(key=key_hash.digest())
-        encryption_params._algorithm = cls._FromPassphraseFastAlgorithm(
-            salt=salt
-        )
-        return encryption_params
 
     if _crypt.available:
 
@@ -1113,7 +1062,7 @@ class DecryptionParams:
     #. Using `DecryptionParams.from_passphrase()`
 
     This will decrypt tensors using the specified passphrase string.
-    This may be used if `EncryptionParams.from_passphrase_fast()`
+    This may be used if `EncryptionParams.from_passphrase_slow()`
     was used during encryption.
 
     #. Using `DecryptionParams.from_key()`
@@ -1121,7 +1070,7 @@ class DecryptionParams:
     This will decrypt tensors using an exact binary key.
     This may always be used with the `key` from an `EncryptionParams` object,
     regardless of whether the key was generated with
-    `EncryptionParams.from_passphrase_fast()`, `EncryptionParams.random()`, etc.
+    `EncryptionParams.from_passphrase_slow()`, `EncryptionParams.random()`, etc.
 
     Examples:
 
@@ -1129,7 +1078,7 @@ class DecryptionParams:
         an environment variable::
 
             passphrase: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
-            encryption_params = EncryptionParams.from_passphrase_fast(
+            encryption_params = EncryptionParams.from_passphrase_slow(
                 passphrase
             )
 
@@ -1222,18 +1171,7 @@ class _KeyDerivation:
         self._cache = {}
 
     def _derive_key(self, method: _crypt_info.KeyDerivationChunk) -> bytes:
-        if isinstance(
-            method,
-            _crypt_info.FastKeyDerivationChunk,
-        ):
-            return EncryptionParams.from_passphrase_fast(
-                passphrase=self.passphrase,
-                salt=method.salt,
-            ).key
-        elif isinstance(
-            method,
-            _crypt_info.SlowKeyDerivationChunk,
-        ):
+        if isinstance(method, _crypt_info.SlowKeyDerivationChunk):
             if method.alg != _crypt.PWHash.ALG_ARGON2ID13:
                 raise CryptographyError(
                     f"Unsupported pwhash algorithm ({method.alg})"
@@ -1249,9 +1187,7 @@ class _KeyDerivation:
 
     @staticmethod
     def _hash_key(chunk: _crypt_info.KeyDerivationChunk) -> tuple:
-        if isinstance(chunk, _crypt_info.FastKeyDerivationChunk):
-            return chunk.derivation_method, bytes(chunk.salt)
-        elif isinstance(chunk, _crypt_info.SlowKeyDerivationChunk):
+        if isinstance(chunk, _crypt_info.SlowKeyDerivationChunk):
             return (
                 chunk.derivation_method,
                 chunk.opslimit,
@@ -1869,7 +1805,7 @@ class TensorDeserializer(
             raise CryptographyError(
                 "Passphrase was provided, but the tensor was"
                 " not originally encrypted using a passphrase"
-                " (i.e. EncryptionParams.from_passphrase_*)"
+                " (e.g. EncryptionParams.from_passphrase_slow()"
             )
         elif len(kd) > 1:
             raise CryptographyError(

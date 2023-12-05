@@ -35,7 +35,7 @@ fd, path = tempfile.mkstemp(prefix="encrypted-tensors")
 
 try:
     # Encrypt a model during serialization
-    encryption_params = EncryptionParams.from_passphrase_fast(passphrase)
+    encryption_params = EncryptionParams.from_passphrase_slow(passphrase)
 
     model = original_model(model_ref)
     serialization_start = time.monotonic()

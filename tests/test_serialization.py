@@ -346,9 +346,14 @@ class TestEncryption(unittest.TestCase):
             raise RuntimeError()
 
     def test_encryption(self):
-        fixed_salt = bytes(32)
-        encryption = serialization.EncryptionParams.from_passphrase_fast(
-            passphrase="test", salt=fixed_salt
+        fixed_salt = bytes(16)
+        low_cpu = serialization.EncryptionParams.OpsLimit.MIN
+        low_mem = serialization.EncryptionParams.MemLimit.MIN
+        encryption = serialization.EncryptionParams.from_passphrase_slow(
+            passphrase="test",
+            opslimit=low_cpu,
+            memlimit=low_mem,
+            salt=fixed_salt,
         )
         decryption = serialization.DecryptionParams.from_passphrase(
             passphrase="test"

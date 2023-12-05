@@ -193,7 +193,7 @@ attribute:
 ```py
 encryption_params = EncryptionParams.random()
 # Or
-encryption_params = EncryptionParams.from_passphrase_fast(...)
+encryption_params = EncryptionParams.from_passphrase_slow(...)
 
 key: bytes = encryption_params.key
 ```

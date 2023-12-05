@@ -122,44 +122,7 @@ class KeyDerivationChunk(CryptInfoChunk, abc.ABC, chunk_type=1):
 
 
 @dataclasses.dataclass(frozen=True)
-class FastKeyDerivationChunk(KeyDerivationChunk, derivation_method=1):
-    salt: Union[bytes, bytearray, memoryview]
-
-    __slots__ = ("salt",)
-
-    _contents_segment_template: ClassVar[str] = (
-        "<H{salt_len:d}s"  # Salt length  # Salt bytes
-    )
-    read_salt = partial(_variable_read, length_fmt="H", data_fmt="s")
-
-    @property
-    def _contents_segment(self):
-        return struct.Struct(
-            self._contents_segment_template.format(salt_len=len(self.salt))
-        )
-
-    @classmethod
-    def unpack_from(cls, buffer, offset: int = 0) -> "FastKeyDerivationChunk":
-        return cls(salt=cls.read_salt(buffer, offset)[0])
-
-    def pack_into(self, buffer, offset: int = 0) -> int:
-        offset = super().pack_into(buffer, offset)
-        segment = self._contents_segment
-        segment.pack_into(
-            buffer,
-            offset,
-            len(self.salt),
-            self.salt,
-        )
-        return offset + segment.size
-
-    @property
-    def size(self) -> int:
-        return 2 + len(self.salt) + super().size
-
-
-@dataclasses.dataclass(frozen=True)
-class SlowKeyDerivationChunk(KeyDerivationChunk, derivation_method=2):
+class SlowKeyDerivationChunk(KeyDerivationChunk, derivation_method=1):
     opslimit: int
     memlimit: int
     alg: int
