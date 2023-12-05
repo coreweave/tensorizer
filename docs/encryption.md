@@ -132,7 +132,7 @@ key derivation method. Currently, two methods are implemented:
     1. Chosen by constructing an `EncryptionParams` object through calling
        `EncryptionParams.random()`
     2. Uses a completely random 32-byte sequence with no associated passphrase
-    3. Highly secure
+    3. Highly secure against being guessed
     4. You must save the randomly generated key
 2. Fast key derivation
     1. Chosen by constructing an `EncryptionParams` object through calling
