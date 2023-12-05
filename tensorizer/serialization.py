@@ -854,12 +854,12 @@ class EncryptionParams:
             ...
 
     @dataclasses.dataclass
-    class _FromPassphraseSlowAlgorithm(_Algorithm):
+    class _FromStringPWHashAlgorithm(_Algorithm):
         __slots__ = ("pwhash_params",)
         pwhash_params: "_crypt.PWHash"
 
         def chunk(self) -> _crypt_info.KeyDerivationChunk:
-            return _crypt_info.SlowKeyDerivationChunk(
+            return _crypt_info.PWHashKeyDerivationChunk(
                 opslimit=self.pwhash_params.opslimit,
                 memlimit=self.pwhash_params.memlimit,
                 alg=self.pwhash_params.alg,
@@ -875,7 +875,7 @@ class EncryptionParams:
             raise TypeError(
                 "Encryption key must be binary (bytes type)."
                 " To derive an encryption key from a string or passphrase,"
-                " use EncryptionParams.from_passphrase_slow()"
+                " use EncryptionParams.from_string()"
             )
 
         if len(key) != _crypt.ChunkedEncryption.KEY_BYTES:
@@ -885,7 +885,7 @@ class EncryptionParams:
                 f" got {len(key)} bytes instead."
                 " To generate a valid encryption key from any string"
                 " or bytes object,"
-                " use EncryptionParams.from_passphrase_slow()"
+                " use EncryptionParams.from_string()"
             )
         self.key = bytes(key)
         self._algorithm = None
@@ -983,7 +983,7 @@ class EncryptionParams:
 
     @classmethod
     @_requires_libsodium
-    def from_passphrase_slow(
+    def from_string(
         cls,
         passphrase: Union[str, bytes],
         opslimit: Union[OpsLimit, int, None] = None,
@@ -1046,7 +1046,7 @@ class EncryptionParams:
             salt=salt, opslimit=opslimit, memlimit=memlimit
         )
         encryption_params = cls(key=pwhash_params.hash(passphrase))
-        encryption_params._algorithm = cls._FromPassphraseSlowAlgorithm(
+        encryption_params._algorithm = cls._FromStringPWHashAlgorithm(
             pwhash_params=pwhash_params
         )
         return encryption_params
@@ -1062,7 +1062,7 @@ class DecryptionParams:
     #. Using `DecryptionParams.from_passphrase()`
 
     This will decrypt tensors using the specified passphrase string.
-    This may be used if `EncryptionParams.from_passphrase_slow()`
+    This may be used if `EncryptionParams.from_string()`
     was used during encryption.
 
     #. Using `DecryptionParams.from_key()`
@@ -1070,7 +1070,7 @@ class DecryptionParams:
     This will decrypt tensors using an exact binary key.
     This may always be used with the `key` from an `EncryptionParams` object,
     regardless of whether the key was generated with
-    `EncryptionParams.from_passphrase_slow()`, `EncryptionParams.random()`, etc.
+    `EncryptionParams.from_string()` or `EncryptionParams.random()`.
 
     Examples:
 
@@ -1078,7 +1078,7 @@ class DecryptionParams:
         an environment variable::
 
             passphrase: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
-            encryption_params = EncryptionParams.from_passphrase_slow(
+            encryption_params = EncryptionParams.from_string(
                 passphrase
             )
 
@@ -1171,12 +1171,12 @@ class _KeyDerivation:
         self._cache = {}
 
     def _derive_key(self, method: _crypt_info.KeyDerivationChunk) -> bytes:
-        if isinstance(method, _crypt_info.SlowKeyDerivationChunk):
+        if isinstance(method, _crypt_info.PWHashKeyDerivationChunk):
             if method.alg != _crypt.PWHash.ALG_ARGON2ID13:
                 raise CryptographyError(
                     f"Unsupported pwhash algorithm ({method.alg})"
                 )
-            return EncryptionParams.from_passphrase_slow(
+            return EncryptionParams.from_string(
                 passphrase=self.passphrase,
                 opslimit=method.opslimit,
                 memlimit=method.memlimit,
@@ -1187,7 +1187,7 @@ class _KeyDerivation:
 
     @staticmethod
     def _hash_key(chunk: _crypt_info.KeyDerivationChunk) -> tuple:
-        if isinstance(chunk, _crypt_info.SlowKeyDerivationChunk):
+        if isinstance(chunk, _crypt_info.PWHashKeyDerivationChunk):
             return (
                 chunk.derivation_method,
                 chunk.opslimit,
@@ -1805,7 +1805,7 @@ class TensorDeserializer(
             raise CryptographyError(
                 "Passphrase was provided, but the tensor was"
                 " not originally encrypted using a passphrase"
-                " (e.g. EncryptionParams.from_passphrase_slow()"
+                " (e.g. EncryptionParams.from_string()"
             )
         elif len(kd) > 1:
             raise CryptographyError(

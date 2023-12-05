@@ -122,7 +122,7 @@ class KeyDerivationChunk(CryptInfoChunk, abc.ABC, chunk_type=1):
 
 
 @dataclasses.dataclass(frozen=True)
-class SlowKeyDerivationChunk(KeyDerivationChunk, derivation_method=1):
+class PWHashKeyDerivationChunk(KeyDerivationChunk, derivation_method=1):
     opslimit: int
     memlimit: int
     alg: int
@@ -148,7 +148,7 @@ class SlowKeyDerivationChunk(KeyDerivationChunk, derivation_method=1):
         )
 
     @classmethod
-    def unpack_from(cls, buffer, offset: int = 0) -> "SlowKeyDerivationChunk":
+    def unpack_from(cls, buffer, offset: int = 0) -> "PWHashKeyDerivationChunk":
         opslimit, memlimit, alg = cls._algorithm_segment.unpack_from(
             buffer, offset
         )

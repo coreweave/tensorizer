@@ -349,7 +349,7 @@ class TestEncryption(unittest.TestCase):
         fixed_salt = bytes(16)
         low_cpu = serialization.EncryptionParams.OpsLimit.MIN
         low_mem = serialization.EncryptionParams.MemLimit.MIN
-        encryption = serialization.EncryptionParams.from_passphrase_slow(
+        encryption = serialization.EncryptionParams.from_string(
             passphrase="test",
             opslimit=low_cpu,
             memlimit=low_mem,
@@ -445,9 +445,9 @@ class TestEncryption(unittest.TestCase):
                 del deserialized
             gc.collect()
 
-    def test_from_passphrase_slow(self):
+    def test_from_string(self):
         fixed_salt = bytes(16)
-        encryption = serialization.EncryptionParams.from_passphrase_slow(
+        encryption = serialization.EncryptionParams.from_string(
             passphrase="test", salt=fixed_salt
         )
         decryption = serialization.DecryptionParams.from_passphrase(
