@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Tensor encryption
+  - Refer to [docs/encryption.md](/docs/encryption.md) for details 
   - Encrypts all tensor weights in a file with minimal overhead
   - Doesn't encrypt tensor metadata, such as:
     - Tensor name
