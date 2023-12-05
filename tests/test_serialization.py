@@ -469,6 +469,7 @@ class TestEncryption(unittest.TestCase):
         incorrect_decryption: DecryptionParams,
     ):
         device = default_device
+        plaid_mode = device != "cpu"
 
         with self._serialize(encryption, device) as encrypted_model:
             # Ensure that it works when given a key
@@ -476,12 +477,12 @@ class TestEncryption(unittest.TestCase):
                 msg="Deserializing with a correct key",
                 device=device,
                 lazy_load=False,
-                plaid_mode=True,
+                plaid_mode=plaid_mode,
             ), open(encrypted_model, "rb") as in_file, TensorDeserializer(
                 in_file,
                 device=device,
                 lazy_load=False,
-                plaid_mode=True,
+                plaid_mode=plaid_mode,
                 verify_hash=True,
                 encryption=decryption,
             ) as deserialized:
