@@ -3,6 +3,14 @@
 `tensorizer` supports fast tensor weight encryption and decryption during
 serialization and deserialization, respectively.
 
+> [!NOTE]
+> 
+> To use `tensorizer` encryption, a recent version of `libsodium` must be
+> installed. Install `libsodium` with `apt-get install libsodium23`
+> on Ubuntu or Debian, or follow
+> [the instructions in `libsodium`'s documentation](https://doc.libsodium.org/installation)
+> for other platforms.
+
 ## Encryption Algorithm
 
 Tensor encryption splits weights into up-to-2 MiB chunks encrypted independently
