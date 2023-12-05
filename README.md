@@ -212,6 +212,57 @@ where `df_main()` serializes models from
 and `hf_main()` serializes
 [HuggingFace Transformers](https://github.com/huggingface/transformers) models.
 
+## Tensor Weight Encryption
+
+`tensorizer` supports fast tensor weight encryption and decryption during
+serialization and deserialization, respectively.
+
+Be aware that metadata (tensor names, dtypes, shapes, etc.) are not encrypted,
+only the weights themselves.
+
+> [!NOTE]
+> 
+> Refer to [docs/encryption.md](/docs/encryption.md) for details, instructions,
+> and warnings on using `tensorizer` encryption correctly and safely.
+
+### Quick Encryption Example
+
+The following outline demonstrates how to encrypt and decrypt a tensorized model
+with a randomly-generated encryption key:
+
+```py
+from tensorizer import (
+    EncryptionParams, DecryptionParams, TensorDeserializer, TensorSerializer
+)
+
+# Serialize and encrypt a model:
+
+encryption_params = EncryptionParams.random()
+
+serializer = TensorSerializer("model.tensors", encryption=encryption_params)
+serializer.write_module(...)  # or write_state_dict(), etc.
+serializer.close()
+
+# Save the randomly-generated encryption key somewhere
+with open("tensor.key", "wb") as key_file:
+    key_file.write(encryption_params.key)
+
+
+# Then decrypt it again:
+
+# Load the randomly-generated key from where it was saved
+with open("tensor.key", "rb") as key_file:
+    key: bytes = key_file.read()
+ 
+decryption_params = DecryptionParams.from_key(key)
+
+deserializer = TensorDeserializer("model.tensors", encryption=decryption_params)
+deserializer.load_into_module(...)
+deserializer.close()
+```
+
+For more detail, refer to [docs/encryption.md](/docs/encryption.md).
+
 ## Benchmarks
 
 You can run your own benchmarks on CoreWeave or your own Kubernetes cluster
