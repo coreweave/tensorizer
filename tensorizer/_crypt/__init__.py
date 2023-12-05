@@ -7,9 +7,9 @@ and are not guaranteed to have a stable interface across versions.
 __all__ = (
     "available",
     "ChunkedEncryption",
+    "Const",
     "CryptographyError",
-    "crypto_pwhash_SALTBYTES",
-    "pwhash",
+    "PWHash",
     "random_bytes",
 )
 
@@ -18,9 +18,9 @@ from ._exceptions import CryptographyError
 try:
     from ._encryption import (
         ChunkedEncryption,
+        Const,
+        PWHash,
         SequentialEncryption,
-        crypto_pwhash_SALTBYTES,
-        pwhash,
         random_bytes,
     )
 

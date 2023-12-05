@@ -2,12 +2,13 @@
 # serialization.py                                                   Wes Brown
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
-
+import abc
 import collections.abc
 import concurrent.futures
 import contextlib
 import ctypes
 import dataclasses
+import enum
 import functools
 import hashlib
 import io
@@ -843,11 +844,38 @@ class EncryptionParams:
     # and deserialization later. Use `EncryptionParams.from_passphrase_fast()`
     # instead with a strong passphrase for better performance.
 
-    key: bytes
-    salt: Optional[bytes]
-    _method: int
+    __slots__ = ("key", "_algorithm")
 
-    _METHOD_FROM_PASSPHRASE_FAST: ClassVar[int] = 1
+    class _Algorithm(abc.ABC):
+        __slots__ = ()
+
+        @abc.abstractmethod
+        def chunk(self) -> _crypt_info.KeyDerivationChunk:
+            ...
+
+    @dataclasses.dataclass
+    class _FromPassphraseFastAlgorithm(_Algorithm):
+        __slots__ = ("salt",)
+        salt: bytes
+
+        def chunk(self) -> _crypt_info.KeyDerivationChunk:
+            return _crypt_info.FastKeyDerivationChunk(salt=self.salt)
+
+    @dataclasses.dataclass
+    class _FromPassphraseSlowAlgorithm(_Algorithm):
+        __slots__ = ("pwhash_params",)
+        pwhash_params: "_crypt.PWHash"
+
+        def chunk(self) -> _crypt_info.KeyDerivationChunk:
+            return _crypt_info.SlowKeyDerivationChunk(
+                opslimit=self.pwhash_params.opslimit,
+                memlimit=self.pwhash_params.memlimit,
+                alg=self.pwhash_params.alg,
+                salt=self.pwhash_params.salt,
+            )
+
+    key: bytes
+    _algorithm: Optional[_Algorithm]
 
     @_requires_libsodium
     def __init__(self, key: bytes):
@@ -868,8 +896,7 @@ class EncryptionParams:
                 " use EncryptionParams.from_passphrase_fast()"
             )
         self.key = bytes(key)
-        self.salt = None
-        self._method = 0
+        self._algorithm = None
 
     @classmethod
     @_requires_libsodium
@@ -904,10 +931,10 @@ class EncryptionParams:
 
     @_requires_libsodium
     def _crypt_info_chunk(self) -> Optional[_crypt_info.CryptInfoChunk]:
-        if self._method == self._METHOD_FROM_PASSPHRASE_FAST:
-            return _crypt_info.FastKeyDerivationChunk(self.salt)
-        else:
+        if self._algorithm is None:
             return None
+        else:
+            return self._algorithm.chunk()
 
     @classmethod
     @_requires_libsodium
@@ -915,6 +942,7 @@ class EncryptionParams:
         cls,
         passphrase: Union[str, bytes],
         salt: Union[str, bytes, None] = None,
+        *,
         encoding="utf-8",
     ) -> "EncryptionParams":
         """
@@ -929,9 +957,10 @@ class EncryptionParams:
 
         Args:
             passphrase: The source passphrase from which to derive a key.
-            salt: A non-secret cryptographic salt to be stored in the model.
+            salt: A non-secret cryptographic salt to be stored
+                in the serialized file.
                 If None (the default), a secure random salt is used.
-            encoding: The encoding to use to convert `passphrase` to bytes
+            encoding: The encoding to use to convert `passphrase` to ``bytes``
                 if provided as a ``str``. Defaults to UTF-8.
 
         Returns:
@@ -944,15 +973,74 @@ class EncryptionParams:
             passphrase = passphrase.encode(encoding)
         key_hash = hashlib.sha256(passphrase)
         key_hash.update(salt)
-        params = cls(key=key_hash.digest())
-        params.salt = salt
-        params._method = cls._METHOD_FROM_PASSPHRASE_FAST
-        return params
+        encryption_params = cls(key=key_hash.digest())
+        encryption_params._algorithm = cls._FromPassphraseFastAlgorithm(
+            salt=salt
+        )
+        return encryption_params
+
+    if _crypt.available:
+
+        class OpsLimit(enum.IntEnum):
+            """
+            For discussion on this parameter, see the libsodium documentation:
+            https://libsodium.gitbook.io/doc/password_hashing/default_phf#key-derivation
+
+            Summary quote:
+                opslimit represents the maximum amount of computations
+                to perform. Raising this number will make the function
+                require more CPU cycles to compute a key.
+
+            The preset levels are related to each other as follows:
+            `MIN` < `INTERACTIVE` < `MODERATE` < `SENSITIVE`
+            (`MIN` is easiest to compute, `SENSITIVE` is hardest).
+            """
+
+            MIN = _crypt.PWHash.OPSLIMIT_MIN
+            INTERACTIVE = _crypt.PWHash.OPSLIMIT_INTERACTIVE
+            MODERATE = _crypt.PWHash.OPSLIMIT_MODERATE
+            SENSITIVE = _crypt.PWHash.OPSLIMIT_SENSITIVE
+
+        class MemLimit(enum.IntEnum):
+            """
+            For discussion on this parameter, see the libsodium documentation:
+            https://libsodium.gitbook.io/doc/password_hashing/default_phf#key-derivation
+
+            Summary quote:
+                memlimit is the maximum amount of RAM in bytes
+                that the function will use.
+
+            The preset levels are related to each other as follows:
+            `MIN` < `INTERACTIVE` < `MODERATE` < `SENSITIVE`
+            (`MIN` is easiest to compute, `SENSITIVE` is hardest).
+            """
+
+            MIN = _crypt.PWHash.MEMLIMIT_MIN
+            INTERACTIVE = _crypt.PWHash.MEMLIMIT_INTERACTIVE
+            MODERATE = _crypt.PWHash.MEMLIMIT_MODERATE
+            SENSITIVE = _crypt.PWHash.MEMLIMIT_SENSITIVE
+
+    else:
+
+        class OpsLimit(enum.IntEnum):
+            def __getattribute__(self, item):
+                super().__getattribute__(self, item)
+                _require_libsodium()
+
+        class MemLimit(enum.IntEnum):
+            def __getattribute__(self, item):
+                super().__getattribute__(self, item)
+                _require_libsodium()
 
     @classmethod
+    @_requires_libsodium
     def from_passphrase_slow(
         cls,
         passphrase: Union[str, bytes],
+        opslimit: Union[OpsLimit, int, None] = None,
+        memlimit: Union[MemLimit, int, None] = None,
+        salt: Union[str, bytes, None] = None,
+        *,
         encoding="utf-8",
     ) -> "EncryptionParams":
         """
@@ -960,21 +1048,59 @@ class EncryptionParams:
 
         Args:
             passphrase: The source passphrase from which to derive a key.
-            salt: A non-secret cryptographic salt to be stored in the model.
+            opslimit:
+                Difficulty of the key derivation algorithm on CPU resources.
+                For details, refer to the `libsodium documentation`_.
+                Can be provided as a preset ``EncryptionParams.OpsLimit`` value,
+                or a custom integer. If None (the default),
+                uses ``EncryptionParams.OpsLimit.MODERATE``.
+            memlimit:
+                Amount of RAM required by the key derivation algorithm.
+                For details, refer to the `libsodium documentation`_.
+                Can be provided as a preset ``EncryptionParams.MemLimit`` value,
+                or a custom integer. If None (the default),
+                uses ``EncryptionParams.MemLimit.MODERATE``.
+            salt: A non-secret cryptographic salt to be stored
+                in the serialized file.
                 If None (the default), a secure random salt is used.
-            encoding: The encoding to use to convert `passphrase` to bytes
+            encoding: The encoding to use to convert `passphrase` to ``bytes``
                 if provided as a ``str``. Defaults to UTF-8.
 
         Returns:
-            An `EncryptionParams` instance to pass to a `TensorSerializer`
+            An `EncryptionParams` instance to pass to a `TensorSerializer`.
+
+        .. _libsodium documentation: https://libsodium.gitbook.io/doc/password_hashing/default_phf#key-derivation
         """
         if not passphrase:
             raise ValueError("Passphrase cannot be empty")
-        salt = _crypt.random_bytes(_crypt.crypto_pwhash_SALTBYTES)
+        if isinstance(opslimit, cls.MemLimit) or not isinstance(
+            opslimit, (cls.OpsLimit, int, type(None))
+        ):
+            raise TypeError(
+                "opslimit parameter: expected EncryptionParams.OpsLimit,"
+                f" int, or None; {opslimit.__class__.__name__} found"
+            )
+        if isinstance(memlimit, cls.OpsLimit) or not isinstance(
+            memlimit, (cls.MemLimit, int, type(None))
+        ):
+            raise TypeError(
+                "memlimit parameter: expected EncryptionParams.MemLimit,"
+                f" int, or None; {memlimit.__class__.__name__} found"
+            )
         if isinstance(passphrase, str):
             passphrase = passphrase.encode(encoding)
-        key, params = _crypt.pwhash(passphrase, salt)
-        return cls(key=key, salt=salt)
+        if opslimit is None:
+            opslimit = cls.OpsLimit.MODERATE
+        if memlimit is None:
+            memlimit = cls.MemLimit.MODERATE
+        pwhash_params = _crypt.PWHash(
+            salt=salt, opslimit=opslimit, memlimit=memlimit
+        )
+        encryption_params = cls(key=pwhash_params.hash(passphrase))
+        encryption_params._algorithm = cls._FromPassphraseSlowAlgorithm(
+            pwhash_params=pwhash_params
+        )
+        return encryption_params
 
 
 @dataclasses.dataclass(init=False)
@@ -1084,6 +1210,70 @@ class DecryptionParams:
         params = cls()
         params.key = key
         return params
+
+
+class _KeyDerivation:
+    __slots__ = ("passphrase", "_cache")
+    passphrase: Union[str, bytes]
+    _cache: Dict[Any, bytes]
+
+    def __init__(self, passphrase: Union[str, bytes]):
+        self.passphrase = passphrase
+        self._cache = {}
+
+    def _derive_key(self, method: _crypt_info.KeyDerivationChunk) -> bytes:
+        if isinstance(
+            method,
+            _crypt_info.FastKeyDerivationChunk,
+        ):
+            return EncryptionParams.from_passphrase_fast(
+                passphrase=self.passphrase,
+                salt=method.salt,
+            ).key
+        elif isinstance(
+            method,
+            _crypt_info.SlowKeyDerivationChunk,
+        ):
+            if method.alg != _crypt.PWHash.ALG_ARGON2ID13:
+                raise CryptographyError(
+                    f"Unsupported pwhash algorithm ({method.alg})"
+                )
+            return EncryptionParams.from_passphrase_slow(
+                passphrase=self.passphrase,
+                opslimit=method.opslimit,
+                memlimit=method.memlimit,
+                salt=method.salt,
+            ).key
+        else:
+            raise CryptographyError("Unknown key derivation method")
+
+    @staticmethod
+    def _hash_key(chunk: _crypt_info.KeyDerivationChunk) -> tuple:
+        if isinstance(chunk, _crypt_info.FastKeyDerivationChunk):
+            return chunk.derivation_method, bytes(chunk.salt)
+        elif isinstance(chunk, _crypt_info.SlowKeyDerivationChunk):
+            return (
+                chunk.derivation_method,
+                chunk.opslimit,
+                chunk.memlimit,
+                chunk.alg,
+                bytes(chunk.salt),
+            )
+        else:
+            raise CryptographyError("Unknown key derivation method")
+
+    def key(self, method: _crypt_info.KeyDerivationChunk) -> bytes:
+        hash_key = self._hash_key(method)
+        cached = self._cache.get(hash_key, None)
+        if cached is not None:
+            return cached
+        else:
+            key: bytes = self._derive_key(method)
+            self._cache[hash_key] = key
+            return key
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
 
 
 class TensorDeserializer(
@@ -1204,12 +1394,24 @@ class TensorDeserializer(
                 )
             self._encryption = encryption
             self._encrypted = encryption is not None
+            self._key_derivation = None
             if self._encrypted:
                 _require_libsodium()
                 self._decryption_pool = concurrent.futures.ThreadPoolExecutor(
                     max_workers=cpu_count,
                     thread_name_prefix="TensorizerDecryption",
                 )
+                if self._encryption.key is None:
+                    if self._encryption.passphrase is None:
+                        raise ValueError(
+                            "Invalid DecryptionParams,"
+                            " no key or passphrase provided"
+                        )
+                    else:
+                        self._key_derivation = _KeyDerivation(
+                            passphrase=self._encryption.passphrase
+                        )
+                        self._cleanup.callback(self._key_derivation.clear_cache)
             else:
                 self._decryption_pool = None
 
@@ -1306,8 +1508,6 @@ class TensorDeserializer(
                     for name, entry in self._metadata.items()
                     if filter_func(name)
                 }
-
-            self._prior_key: Optional[str] = None
 
             # We calculate the total tensor bytes here so that we can use mmap,
             # based on the total size of the tensors that we're going to read,
@@ -1488,6 +1688,8 @@ class TensorDeserializer(
 
     def close(self):
         self._cleanup.close()
+        self._encryption = None
+        self._key_derivation = None
 
     @property
     def total_bytes_read(self) -> int:
@@ -1659,7 +1861,7 @@ class TensorDeserializer(
         if self._encryption.key is not None:
             return self._encryption.key
         # Requires key derivation from a passphrase
-        if self._encryption.passphrase is None:
+        if self._key_derivation is None:
             raise ValueError("Invalid DecryptionParams")
         # Check for a KeyDerivationChunk
         kd = crypt_info.find_chunks(_crypt_info.KeyDerivationChunk)
@@ -1674,20 +1876,8 @@ class TensorDeserializer(
                 "Could not interpret encryption key derivation"
                 " method of the file"
             )
-        else:
-            method = kd[0]
-            if isinstance(
-                method,
-                _crypt_info.FastKeyDerivationChunk,
-            ):
-                return EncryptionParams.from_passphrase_fast(
-                    passphrase=self._encryption.passphrase,
-                    salt=method.salt,
-                ).key
-            else:
-                # Only FastKeyDerivationChunk is currently
-                # recognized
-                raise CryptographyError("Unknown key derivation method")
+        method = typing.cast(_crypt_info.KeyDerivationChunk, kd[0])
+        return self._key_derivation.key(method)
 
     def _get_decryption_manager(
         self, encryption_method: _crypt_info.CryptInfoChunk, key: bytes, buffer

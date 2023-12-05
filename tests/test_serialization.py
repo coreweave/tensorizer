@@ -249,118 +249,6 @@ class TestSerialization(unittest.TestCase):
                 finally:
                     os.unlink(serialized_model)
 
-    @unittest.skipUnless(
-        encryption_available,
-        reason="libsodium must be installed to test encryption",
-    )
-    def test_encryption(self):
-        fixed_salt = bytes(32)
-        encryption = serialization.EncryptionParams.from_passphrase_fast(
-            passphrase="test", salt=fixed_salt
-        )
-        decryption = serialization.DecryptionParams.from_passphrase(
-            passphrase="test"
-        )
-        incorrect_decryption = serialization.DecryptionParams.from_passphrase(
-            passphrase="tset"
-        )
-        device = default_device
-
-        def _serialize(enc: Optional[serialization.EncryptionParams]):
-            return serialize_model_temp(
-                model_name,
-                device,
-                method=SerializeMethod.Module,
-                encryption=enc,
-            )
-
-        def _test_first_key(obj):
-            k = next(iter(deserialized.keys()))
-            if obj[k] is not None:
-                raise RuntimeError()
-
-        with _serialize(encryption) as encrypted_model:
-            if device == "cuda":
-                modes = (
-                    (False, False),
-                    (False, True),
-                    (True, True),
-                )
-            else:
-                modes = (
-                    (False, False),
-                    (True, False),
-                )
-            for lazy_load, plaid_mode in modes:
-                # Ensure that it works when given a passphrase
-                with self.subTest(
-                    msg="Deserializing with a correct passphrase",
-                    device=device,
-                    lazy_load=lazy_load,
-                    plaid_mode=plaid_mode,
-                ), open(encrypted_model, "rb") as in_file, TensorDeserializer(
-                    in_file,
-                    device=device,
-                    lazy_load=lazy_load,
-                    plaid_mode=plaid_mode,
-                    verify_hash=True,
-                    encryption=decryption,
-                ) as deserialized:
-                    check_deserialized(
-                        self,
-                        deserialized,
-                        model_name,
-                    )
-                    del deserialized
-                gc.collect()
-
-            # Ensure that it fails to load when not given a passphrase
-            with self.subTest(
-                msg="Deserializing with a missing passphrase"
-            ), self.assertRaises(serialization.CryptographyError), open(
-                encrypted_model, "rb"
-            ) as in_file, TensorDeserializer(
-                in_file,
-                device=device,
-                lazy_load=True,
-                encryption=None,
-            ) as deserialized:
-                _test_first_key(deserialized)
-                del deserialized
-            gc.collect()
-
-            # Ensure that it fails to load when given the wrong passphrase
-            with self.subTest(
-                msg="Deserializing with an incorrect passphrase"
-            ), self.assertRaises(serialization.CryptographyError), open(
-                encrypted_model, "rb"
-            ) as in_file, TensorDeserializer(
-                in_file,
-                device=device,
-                lazy_load=True,
-                encryption=incorrect_decryption,
-            ) as deserialized:
-                _test_first_key(deserialized)
-                del deserialized
-            gc.collect()
-
-        with _serialize(None) as unencrypted_model:
-            # Ensure that it fails to load an unencrypted model
-            # when expecting encryption
-            with self.subTest(
-                msg="Deserializing an unencrypted model with a passphrase"
-            ), self.assertRaises(serialization.CryptographyError), open(
-                unencrypted_model, "rb"
-            ) as in_file, TensorDeserializer(
-                in_file,
-                device=device,
-                lazy_load=True,
-                encryption=decryption,
-            ) as deserialized:
-                _test_first_key(deserialized)
-                del deserialized
-            gc.collect()
-
     def test_bfloat16(self):
         shape = (50, 50)
         tensor = torch.normal(0, 0.5, shape, dtype=torch.bfloat16)
@@ -433,6 +321,210 @@ class TestSerialization(unittest.TestCase):
                             )
                 finally:
                     os.unlink(tensorized_file.name)
+
+
+@unittest.skipUnless(
+    encryption_available,
+    reason="libsodium must be installed to test encryption",
+)
+class TestEncryption(unittest.TestCase):
+    @staticmethod
+    def _serialize(
+        enc: Optional[serialization.EncryptionParams], device=default_device
+    ):
+        return serialize_model_temp(
+            model_name,
+            device,
+            method=SerializeMethod.Module,
+            encryption=enc,
+        )
+
+    @staticmethod
+    def _test_first_key_negative(obj):
+        k = next(iter(obj.keys()))
+        if obj[k] is not None:
+            raise RuntimeError()
+
+    def test_encryption(self):
+        fixed_salt = bytes(32)
+        encryption = serialization.EncryptionParams.from_passphrase_fast(
+            passphrase="test", salt=fixed_salt
+        )
+        decryption = serialization.DecryptionParams.from_passphrase(
+            passphrase="test"
+        )
+        incorrect_decryption = serialization.DecryptionParams.from_passphrase(
+            passphrase="tset"
+        )
+        device = default_device
+
+        with self._serialize(encryption, device) as encrypted_model:
+            if device == "cuda":
+                modes = (
+                    (False, False),
+                    (False, True),
+                    (True, True),
+                )
+            else:
+                modes = (
+                    (False, False),
+                    (True, False),
+                )
+            for lazy_load, plaid_mode in modes:
+                # Ensure that it works when given a passphrase
+                with self.subTest(
+                    msg="Deserializing with a correct passphrase",
+                    device=device,
+                    lazy_load=lazy_load,
+                    plaid_mode=plaid_mode,
+                ), open(encrypted_model, "rb") as in_file, TensorDeserializer(
+                    in_file,
+                    device=device,
+                    lazy_load=lazy_load,
+                    plaid_mode=plaid_mode,
+                    verify_hash=True,
+                    encryption=decryption,
+                ) as deserialized:
+                    check_deserialized(
+                        self,
+                        deserialized,
+                        model_name,
+                    )
+                    del deserialized
+                gc.collect()
+
+            # Ensure that it fails to load when not given a passphrase
+            with self.subTest(
+                msg="Deserializing with a missing passphrase"
+            ), self.assertRaises(serialization.CryptographyError), open(
+                encrypted_model, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file,
+                device=device,
+                lazy_load=True,
+                encryption=None,
+            ) as deserialized:
+                self._test_first_key_negative(deserialized)
+                del deserialized
+            gc.collect()
+
+            # Ensure that it fails to load when given the wrong passphrase
+            with self.subTest(
+                msg="Deserializing with an incorrect passphrase"
+            ), self.assertRaises(serialization.CryptographyError), open(
+                encrypted_model, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file,
+                device=device,
+                lazy_load=True,
+                encryption=incorrect_decryption,
+            ) as deserialized:
+                self._test_first_key_negative(deserialized)
+                del deserialized
+            gc.collect()
+
+        with self._serialize(None, device) as unencrypted_model:
+            # Ensure that it fails to load an unencrypted model
+            # when expecting encryption
+            with self.subTest(
+                msg="Deserializing an unencrypted model with a passphrase"
+            ), self.assertRaises(serialization.CryptographyError), open(
+                unencrypted_model, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file,
+                device=device,
+                lazy_load=True,
+                encryption=decryption,
+            ) as deserialized:
+                self._test_first_key_negative(deserialized)
+                del deserialized
+            gc.collect()
+
+    def test_from_passphrase_slow(self):
+        fixed_salt = bytes(16)
+        encryption = serialization.EncryptionParams.from_passphrase_slow(
+            passphrase="test", salt=fixed_salt
+        )
+        decryption = serialization.DecryptionParams.from_passphrase(
+            passphrase="test"
+        )
+        incorrect_decryption = serialization.DecryptionParams.from_passphrase(
+            passphrase="tset"
+        )
+        self._test_encryption_params(
+            encryption, decryption, incorrect_decryption
+        )
+
+    def test_random_encryption_params(self):
+        encryption = serialization.EncryptionParams.random()
+        decryption = serialization.DecryptionParams.from_key(encryption.key)
+        incorrect_decryption = serialization.DecryptionParams.from_key(
+            bytes(len(encryption.key))
+        )
+        self._test_encryption_params(
+            encryption, decryption, incorrect_decryption
+        )
+
+    def _test_encryption_params(
+        self,
+        encryption: serialization.EncryptionParams,
+        decryption: serialization.DecryptionParams,
+        incorrect_decryption: serialization.DecryptionParams,
+    ):
+        device = default_device
+
+        with self._serialize(encryption, device) as encrypted_model:
+            # Ensure that it works when given a passphrase
+            with self.subTest(
+                msg="Deserializing with a correct passphrase",
+                device=device,
+                lazy_load=False,
+                plaid_mode=True,
+            ), open(encrypted_model, "rb") as in_file, TensorDeserializer(
+                in_file,
+                device=device,
+                lazy_load=False,
+                plaid_mode=True,
+                verify_hash=True,
+                encryption=decryption,
+            ) as deserialized:
+                check_deserialized(
+                    self,
+                    deserialized,
+                    model_name,
+                )
+                del deserialized
+            gc.collect()
+
+            # Ensure that it fails to load when not given a passphrase
+            with self.subTest(
+                msg="Deserializing with a missing passphrase"
+            ), self.assertRaises(serialization.CryptographyError), open(
+                encrypted_model, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file,
+                device=device,
+                lazy_load=True,
+                encryption=None,
+            ) as deserialized:
+                self._test_first_key_negative(deserialized)
+                del deserialized
+            gc.collect()
+
+            # Ensure that it fails to load when given the wrong passphrase
+            with self.subTest(
+                msg="Deserializing with an incorrect passphrase"
+            ), self.assertRaises(serialization.CryptographyError), open(
+                encrypted_model, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file,
+                device=device,
+                lazy_load=True,
+                encryption=incorrect_decryption,
+            ) as deserialized:
+                self._test_first_key_negative(deserialized)
+                del deserialized
+            gc.collect()
 
 
 class TestDeserialization(unittest.TestCase):

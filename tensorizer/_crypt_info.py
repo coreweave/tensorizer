@@ -121,7 +121,7 @@ class KeyDerivationChunk(CryptInfoChunk, abc.ABC, chunk_type=1):
         return KeyDerivationChunk._derivation_method_segment.size + super().size
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class FastKeyDerivationChunk(KeyDerivationChunk, derivation_method=1):
     salt: Union[bytes, bytearray, memoryview]
 
@@ -156,6 +156,57 @@ class FastKeyDerivationChunk(KeyDerivationChunk, derivation_method=1):
     @property
     def size(self) -> int:
         return 2 + len(self.salt) + super().size
+
+
+@dataclasses.dataclass(frozen=True)
+class SlowKeyDerivationChunk(KeyDerivationChunk, derivation_method=2):
+    opslimit: int
+    memlimit: int
+    alg: int
+    salt: Union[bytes, bytearray, memoryview]
+
+    __slots__ = ("opslimit", "memlimit", "alg", "salt")
+
+    _algorithm_segment: ClassVar[struct.Struct] = struct.Struct(
+        "<"  # Little-endian
+        "Q"  # Opslimit (unsigned long long)
+        "Q"  # Memlimit (size_t)
+        "i"  # Algorithm identifier (int)
+    )
+    _salt_segment_template: ClassVar[str] = (
+        "<H{salt_len:d}s"  # Salt length and bytes
+    )
+    read_salt = partial(_variable_read, length_fmt="H", data_fmt="s")
+
+    @property
+    def _salt_segment(self):
+        return struct.Struct(
+            self._salt_segment_template.format(salt_len=len(self.salt))
+        )
+
+    @classmethod
+    def unpack_from(cls, buffer, offset: int = 0) -> "SlowKeyDerivationChunk":
+        opslimit, memlimit, alg = cls._algorithm_segment.unpack_from(
+            buffer, offset
+        )
+        offset += cls._algorithm_segment.size
+        salt = cls.read_salt(buffer, offset)[0]
+        return cls(opslimit=opslimit, memlimit=memlimit, alg=alg, salt=salt)
+
+    def pack_into(self, buffer, offset: int = 0) -> int:
+        offset = super().pack_into(buffer, offset)
+        self._algorithm_segment.pack_into(
+            buffer, offset, self.opslimit, self.memlimit, self.alg
+        )
+        offset += self._algorithm_segment.size
+        salt_segment = self._salt_segment
+        salt_segment.pack_into(buffer, offset, len(self.salt), self.salt)
+        offset += salt_segment.size
+        return offset
+
+    @property
+    def size(self) -> int:
+        return self._algorithm_segment.size + 2 + len(self.salt) + super().size
 
 
 @dataclasses.dataclass

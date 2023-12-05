@@ -1,8 +1,10 @@
 import concurrent.futures
 import ctypes
+import dataclasses
 import enum
 import io
 import mmap
+import typing
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from ctypes import (
@@ -223,7 +225,7 @@ def init_crypto_pwhash():
     )
 
     crypto_pwhash.errcheck = error_handler(
-        "Ran out of memory while hashing a password"
+        "Password hashing failed. May have run out of memory."
     )
 
     return crypto_pwhash
@@ -343,20 +345,66 @@ crypto_core_hsalsa20 = init_crypto_core_hsalsa20()
 crypto_stream_salsa20_xor_ic = init_crypto_stream_salsa20_xor_ic()
 sodium_memzero = init_sodium_memzero()
 
-crypto_stream_salsa20_NONCEBYTES: Final[int] = (
-    nacl.crypto_stream_salsa20_noncebytes()
-)
-crypto_stream_salsa20_KEYBYTES: Final[int] = (
-    nacl.crypto_stream_salsa20_keybytes()
-)
-crypto_onetimeauth_poly1305_BYTES: Final[int] = (
-    nacl.crypto_onetimeauth_poly1305_bytes()
-)
-crypto_onetimeauth_poly1305_KEYBYTES: Final[int] = (
-    nacl.crypto_onetimeauth_poly1305_keybytes()
-)
 
-if crypto_stream_salsa20_KEYBYTES != crypto_onetimeauth_poly1305_KEYBYTES:
+class Constants(type):
+    @staticmethod
+    def _get_constant(name, typ) -> int:
+        prototype = ctypes.CFUNCTYPE(typ)
+        paramflags = ()
+        getter = prototype((name, nacl), paramflags)
+        return getter()
+
+    def __new__(cls, name: str, bases: tuple, dct: dict) -> NamedTuple:
+        annotations = dct.pop("__annotations__", {})
+        entries = {}
+        for constant_name, constant_type in dct.items():
+            if constant_name.startswith("_"):
+                continue
+            entries[constant_name] = cls._get_constant(
+                constant_name.lower(), constant_type
+            )
+        constant_class = typing.cast(
+            type, NamedTuple(name, **{k: annotations[k] for k in entries})
+        )
+        return constant_class(**entries)
+
+
+class Const(metaclass=Constants):
+    # Dynamically pulls constants from libsodium
+    # Syntax:
+    # libsodium name: Python type = C type
+
+    crypto_stream_salsa20_NONCEBYTES: int = c_size_t
+    crypto_stream_salsa20_KEYBYTES: int = c_size_t
+
+    crypto_onetimeauth_poly1305_BYTES: int = c_size_t
+    crypto_onetimeauth_poly1305_KEYBYTES: int = c_size_t
+
+    crypto_pwhash_SALTBYTES: int = c_size_t
+    crypto_pwhash_PASSWD_MIN: int = c_size_t
+    crypto_pwhash_PASSWD_MAX: int = c_size_t
+    crypto_pwhash_BYTES_MIN: int = c_size_t
+    crypto_pwhash_BYTES_MAX: int = c_size_t
+
+    crypto_pwhash_OPSLIMIT_MIN: int = c_ulonglong
+    crypto_pwhash_OPSLIMIT_INTERACTIVE: int = c_ulonglong
+    crypto_pwhash_OPSLIMIT_MODERATE: int = c_ulonglong
+    crypto_pwhash_OPSLIMIT_SENSITIVE: int = c_ulonglong
+    crypto_pwhash_OPSLIMIT_MAX: int = c_ulonglong
+
+    crypto_pwhash_MEMLIMIT_MIN: int = c_size_t
+    crypto_pwhash_MEMLIMIT_INTERACTIVE: int = c_size_t
+    crypto_pwhash_MEMLIMIT_MODERATE: int = c_size_t
+    crypto_pwhash_MEMLIMIT_SENSITIVE: int = c_size_t
+    crypto_pwhash_MEMLIMIT_MAX: int = c_size_t
+
+    crypto_pwhash_ALG_ARGON2ID13: int = c_int
+
+
+if (
+    Const.crypto_stream_salsa20_KEYBYTES
+    != Const.crypto_onetimeauth_poly1305_KEYBYTES
+):
     # The definitions of these two algorithms should set these
     # both at 32 bytes.
     raise RuntimeError(
@@ -364,16 +412,6 @@ if crypto_stream_salsa20_KEYBYTES != crypto_onetimeauth_poly1305_KEYBYTES:
         " crypto_onetimeauth_poly1305_KEYBYTES"
     )
 
-crypto_pwhash_SALTBYTES: Final[int] = nacl.crypto_pwhash_saltbytes()
-crypto_pwhash_PASSWD_MIN: Final[int] = nacl.crypto_pwhash_passwd_min()
-crypto_pwhash_PASSWD_MAX: Final[int] = nacl.crypto_pwhash_passwd_max()
-crypto_pwhash_OPSLIMIT_MODERATE: Final[int] = (
-    nacl.crypto_pwhash_opslimit_moderate()
-)
-crypto_pwhash_MEMLIMIT_MODERATE: Final[int] = (
-    nacl.crypto_pwhash_memlimit_moderate()
-)
-crypto_pwhash_ALG_ARGON2ID13: Final[int] = nacl.crypto_pwhash_alg_argon2id13()
 
 SALSA20_BLOCK_SIZE: Final[int] = 64
 
@@ -403,56 +441,125 @@ def random_bytes(size: int) -> bytes:
     return buf.getvalue()
 
 
-class PWHashParams(NamedTuple):
+@dataclasses.dataclass(init=False)
+class PWHash:
+    __slots__ = ("opslimit", "memlimit", "alg", "salt")
+
+    OPSLIMIT_MIN: ClassVar[int] = Const.crypto_pwhash_OPSLIMIT_MIN
+    OPSLIMIT_INTERACTIVE: ClassVar[int] = (
+        Const.crypto_pwhash_OPSLIMIT_INTERACTIVE
+    )
+    OPSLIMIT_MODERATE: ClassVar[int] = Const.crypto_pwhash_OPSLIMIT_MODERATE
+    OPSLIMIT_SENSITIVE: ClassVar[int] = Const.crypto_pwhash_OPSLIMIT_SENSITIVE
+    OPSLIMIT_MAX: ClassVar[int] = Const.crypto_pwhash_OPSLIMIT_MAX
+
+    MEMLIMIT_MIN: ClassVar[int] = Const.crypto_pwhash_MEMLIMIT_MIN
+    MEMLIMIT_INTERACTIVE: ClassVar[int] = (
+        Const.crypto_pwhash_MEMLIMIT_INTERACTIVE
+    )
+    MEMLIMIT_MODERATE: ClassVar[int] = Const.crypto_pwhash_MEMLIMIT_MODERATE
+    MEMLIMIT_SENSITIVE: ClassVar[int] = Const.crypto_pwhash_MEMLIMIT_SENSITIVE
+    MEMLIMIT_MAX: ClassVar[int] = Const.crypto_pwhash_MEMLIMIT_MAX
+
+    ALG_ARGON2ID13: ClassVar[int] = Const.crypto_pwhash_ALG_ARGON2ID13
+
     opslimit: int
     memlimit: int
     alg: int
 
+    salt: bytes
 
-def pwhash(
-    passwd: bytes, salt: bytes, output_size: int = 32
-) -> Tuple[bytes, PWHashParams]:
-    if not isinstance(passwd, bytes):
-        raise TypeError("Invalid type for password, should be bytes")
-    if not isinstance(salt, bytes):
-        raise TypeError("Invalid type for salt, should be bytes")
-    if not isinstance(output_size, int):
-        raise TypeError("Invalid output_size")
-    if len(salt) != crypto_pwhash_SALTBYTES:
-        raise ValueError(
-            f"Invalid salt size, {len(salt)} != {crypto_pwhash_SALTBYTES}"
+    @staticmethod
+    def _range_check(value, lower, upper, name: str) -> None:
+        if not (lower <= value <= upper):
+            raise ValueError(
+                f"Invalid {name}, must be in the range [{lower}, {upper})"
+            )
+
+    def __init__(
+        self,
+        salt: Union[bytes, bytearray, memoryview, None] = None,
+        opslimit=OPSLIMIT_MODERATE,
+        memlimit=MEMLIMIT_MODERATE,
+    ):
+        if salt is None:
+            salt: bytes = random_bytes(Const.crypto_pwhash_SALTBYTES)
+        elif not isinstance(salt, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                "Invalid type for salt,"
+                " expected bytes, bytearray, or memoryview;"
+                f" got {type(salt).__name__}"
+            )
+        if len(salt) != Const.crypto_pwhash_SALTBYTES:
+            raise ValueError(
+                "Invalid salt size,"
+                f" {len(salt)} != {Const.crypto_pwhash_SALTBYTES}"
+            )
+        self._range_check(
+            opslimit,
+            Const.crypto_pwhash_OPSLIMIT_MIN,
+            Const.crypto_pwhash_OPSLIMIT_MAX,
+            "opslimit",
         )
-    if not (crypto_pwhash_PASSWD_MIN <= len(passwd) < crypto_pwhash_PASSWD_MAX):
-        raise ValueError(
-            "Invalid password length, must be in the range"
-            f" [{crypto_pwhash_PASSWD_MIN}, {crypto_pwhash_PASSWD_MAX})"
+        self._range_check(
+            memlimit,
+            Const.crypto_pwhash_MEMLIMIT_MIN,
+            Const.crypto_pwhash_MEMLIMIT_MAX,
+            "memlimit",
         )
-    buf = io.BytesIO(bytes(output_size))
-    buf_view = buf.getbuffer()
-    assert len(buf_view) == output_size
-    params = PWHashParams(
-        opslimit=crypto_pwhash_OPSLIMIT_MODERATE,
-        memlimit=crypto_pwhash_MEMLIMIT_MODERATE,
-        alg=crypto_pwhash_ALG_ARGON2ID13,
-    )
-    crypto_pwhash(
-        out=as_ucstr(buf_view),
-        outlen=output_size,
-        passwd=passwd,
-        passwdlen=len(passwd),
-        salt=as_ucstr(salt),
-        opslimit=params.opslimit,
-        memlimit=params.memlimit,
-        alg=params.alg,
-    )
-    del buf_view
-    return buf.getvalue(), params
+        self.opslimit = opslimit
+        self.memlimit = memlimit
+        self.alg = Const.crypto_pwhash_ALG_ARGON2ID13
+        self.salt = salt
+
+    def hash(
+        self,
+        passwd: bytes,
+        output_size: int = Const.crypto_stream_salsa20_KEYBYTES,
+    ) -> bytes:
+        if not isinstance(passwd, bytes):
+            raise TypeError(
+                "Invalid type for password,"
+                f" expected bytes, got {type(passwd).__name__}"
+            )
+        if not isinstance(output_size, int):
+            raise TypeError(
+                "Invalid type for output_size"
+                f" expected int, got {type(output_size).__name__}"
+            )
+        self._range_check(
+            len(passwd),
+            Const.crypto_pwhash_PASSWD_MIN,
+            Const.crypto_pwhash_PASSWD_MAX,
+            "password length",
+        )
+        self._range_check(
+            output_size,
+            Const.crypto_pwhash_BYTES_MIN,
+            Const.crypto_pwhash_BYTES_MAX,
+            "output length",
+        )
+        buf = io.BytesIO(bytes(output_size))
+        buf_view = buf.getbuffer()
+        assert len(buf_view) == output_size
+        crypto_pwhash(
+            out=as_ucstr(buf_view),
+            outlen=output_size,
+            passwd=passwd,
+            passwdlen=len(passwd),
+            salt=as_ucstr(self.salt),
+            opslimit=self.opslimit,
+            memlimit=self.memlimit,
+            alg=self.alg,
+        )
+        del buf_view
+        return buf.getvalue()
 
 
 def poly1305(out: MutableBuffer, in_buf: Buffer, key: Buffer):
-    if len(out) != crypto_onetimeauth_poly1305_BYTES:
+    if len(out) != Const.crypto_onetimeauth_poly1305_BYTES:
         raise ValueError("Invalid output buffer size for onetimeauth")
-    if len(key) < crypto_onetimeauth_poly1305_KEYBYTES:
+    if len(key) < Const.crypto_onetimeauth_poly1305_KEYBYTES:
         # The key can be larger, but only the prefix will be used
         raise ValueError("Invalid key buffer size for onetimeauth")
     return crypto_onetimeauth_poly1305(
@@ -467,8 +574,8 @@ def salsa20_subkey(
     nonce: Buffer, key: Buffer, out: Optional[MutableBuffer] = None
 ) -> Optional[MutableBuffer]:
     if out is None:
-        out = bytearray(crypto_stream_salsa20_KEYBYTES)
-    elif len(out) != crypto_stream_salsa20_KEYBYTES:
+        out = bytearray(Const.crypto_stream_salsa20_KEYBYTES)
+    elif len(out) != Const.crypto_stream_salsa20_KEYBYTES:
         raise ValueError("Invalid key buffer size for hsalsa20")
     crypto_core_hsalsa20(
         out=as_ucstr(out), in_buf=as_ucstr(nonce), k=as_ucstr(key)
@@ -479,11 +586,11 @@ def salsa20_subkey(
 def salsa20_inplace(
     buffer: MutableBuffer, nonce: Buffer, key: Buffer, block: int = 0
 ):
-    if len(key) != crypto_stream_salsa20_KEYBYTES:
+    if len(key) != Const.crypto_stream_salsa20_KEYBYTES:
         raise ValueError(
             "Invalid key buffer size for crypto_stream_salsa20_xor_ic"
         )
-    if len(nonce) != crypto_stream_salsa20_NONCEBYTES:
+    if len(nonce) != Const.crypto_stream_salsa20_NONCEBYTES:
         raise ValueError(
             "Invalid nonce buffer size for crypto_stream_salsa20_xor_ic"
         )
