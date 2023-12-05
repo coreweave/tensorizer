@@ -262,6 +262,10 @@ deserializer.close()
 ```
 
 For more detail, refer to [docs/encryption.md](/docs/encryption.md).
+A complete example is also available as
+[examples/encryption.py](examples/encryption.py).
+The `EncryptionParams` and `DecryptionParams` class docstrings additionally
+contain some usage information for quick reference from an IDE.
 
 ## Benchmarks
 
