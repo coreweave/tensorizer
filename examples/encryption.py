@@ -27,15 +27,15 @@ def empty_model(ref) -> torch.nn.Module:
 
 
 # Set a strong string or bytes passphrase here
-passphrase: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD", "") or input(
-    "Passphrase to use for encryption: "
+source: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD", "") or input(
+    "Source string to create an encryption key: "
 )
 
 fd, path = tempfile.mkstemp(prefix="encrypted-tensors")
 
 try:
     # Encrypt a model during serialization
-    encryption_params = EncryptionParams.from_string(passphrase)
+    encryption_params = EncryptionParams.from_string(source)
 
     model = original_model(model_ref)
     serialization_start = time.monotonic()
@@ -48,7 +48,7 @@ try:
     del model
 
     # Then decrypt it again during deserialization
-    decryption_params = DecryptionParams.from_passphrase(passphrase)
+    decryption_params = DecryptionParams.from_string(source)
 
     model = empty_model(model_ref)
     deserialization_start = time.monotonic()

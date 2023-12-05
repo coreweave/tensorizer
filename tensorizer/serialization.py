@@ -769,32 +769,36 @@ class EncryptionParams:
     This is the fastest and most secure option, but you must
     save it somewhere to be able to use it for decryption later.
 
-    #. Using `EncryptionParams.from_passphrase_fast()`
+    #. Using `EncryptionParams.from_string()`
 
-    This will generate a reproducible encryption key from a passphrase string,
-    using a fast algorithm (one round of SHA256 with salt).
-    This is a good choice if your passphrase is already strong,
-    such as when using a long randomly-generated string.
-    This does not provide the same protection against brute-force attempts
-    as an intentionally slow password hashing function.
+    This will generate a reproducible encryption key from an arbitrary string,
+    using the Argon2 (Argon2id, RFC 9106) password hashing algorithm.
+
+    The resulting key has resistance against brute-force attacks that attempt
+    to guess the input string, achieved by making each attempt
+    expensive to compute, both in CPU time and RAM usage.
+
+    The difficulty to compute the key may be adjusted using additional
+    parameters to ``from_string()``.
+    See `EncryptionParams.from_string()`'s documentation for more details.
 
     #. Using `EncryptionParams(key=...)` directly
 
     You can supply an exact key to use for encryption by directly invoking
     the `EncryptionParams` constructor. This must be a `bytes` object of the
-    correct length to be used as an XSalsa20 cipher key.
-    This is more complicated and risky to use than the other options.
+    correct length to be used as an XSalsa20 cipher key (32 bytes).
+
+    This allows bringing your own key derivation algorithm or random key source,
+    but is more complicated and risky to use than the other options.
     Do not use this with an insecure key.
 
     Examples:
 
-        Using `EncryptionParams.from_passphrase_fast()` with
+        Using `EncryptionParams.from_string()` with
         an environment variable::
 
-            passphrase: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
-            encryption_params = EncryptionParams.from_passphrase_fast(
-                passphrase
-            )
+            source: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
+            encryption_params = EncryptionParams.from_string(source)
 
             # Use this to encrypt something:
             serializer = TensorSerializer(
@@ -804,7 +808,7 @@ class EncryptionParams:
             serializer.close()
 
             # Then decrypt it again
-            decryption_params = DecryptionParams.from_passphrase(passphrase)
+            decryption_params = DecryptionParams.from_string(source)
             deserializer = TensorDeserializer(
                 "model.tensors", encryption=decryption_params
             )
@@ -832,17 +836,6 @@ class EncryptionParams:
             deserializer.load_into_module(...)
             deserializer.close()
     """
-
-    # Not yet fully implemented:
-    # #. Using `EncryptionParams.from_passphrase_slow(passphrase)`
-    #
-    # This will generate a reproducible encryption key from a passphrase string,
-    # using a slow algorithm that is resistant against brute-force attacks.
-    # This should be used if the source passphrase is weak (or human-written).
-    #
-    # This algorithm is intentionally very slow and will slow down decryption
-    # and deserialization later. Use `EncryptionParams.from_passphrase_fast()`
-    # instead with a strong passphrase for better performance.
 
     __slots__ = ("key", "_algorithm")
 
@@ -873,8 +866,8 @@ class EncryptionParams:
     def __init__(self, key: bytes):
         if not isinstance(key, (bytes, bytearray, memoryview)):
             raise TypeError(
-                "Encryption key must be binary (bytes type)."
-                " To derive an encryption key from a string or passphrase,"
+                "Encryption key must be a cryptographically secure bytestring."
+                " To derive an encryption key from an arbitrary string,"
                 " use EncryptionParams.from_string()"
             )
 
@@ -894,7 +887,7 @@ class EncryptionParams:
     @_requires_libsodium
     def random(cls) -> "EncryptionParams":
         """
-        Generates a random encryption key with no associated passphrase.
+        Generates a random encryption key with no associated source string.
 
         This is the fastest and most secure option, but you must
         save the resulting key (from ``EncryptionParams.key``)
@@ -981,11 +974,40 @@ class EncryptionParams:
                 super().__getattribute__(self, item)
                 _require_libsodium()
 
+    @property
+    def salt(self) -> bytes:
+        """
+        Cryptographic salt used for key derivation.
+        This is stored within a serialized model, and will be retrieved
+        automatically during deserialization, so it does not normally
+        need to be manually saved.
+
+        However, manually saving this value will allow recalculating an exact
+        binary key separately from the deserialization process.
+
+        Returns:
+            The cryptographic salt used for key derivation.
+        Raises:
+            ValueError: If no salt is being used for key derivation.
+        """
+        if hasattr(self._algorithm, "salt"):
+            return bytes(self._algorithm.salt)
+        elif self._algorithm is None:
+            raise ValueError(
+                "An exact binary key is being used."
+                " Exact binary keys do not use key derivation algorithms,"
+                " and thus have no salt."
+            )
+        else:
+            raise ValueError(
+                "The key derivation algorithm in use does not use a salt."
+            )
+
     @classmethod
     @_requires_libsodium
     def from_string(
         cls,
-        passphrase: Union[str, bytes],
+        source: Union[str, bytes],
         opslimit: Union[OpsLimit, int, None] = None,
         memlimit: Union[MemLimit, int, None] = None,
         salt: Union[str, bytes, None] = None,
@@ -993,10 +1015,78 @@ class EncryptionParams:
         encoding="utf-8",
     ) -> "EncryptionParams":
         """
-        Generates an encryption key from a password and salt.
+        Generates an encryption key from any string.
+
+        This method uses the Argon2 (Argon2id, RFC 9106) password hashing
+        algorithm to create a key from an input string.
+
+        The key has resistance against brute-force attacks that attempt
+        to guess the input string, achieved by making each attempt
+        expensive to compute, both in CPU time and RAM usage.
+
+        The computational difficulty can be increased or decreased
+        via the `opslimit` and `memlimit` parameters.
+        Higher computational difficulty gives more security
+        for weak input strings, but may impact performance.
+        The default setting is a "moderate" profile taken from ``libsodium``.
+
+        Presets (as well as minimum values) are available through the
+        `EncryptionParams.OpsLimit` and `EncryptionParams.MemLimit` enums.
+
+        Rough estimates of performance impact (on a 3.20 GHz processor)::
+
+            from tensorizer import EncryptionParams
+
+            OpsLimit = EncryptionParams.OpsLimit
+            MemLimit = EncryptionParams.MemLimit
+            s = "X" * 40
+
+            EncryptionParams.from_string(  # Takes about 0.05 ms, 8 KiB RAM
+                s, opslimit=OpsLimit.MIN, memlimit=MemLimit.MIN
+            )
+            EncryptionParams.from_string(  # Takes about 90 ms, 64 MiB RAM
+                s, opslimit=OpsLimit.INTERACTIVE, memlimit=MemLimit.INTERACTIVE
+            )
+            EncryptionParams.from_string(  # Takes about 500 ms, 256 MiB RAM
+                s, opslimit=OpsLimit.MODERATE, memlimit=MemLimit.MODERATE
+                # Default: equivalent to opslimit=None, memlimit=None
+            )
+            EncryptionParams.from_string(  # Takes about 3.0 seconds, 1 GiB RAM
+                s, opslimit=OpsLimit.SENSITIVE, memlimit=MemLimit.SENSITIVE
+            )
+
+        Performance Tuning:
+            If possible, use `EncryptionParams.random()` instead of this method,
+            and save the generated key to use for decryption.
+
+            If that is not possible, save the binary key generated during
+            `EncryptionParams.from_string()` (from the ``.key`` attribute),
+            and use that key for decryption (via `DecryptionParams.from_key()`)
+            to remove the cost of re-computing the key at deserialization time.
+
+            If that is not possible, use a strong input string.
+            For input strings that are already very strong and high-entropy,
+            where brute-force attacks on the input string are no more likely
+            to succeed than brute-force attacks on a 256-bit key itself,
+            (e.g. very long, randomly generated strings),
+            `opslimit` and `memlimit` may be tuned down to minimize
+            their performance impact.
+
+            If that is not possible, test different values of `opslimit`
+            and `memlimit` to determine an acceptable tradeoff between
+            performance and security for your use case.
+
+        See Also:
+            ``libsodium`` documentation for ``pwhash``,
+            the Argon2id implementation used in ``from_string()``:
+            https://libsodium.gitbook.io/doc/password_hashing/default_phf#key-derivation
+
+        See Also:
+            RFC 9106 for details on Argon2,
+            https://datatracker.ietf.org/doc/html/rfc9106
 
         Args:
-            passphrase: The source passphrase from which to derive a key.
+            source: The source string from which to derive a key.
             opslimit:
                 Difficulty of the key derivation algorithm on CPU resources.
                 For details, refer to the `libsodium documentation`_.
@@ -1012,7 +1102,10 @@ class EncryptionParams:
             salt: A non-secret cryptographic salt to be stored
                 in the serialized file.
                 If None (the default), a secure random salt is used.
-            encoding: The encoding to use to convert `passphrase` to ``bytes``
+                This normally does not need to be chosen manually, however,
+                this can allow reproducing an exact binary key separately
+                from deserialization.
+            encoding: The encoding to use to convert `source` to ``bytes``
                 if provided as a ``str``. Defaults to UTF-8.
 
         Returns:
@@ -1020,8 +1113,8 @@ class EncryptionParams:
 
         .. _libsodium documentation: https://libsodium.gitbook.io/doc/password_hashing/default_phf#key-derivation
         """
-        if not passphrase:
-            raise ValueError("Passphrase cannot be empty")
+        if not source:
+            raise ValueError("Source cannot be empty")
         if isinstance(opslimit, cls.MemLimit) or not isinstance(
             opslimit, (cls.OpsLimit, int, type(None))
         ):
@@ -1036,8 +1129,8 @@ class EncryptionParams:
                 "memlimit parameter: expected EncryptionParams.MemLimit,"
                 f" int, or None; {memlimit.__class__.__name__} found"
             )
-        if isinstance(passphrase, str):
-            passphrase = passphrase.encode(encoding)
+        if isinstance(source, str):
+            source = source.encode(encoding)
         if opslimit is None:
             opslimit = cls.OpsLimit.MODERATE
         if memlimit is None:
@@ -1045,7 +1138,7 @@ class EncryptionParams:
         pwhash_params = _crypt.PWHash(
             salt=salt, opslimit=opslimit, memlimit=memlimit
         )
-        encryption_params = cls(key=pwhash_params.hash(passphrase))
+        encryption_params = cls(key=pwhash_params.hash(source))
         encryption_params._algorithm = cls._FromStringPWHashAlgorithm(
             pwhash_params=pwhash_params
         )
@@ -1059,28 +1152,26 @@ class DecryptionParams:
 
     There are two ways to use this class, using its factory functions:
 
-    #. Using `DecryptionParams.from_passphrase()`
+    #. Using `DecryptionParams.from_string()`
 
-    This will decrypt tensors using the specified passphrase string.
+    This will decrypt tensors using the specified key string.
     This may be used if `EncryptionParams.from_string()`
     was used during encryption.
 
     #. Using `DecryptionParams.from_key()`
 
     This will decrypt tensors using an exact binary key.
-    This may always be used with the `key` from an `EncryptionParams` object,
+    This may always be used with the ``key`` from an `EncryptionParams` object,
     regardless of whether the key was generated with
     `EncryptionParams.from_string()` or `EncryptionParams.random()`.
 
     Examples:
 
-        Using `DecryptionParams.from_passphrase()` with
+        Using `DecryptionParams.from_string()` with
         an environment variable::
 
-            passphrase: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
-            encryption_params = EncryptionParams.from_string(
-                passphrase
-            )
+            source: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
+            encryption_params = EncryptionParams.from_string(source)
 
             # Use this to encrypt something:
             serializer = TensorSerializer(
@@ -1090,7 +1181,7 @@ class DecryptionParams:
             serializer.close()
 
             # Then decrypt it again
-            decryption_params = DecryptionParams.from_passphrase(passphrase)
+            decryption_params = DecryptionParams.from_string(source)
             deserializer = TensorDeserializer(
                 "model.tensors", encryption=decryption_params
             )
@@ -1120,25 +1211,45 @@ class DecryptionParams:
     """
 
     key: Optional[bytes]
-    passphrase: Optional[bytes]
+    source: Optional[bytes]
 
     def __init__(self):
         self.key = None
-        self.passphrase = None
+        self.source = None
 
     @classmethod
     @_requires_libsodium
-    def from_passphrase(
-        cls, passphrase: Union[str, bytes], encoding="utf-8"
+    def from_string(
+        cls, source: Union[str, bytes], *, encoding="utf-8"
     ) -> "DecryptionParams":
-        if not passphrase:
-            raise ValueError("Passphrase cannot be empty")
-        if isinstance(passphrase, str):
-            passphrase = passphrase.encode(encoding)
-        elif not isinstance(passphrase, bytes):
-            raise TypeError("Invalid passphrase type: must be str or bytes")
+        """
+        Reverses the process of `EncryptionParams.from_string()`.
+        Encryption algorithm parameters such as ``opslimit``, ``memlimit``,
+        and ``salt`` are automatically inferred from the file during decryption.
+
+        Tensors encrypted with `EncryptionParams.random()` or a custom binary
+        key cannot be decrypted using this method.
+        Use `DecryptionParams.from_key() instead.
+
+        Using `DecryptionParams.from_key()` is always faster than this method.
+        Use it whenever possible (when you already know the exact binary key).
+
+        Args:
+            source: Source string to use for decryption.
+            encoding: The encoding to use to convert `source` to ``bytes``
+                if provided as a ``str``. Defaults to UTF-8.
+
+        Returns:
+
+        """
+        if not source:
+            raise ValueError("Source cannot be empty")
+        if isinstance(source, str):
+            source = source.encode(encoding)
+        elif not isinstance(source, bytes):
+            raise TypeError("Invalid source type: must be str or bytes")
         params = cls()
-        params.passphrase = passphrase
+        params.source = source
         return params
 
     @classmethod
@@ -1153,8 +1264,8 @@ class DecryptionParams:
                 f" got {len(key)} bytes instead."
                 " DecryptionParams.from_key() should be used with a key"
                 " read from EncryptionParams.key."
-                " To decrypt with a passphrase instead of a binary key,"
-                " use DecryptionParams.from_passphrase() instead."
+                " To decrypt with an arbitrary string instead of a binary key,"
+                " use DecryptionParams.from_string() instead."
             )
         params = cls()
         params.key = key
@@ -1162,12 +1273,12 @@ class DecryptionParams:
 
 
 class _KeyDerivation:
-    __slots__ = ("passphrase", "_cache")
-    passphrase: Union[str, bytes]
+    __slots__ = ("source", "_cache")
+    source: Union[str, bytes]
     _cache: Dict[Any, bytes]
 
-    def __init__(self, passphrase: Union[str, bytes]):
-        self.passphrase = passphrase
+    def __init__(self, source: Union[str, bytes]):
+        self.source = source
         self._cache = {}
 
     def _derive_key(self, method: _crypt_info.KeyDerivationChunk) -> bytes:
@@ -1177,7 +1288,7 @@ class _KeyDerivation:
                     f"Unsupported pwhash algorithm ({method.alg})"
                 )
             return EncryptionParams.from_string(
-                passphrase=self.passphrase,
+                source=self.source,
                 opslimit=method.opslimit,
                 memlimit=method.memlimit,
                 salt=method.salt,
@@ -1338,14 +1449,14 @@ class TensorDeserializer(
                     thread_name_prefix="TensorizerDecryption",
                 )
                 if self._encryption.key is None:
-                    if self._encryption.passphrase is None:
+                    if self._encryption.source is None:
                         raise ValueError(
                             "Invalid DecryptionParams,"
-                            " no key or passphrase provided"
+                            " no key or source string provided"
                         )
                     else:
                         self._key_derivation = _KeyDerivation(
-                            passphrase=self._encryption.passphrase
+                            source=self._encryption.source
                         )
                         self._cleanup.callback(self._key_derivation.clear_cache)
             else:
@@ -1796,16 +1907,17 @@ class TensorDeserializer(
     ) -> bytes:
         if self._encryption.key is not None:
             return self._encryption.key
-        # Requires key derivation from a passphrase
+        # Requires key derivation from a source string
         if self._key_derivation is None:
             raise ValueError("Invalid DecryptionParams")
         # Check for a KeyDerivationChunk
         kd = crypt_info.find_chunks(_crypt_info.KeyDerivationChunk)
         if not kd:
             raise CryptographyError(
-                "Passphrase was provided, but the tensor was"
-                " not originally encrypted using a passphrase"
-                " (e.g. EncryptionParams.from_string()"
+                "Source string was provided, but the tensor was"
+                " not originally encrypted using a source string"
+                " (e.g. EncryptionParams.from_string())."
+                " DecryptionParams.from_key() must be used instead"
             )
         elif len(kd) > 1:
             raise CryptographyError(

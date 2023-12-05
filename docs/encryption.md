@@ -96,36 +96,35 @@ deserializer.load_into_module(...)
 deserializer.close()
 ```
 
-### Using `EncryptionParams.from_passphrase_fast()` with an environment variable
+### Using `EncryptionParams.from_string()` with an environment variable
 
-If an encryption key must be provided as a pre-existing string that
-still has high entropy (~256 bits), this method of encryption will allow the
-use of that string, and does not require saving a key generated at the time
-of encryption.
+If an encryption key must be provided as a pre-existing string,
+this method of encryption will allow the use of that string,
+and does not require saving a key generated at the time of encryption.
 
 > [!WARNING]
-> 
-> This is not secure for human-written or low-entropy strings, as they can be
-> brute-forced guessed. Only use this with passphrase strings that are already
-> as secure as an encryption key themselves.
+>
+> Make sure a secure input string is used to create a key.
+> `EncryptionParams.from_string()` accepts parameters to tune its algorithm
+> to make searching the input string via brute-force checking less viable,
+> but nothing can protect against weak enough input strings,
+> like your birthdate, or a common password.
 
 ```py
 from tensorizer import (
     EncryptionParams, DecryptionParams, TensorDeserializer, TensorSerializer
 )
 
-# This passphrase must already be a secure key (high-entropy).
-# Short or insecure passphrases may be brute-force guessed.
-passphrase: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
+source: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
 
 # Serialize and encrypt a model:
-encryption_params = EncryptionParams.from_passphrase_fast(passphrase)
+encryption_params = EncryptionParams.from_string(source)
 serializer = TensorSerializer("model.tensors", encryption=encryption_params)
 serializer.write_module(...)  # or write_state_dict(), etc.
 serializer.close()
 
 # Then decrypt it again:
-decryption_params = DecryptionParams.from_passphrase(passphrase)
+decryption_params = DecryptionParams.from_string(source)
 deserializer = TensorDeserializer("model.tensors", encryption=decryption_params)
 deserializer.load_into_module(...)
 deserializer.close()
@@ -134,27 +133,101 @@ deserializer.close()
 ### Choosing a Key Derivation Algorithm
 
 The classes `EncryptionParams` and `DecryptionParams` allow a choice of
-key derivation method. Currently, two methods are implemented:
+key derivation method. Two methods are implemented:
 
 1. Random key generation
     1. Chosen by constructing an `EncryptionParams` object through calling
        `EncryptionParams.random()`
-    2. Uses a completely random 32-byte sequence with no associated passphrase
-    3. Highly secure against being guessed
-    4. You must save the randomly generated key
-2. Fast key derivation
+    2. Not technically key derivation
+    3. Uses a completely random 32-byte sequence with no associated passphrase
+    4. Highly secure against being guessed
+    5. You must save the randomly generated key
+2. [Argon2id](https://datatracker.ietf.org/doc/html/rfc9106) key derivation
     1. Chosen by constructing an `EncryptionParams` object through calling
-       `EncryptionParams.from_passphrase_fast(passphrase)`
-    2. Transmutes an arbitrary-length `str` or `bytes` passphrase into a
+       `EncryptionParams.from_string(source)`
+    2. Transmutes an arbitrary-length `str` or `bytes` source string into a
        binary encryption key
-    3. Does not implement any security against brute-force checking
-       many passphrases (brute-force checking is prevented by using an
-       intentionally slow algorithm, **which this is not**)
-    4. Must only be used with passphrases that are already secure and
-       high-entropy
+    3. Implements adjustable security against brute-force cracking
+       via its `opslimit` and `memlimit` parameters
+    4. Internally uses
+       [`libsodium`'s `pwhash` function with the algorithm `crypto_pwhash_ALG_ARGON2ID13`](https://libsodium.gitbook.io/doc/password_hashing/default_phf#key-derivation)
 
 An `EncryptionParams` object is passed to a `TensorSerializer` using its
 `encryption=...` keyword-only parameter during initialization.
+
+#### `EncryptionParams.from_string()` details (Argon2id)
+
+`EncryptionParams.from_string()` uses the Argon2 (Argon2id, RFC 9106)
+password hashing algorithm to create a key from an input string.
+
+The key has resistance against brute-force attacks that attempt
+to guess the input string, achieved by making each attempt
+expensive to compute, both in CPU time and RAM usage.
+
+The computational difficulty can be increased or decreased
+via the `opslimit` and `memlimit` parameters.
+Higher computational difficulty gives more security
+for weak input strings, but may impact performance.
+The default setting is a "moderate" profile taken from `libsodium`.
+
+Presets (as well as minimum values) are available through the
+`EncryptionParams.OpsLimit` and `EncryptionParams.MemLimit` enums.
+
+Rough estimates of performance impact (on a 3.20 GHz processor):
+
+```py
+from tensorizer import EncryptionParams
+
+OpsLimit = EncryptionParams.OpsLimit
+MemLimit = EncryptionParams.MemLimit
+s = "X" * 40
+
+EncryptionParams.from_string(  # Takes about 0.05 ms, 8 KiB RAM
+    s, opslimit=OpsLimit.MIN, memlimit=MemLimit.MIN
+)
+EncryptionParams.from_string(  # Takes about 90 ms, 64 MiB RAM
+    s, opslimit=OpsLimit.INTERACTIVE, memlimit=MemLimit.INTERACTIVE
+)
+EncryptionParams.from_string(  # Takes about 500 ms, 256 MiB RAM
+    s, opslimit=OpsLimit.MODERATE, memlimit=MemLimit.MODERATE
+    # Default: equivalent to opslimit=None, memlimit=None
+)
+EncryptionParams.from_string(  # Takes about 3.0 seconds, 1 GiB RAM
+    s, opslimit=OpsLimit.SENSITIVE, memlimit=MemLimit.SENSITIVE
+)
+```
+
+Timing may be different on different hardware.
+These do not reflect the exact times an attacker may require for each guess.
+
+##### Performance tuning
+
+If possible, use `EncryptionParams.random()` instead of
+`EncryptionParams.from_string()`, and save the generated key
+to use for decryption.
+
+If that is not possible, save the binary key generated during
+`EncryptionParams.from_string()` (from the `.key` attribute),
+and use that key for decryption (via `DecryptionParams.from_key()`)
+to remove the cost of re-computing the key at deserialization time.
+
+If that is not possible, use a strong input string.
+For input strings that are already very strong and high-entropy,
+where brute-force attacks on the input string are no more likely
+to succeed than brute-force attacks on a 256-bit key itself,
+(e.g. very long, randomly generated strings),
+`opslimit` and `memlimit` may be tuned down to minimize
+their performance impact.
+
+If that is not possible, test different values of `opslimit`
+and `memlimit` to determine an acceptable tradeoff between
+performance and security for your use case.
+
+See also:
+- [`libsodium` documentation for `pwhash`](https://libsodium.gitbook.io/doc/password_hashing/default_phf#key-derivation),
+  the Argon2id implementation used in `EncryptionParams.from_string()`
+- [RFC 9106](https://datatracker.ietf.org/doc/html/rfc9106)
+  for details on Argon2 and Argon2id
 
 #### Using the right key derivation algorithm for decryption
 
@@ -164,13 +237,13 @@ A `DecryptionParams` object is passed to a `TensorDeserializer` using its
 `encryption=...` keyword-only parameter during initialization.
 
 When passphrase-based key derivation is used during encryption,
-a *key derivation chunk* recording the algorithm used is stored
+*key derivation metadata* recording the algorithm used is stored
 in the tensorized file. Since the file keeps track of the algorithm,
-any passphrase-based encryption can be decrypted the same way:
+any `from_string()`-based encryption can be decrypted the same way:
 
 ```py
-passphrase: str = ...
-decryption_params = DecryptionParams.from_passphrase(passphrase)
+source: str = ...
+decryption_params = DecryptionParams.from_string(source)
 deserializer = TensorDeserializer(..., encryption=decryption_params)
 ```
 
@@ -205,6 +278,9 @@ The throughput of `tensorizer`'s encryption algorithm reaches 31 GiB/s on
 Since it can overlap with downloads, the time overhead of decryption is
 very small, with data-processed-to-latency-incurred rates in the terabit range
 encountered on test machines.
+
+Speed of key derivation is configurable, if used.
+See [Choosing a Key Derivation Algorithm](#choosing-a-key-derivation-algorithm).
 
 ## Compatibility
 

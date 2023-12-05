@@ -23,6 +23,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = (
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from tensorizer import (
+    DecryptionParams,
+    EncryptionParams,
     TensorDeserializer,
     TensorSerializer,
     serialization,
@@ -59,7 +61,7 @@ def serialize_model(
     model_name: str,
     device: str,
     method: SerializeMethod = SerializeMethod.Module,
-    encryption: Optional[serialization.EncryptionParams] = None,
+    encryption: Optional[EncryptionParams] = None,
 ) -> SerializationResult:
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     sd = model.state_dict()
@@ -329,9 +331,7 @@ class TestSerialization(unittest.TestCase):
 )
 class TestEncryption(unittest.TestCase):
     @staticmethod
-    def _serialize(
-        enc: Optional[serialization.EncryptionParams], device=default_device
-    ):
+    def _serialize(enc: Optional[EncryptionParams], device=default_device):
         return serialize_model_temp(
             model_name,
             device,
@@ -347,20 +347,16 @@ class TestEncryption(unittest.TestCase):
 
     def test_encryption(self):
         fixed_salt = bytes(16)
-        low_cpu = serialization.EncryptionParams.OpsLimit.MIN
-        low_mem = serialization.EncryptionParams.MemLimit.MIN
-        encryption = serialization.EncryptionParams.from_string(
-            passphrase="test",
+        low_cpu = EncryptionParams.OpsLimit.MIN
+        low_mem = EncryptionParams.MemLimit.MIN
+        encryption = EncryptionParams.from_string(
+            source="test",
             opslimit=low_cpu,
             memlimit=low_mem,
             salt=fixed_salt,
         )
-        decryption = serialization.DecryptionParams.from_passphrase(
-            passphrase="test"
-        )
-        incorrect_decryption = serialization.DecryptionParams.from_passphrase(
-            passphrase="tset"
-        )
+        decryption = DecryptionParams.from_string(source="test")
+        incorrect_decryption = DecryptionParams.from_string(source="tset")
         device = default_device
 
         with self._serialize(encryption, device) as encrypted_model:
@@ -376,9 +372,9 @@ class TestEncryption(unittest.TestCase):
                     (True, False),
                 )
             for lazy_load, plaid_mode in modes:
-                # Ensure that it works when given a passphrase
+                # Ensure that it works when given a key
                 with self.subTest(
-                    msg="Deserializing with a correct passphrase",
+                    msg="Deserializing with a correct key",
                     device=device,
                     lazy_load=lazy_load,
                     plaid_mode=plaid_mode,
@@ -398,9 +394,9 @@ class TestEncryption(unittest.TestCase):
                     del deserialized
                 gc.collect()
 
-            # Ensure that it fails to load when not given a passphrase
+            # Ensure that it fails to load when not given a key
             with self.subTest(
-                msg="Deserializing with a missing passphrase"
+                msg="Deserializing with a missing key"
             ), self.assertRaises(serialization.CryptographyError), open(
                 encrypted_model, "rb"
             ) as in_file, TensorDeserializer(
@@ -413,9 +409,9 @@ class TestEncryption(unittest.TestCase):
                 del deserialized
             gc.collect()
 
-            # Ensure that it fails to load when given the wrong passphrase
+            # Ensure that it fails to load when given the wrong key
             with self.subTest(
-                msg="Deserializing with an incorrect passphrase"
+                msg="Deserializing with an incorrect key"
             ), self.assertRaises(serialization.CryptographyError), open(
                 encrypted_model, "rb"
             ) as in_file, TensorDeserializer(
@@ -432,7 +428,7 @@ class TestEncryption(unittest.TestCase):
             # Ensure that it fails to load an unencrypted model
             # when expecting encryption
             with self.subTest(
-                msg="Deserializing an unencrypted model with a passphrase"
+                msg="Deserializing an unencrypted model with a key"
             ), self.assertRaises(serialization.CryptographyError), open(
                 unencrypted_model, "rb"
             ) as in_file, TensorDeserializer(
@@ -447,23 +443,19 @@ class TestEncryption(unittest.TestCase):
 
     def test_from_string(self):
         fixed_salt = bytes(16)
-        encryption = serialization.EncryptionParams.from_string(
-            passphrase="test", salt=fixed_salt
+        encryption = EncryptionParams.from_string(
+            source="test", salt=fixed_salt
         )
-        decryption = serialization.DecryptionParams.from_passphrase(
-            passphrase="test"
-        )
-        incorrect_decryption = serialization.DecryptionParams.from_passphrase(
-            passphrase="tset"
-        )
+        decryption = DecryptionParams.from_string(source="test")
+        incorrect_decryption = DecryptionParams.from_string(source="tset")
         self._test_encryption_params(
             encryption, decryption, incorrect_decryption
         )
 
     def test_random_encryption_params(self):
-        encryption = serialization.EncryptionParams.random()
-        decryption = serialization.DecryptionParams.from_key(encryption.key)
-        incorrect_decryption = serialization.DecryptionParams.from_key(
+        encryption = EncryptionParams.random()
+        decryption = DecryptionParams.from_key(encryption.key)
+        incorrect_decryption = DecryptionParams.from_key(
             bytes(len(encryption.key))
         )
         self._test_encryption_params(
@@ -472,16 +464,16 @@ class TestEncryption(unittest.TestCase):
 
     def _test_encryption_params(
         self,
-        encryption: serialization.EncryptionParams,
-        decryption: serialization.DecryptionParams,
-        incorrect_decryption: serialization.DecryptionParams,
+        encryption: EncryptionParams,
+        decryption: DecryptionParams,
+        incorrect_decryption: DecryptionParams,
     ):
         device = default_device
 
         with self._serialize(encryption, device) as encrypted_model:
-            # Ensure that it works when given a passphrase
+            # Ensure that it works when given a key
             with self.subTest(
-                msg="Deserializing with a correct passphrase",
+                msg="Deserializing with a correct key",
                 device=device,
                 lazy_load=False,
                 plaid_mode=True,
@@ -501,9 +493,9 @@ class TestEncryption(unittest.TestCase):
                 del deserialized
             gc.collect()
 
-            # Ensure that it fails to load when not given a passphrase
+            # Ensure that it fails to load when not given a key
             with self.subTest(
-                msg="Deserializing with a missing passphrase"
+                msg="Deserializing with a missing key"
             ), self.assertRaises(serialization.CryptographyError), open(
                 encrypted_model, "rb"
             ) as in_file, TensorDeserializer(
@@ -516,9 +508,9 @@ class TestEncryption(unittest.TestCase):
                 del deserialized
             gc.collect()
 
-            # Ensure that it fails to load when given the wrong passphrase
+            # Ensure that it fails to load when given the wrong key
             with self.subTest(
-                msg="Deserializing with an incorrect passphrase"
+                msg="Deserializing with an incorrect key"
             ), self.assertRaises(serialization.CryptographyError), open(
                 encrypted_model, "rb"
             ) as in_file, TensorDeserializer(
