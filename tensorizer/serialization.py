@@ -990,8 +990,8 @@ class EncryptionParams:
         Raises:
             ValueError: If no salt is being used for key derivation.
         """
-        if hasattr(self._algorithm, "salt"):
-            return bytes(self._algorithm.salt)
+        if isinstance(self._algorithm, self._FromStringPWHashAlgorithm):
+            return bytes(self._algorithm.pwhash_params.salt)
         elif self._algorithm is None:
             raise ValueError(
                 "An exact binary key is being used."
