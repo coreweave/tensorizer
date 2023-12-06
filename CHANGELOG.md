@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.7.0] - 2023-12-06
 
 ### Added
 
@@ -26,8 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Example usage: see [examples/encryption.py](examples/encryption.py)
   - Example CLI tool to add or remove encryption from pre-serialized models:
     [examples/encrypt_existing.py](examples/encrypt_existing.py)
+
+### Changed
+
+- Added more error checking against deserializing corrupted files
+- Added stricter error checking for file writes during serialization
+
+### Fixed
+
 - Fix cases where the `pynvml` library was available on a node with no NVML
-  devices. This allows CPU-only deployments to work with `pynvml` in the image.
+  devices
+  - This allows CPU-only deployments to work with `pynvml` in the image
+- Fix serialization for tensors with discontiguous memory
+- Fixed a bug where the `module_idx` on bulk serialized tensors was misaligned
+  - During bulk writes (`write_module()`, `write_state_dict()`),
+    each tensor was receiving the preceding one's `module_idx`
+    instead of its own
 
 ## [2.6.0] - 2023-10-30
 
@@ -244,7 +258,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
-[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.6.0...HEAD
+[2.7.0]: https://github.com/coreweave/tensorizer/compare/v2.6.0...v2.7.0
 [2.6.0]: https://github.com/coreweave/tensorizer/compare/v2.5.1...v2.6.0
 [2.5.1]: https://github.com/coreweave/tensorizer/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/coreweave/tensorizer/compare/v2.4.0...v2.5.0
