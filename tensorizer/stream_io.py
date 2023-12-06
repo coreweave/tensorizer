@@ -472,7 +472,16 @@ class CURLStreamFile(io.RawIOBase):
         return self._read_until(goal_position)
 
     def writable(self) -> bool:
+        super().writable()  # Raise an error if closed
         return False
+
+    def readable(self) -> bool:
+        super().readable()  # Raise an error if closed
+        return True
+
+    def seekable(self) -> bool:
+        super().seekable()  # Raise an error if closed
+        return True
 
     def fileno(self) -> int:
         return -1
@@ -495,7 +504,7 @@ class CURLStreamFile(io.RawIOBase):
         return self._closed
 
     def readline(self, size=-1) -> bytes:
-        raise NotImplementedError("Unimplemented")
+        raise io.UnsupportedOperation("readline")
 
     """
     This seek() implementation should be avoided if you're seeking backwards,
@@ -802,7 +811,7 @@ class RedisStreamFile:
             self._redis_tcp = None
 
     def readline(self):
-        raise NotImplementedError("Unimplemented")
+        raise io.UnsupportedOperation("readline")
 
 
 def _ensure_https_endpoint(endpoint: str):

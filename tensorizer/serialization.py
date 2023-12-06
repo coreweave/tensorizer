@@ -1721,7 +1721,7 @@ class TensorDeserializer(
         if isinstance(file_obj, io.TextIOBase) or not readable:
             mode = getattr(file_obj, "mode", "")
             raise ValueError(
-                "TensorSerializer's file_obj must be readable "
+                "TensorDeserializer's file_obj must be readable "
                 'and in binary mode (mode="rb"{})'.format(
                     mode and f', current mode="{mode}"'
                 )
