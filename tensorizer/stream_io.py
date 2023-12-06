@@ -186,7 +186,7 @@ class CAInfo:
         return hash(self._curl_flags)
 
 
-class CURLStreamFile:
+class CURLStreamFile(io.RawIOBase):
     """
     CURLStreamFile implements a file-like object around an HTTP download, the
     intention being to not buffer more than we have to. It is intended for
@@ -307,7 +307,7 @@ class CURLStreamFile:
 
         self._curr = 0 if begin is None else begin
         self._end = end
-        self.closed = False
+        self._closed = False
 
     def _init_vars(self):
         self.popen_latencies: List[float] = getattr(self, "popen_latencies", [])
@@ -444,7 +444,7 @@ class CURLStreamFile:
                     ret_buff = ba
             self.bytes_read += ret_buff_sz
             if ret_buff_sz != rq_sz:
-                self.closed = True
+                self._closed = True
                 self._curl.terminate()
                 raise IOError(f"Requested {rq_sz} != {ret_buff_sz}")
             self._curr += ret_buff_sz
@@ -464,23 +464,21 @@ class CURLStreamFile:
         return self._read_until(goal_position, ba)
 
     def read(self, size=None) -> bytes:
-        if self.closed:
+        if self._closed:
             raise IOError("CURLStreamFile closed.")
         if size is None:
             return self._curl.stdout.read()
         goal_position = self._curr + size
         return self._read_until(goal_position)
 
-    @staticmethod
-    def writable() -> bool:
+    def writable(self) -> bool:
         return False
 
-    @staticmethod
-    def fileno() -> int:
+    def fileno(self) -> int:
         return -1
 
     def close(self):
-        self.closed = True
+        self._closed = True
         if self._curl is not None:
             if self._curl.poll() is None:
                 self._curl.stdout.close()
@@ -492,7 +490,11 @@ class CURLStreamFile:
                 self._curl.stdout.close()
             self._curl = None
 
-    def readline(self):
+    @property
+    def closed(self):
+        return self._closed
+
+    def readline(self, size=-1) -> bytes:
         raise NotImplementedError("Unimplemented")
 
     """

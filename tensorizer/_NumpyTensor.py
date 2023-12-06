@@ -13,39 +13,74 @@ _INTERMEDIATE_MAPPING = {
     8: torch.int64,
 }
 
+# Listing of types from a static copy of:
+# tuple(
+#     dict.fromkeys(
+#         str(t)
+#         for t in vars(torch).values()
+#         if isinstance(t, torch.dtype)
+#     )
+# )
+_ALL_TYPES = {
+    f"torch.{t}": v
+    for t in (
+        "uint8",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "float16",
+        "float32",
+        "float64",
+        "complex32",
+        "complex64",
+        "complex128",
+        "bool",
+        "qint8",
+        "quint8",
+        "qint32",
+        "bfloat16",
+        "quint4x2",
+        "quint2x4",
+    )
+    if isinstance(v := getattr(torch, t, None), torch.dtype)
+}
+
 # torch types with no numpy equivalents
 # i.e. the only ones that need to be opaque
 # Uses a comprehension to filter out any dtypes
 # that don't exist in older torch versions
 _ASYMMETRIC_TYPES = {
-    getattr(torch, t)
-    for t in (
-        "bfloat16",
-        "quint8",
-        "qint8",
-        "qint32",
-        "quint4x2",
-        "quint2x4",
-        "complex32",
-    )
-    if hasattr(torch, t)
+    _ALL_TYPES[t]
+    for t in {
+        "torch.bfloat16",
+        "torch.quint8",
+        "torch.qint8",
+        "torch.qint32",
+        "torch.quint4x2",
+        "torch.quint2x4",
+        "torch.complex32",
+    }
+    & _ALL_TYPES.keys()
 }
 
 # These types aren't supported yet because they require supplemental
 # quantization parameters to deserialize correctly
 _UNSUPPORTED_TYPES = {
-    getattr(torch, t)
-    for t in (
-        "quint8",
-        "qint8",
-        "qint32",
-        "quint4x2",
-        "quint2x4",
-    )
-    if hasattr(torch, t)
+    _ALL_TYPES[t]
+    for t in {
+        "torch.quint8",
+        "torch.qint8",
+        "torch.qint32",
+        "torch.quint4x2",
+        "torch.quint2x4",
+    }
+    & _ALL_TYPES.keys()
 }
 
-_DECODE_MAPPING = {str(t): t for t in _ASYMMETRIC_TYPES}
+_DECODE_MAPPING = {
+    k: v for k, v in _ALL_TYPES.items() if v not in _UNSUPPORTED_TYPES
+}
 
 
 class _NumpyTensor(NamedTuple):
@@ -85,14 +120,12 @@ class _NumpyTensor(NamedTuple):
             buffer=buffer,
             offset=offset,
         )
-        return cls(data=data,
-                   numpy_dtype=numpy_dtype,
-                   torch_dtype=torch_dtype)
+        return cls(data=data, numpy_dtype=numpy_dtype, torch_dtype=torch_dtype)
 
     @classmethod
-    def from_tensor(cls,
-                    tensor: Union[torch.Tensor,
-                                  torch.nn.Module]) -> "_NumpyTensor":
+    def from_tensor(
+        cls, tensor: Union[torch.Tensor, torch.nn.Module]
+    ) -> "_NumpyTensor":
         """
         Converts a torch tensor into a `_NumpyTensor`.
         May use an opaque dtype for the numpy array stored in

@@ -1,0 +1,2 @@
+class CryptographyError(Exception):
+    pass
