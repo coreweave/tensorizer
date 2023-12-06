@@ -1,3 +1,4 @@
 graft tensors
 graft proto
 include CMakeLists.txt
+exclude tensorizer/_crypt/__main__.py
