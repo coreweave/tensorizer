@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Example usage: see [examples/encryption.py](examples/encryption.py)
   - Example CLI tool to add or remove encryption from pre-serialized models:
     [examples/encrypt_existing.py](examples/encrypt_existing.py)
+- Fix cases where the `pynvml` library was available on a node with no NVML
+  devices. This allows CPU-only deployments to work with `pynvml` in the image.
 
 ## [2.6.0] - 2023-10-30
 
