@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Uses a parallelized version of XSalsa20-Poly1305 as its encryption algorithm
     - Splits each tensor's weights into &leq; 2 MiB chunks, encrypted separately
   - Example usage: see [examples/encryption.py](examples/encryption.py)
+  - Example CLI tool to add or remove encryption from pre-serialized models:
+    [examples/encrypt_existing.py](examples/encrypt_existing.py)
 
 ## [2.6.0] - 2023-10-30
 

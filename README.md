@@ -273,6 +273,10 @@ A complete example is also available as
 The `EncryptionParams` and `DecryptionParams` class docstrings additionally
 contain some usage information for quick reference from an IDE.
 
+An example command line tool to add or remove encryption from existing
+serialized models is also available as
+[examples/encryption.py](examples/encrypt_existing.py).
+
 ## Benchmarks
 
 You can run your own benchmarks on CoreWeave or your own Kubernetes cluster

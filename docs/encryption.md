@@ -61,6 +61,46 @@ The class docstrings of `EncryptionParams` and `DecryptionParams` include
 usage outlines like below as well as additional usage information.
 Most IDEs support automatically displaying this information while coding.
 
+### Encrypting and Decrypting Existing Models with a CLI Tool
+
+Existing models that have already been serialized by tensorizer can have
+encryption added to them or removed from them using the example
+[`examples/encrypt_existing.py`](/examples/encrypt_existing.py)
+command line utility. Download the script, then run
+`python encrypt_existing.py -h` to see usage.
+
+The source code in [`examples/encrypt_existing.py`](/examples/encrypt_existing.py)
+also serves as usage examples for the various encryption methods.
+
+Examples:
+
+```bash
+# Global help and subcommand help
+python encrypt_existing.py --help
+python encrypt_existing.py add pwhash --help
+
+# Encrypt using a random binary key (outputs generated key to --keyfile)
+python encrypt_existing.py add random --keyfile encrypted.tensors.key \
+  --infile original.tensors --outfile encrypted.tensors
+
+# Encrypt using a pre-existing binary key (reads key from --keyfile)
+python encrypt_existing.py add exact --keyfile encrypted.tensors.key \
+  --infile original.tensors --outfile encrypted.tensors
+
+# Encrypt using Argon2id key derivation (reads string to turn into a key from --keyfile)
+python encrypt_existing.py add pwhash --keyfile encrypted.tensors.key \
+  --opslimit MODERATE --memlimit MODERATE \
+  --infile original.tensors --outfile encrypted.tensors
+
+# Decrypt using a binary key (reads key from --keyfile)
+python encrypt_existing.py remove exact --keyfile encrypted.tensors.key \
+  --infile encrypted.tensors --outfile decrypted.tensors
+
+# Decrypt using Argon2id key derivation (reads string to turn into a key from --keyfile)
+python encrypt_existing.py remove pwhash --keyfile encrypted.tensors.key \
+  --infile encrypted.tensors --outfile decrypted.tensors
+```
+
 ### Using `EncryptionParams.random()`
 
 This is the preferred method of tensor encryption and decryption.
