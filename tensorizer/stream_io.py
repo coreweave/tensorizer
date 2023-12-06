@@ -472,15 +472,12 @@ class CURLStreamFile(io.RawIOBase):
         return self._read_until(goal_position)
 
     def writable(self) -> bool:
-        super().writable()  # Raise an error if closed
         return False
 
     def readable(self) -> bool:
-        super().readable()  # Raise an error if closed
         return True
 
     def seekable(self) -> bool:
-        super().seekable()  # Raise an error if closed
         return True
 
     def fileno(self) -> int:
