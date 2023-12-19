@@ -1,0 +1,109 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: shared-fs-benchmark
+spec:
+  completions: 40
+  parallelism: 40
+  template:
+    spec:
+      containers:
+        - name: main
+          image: "..."
+          command: [ "bash", "-c" ]
+          args:
+            - |
+              set -eo pipefail;
+              common_args=(
+                '--chunk-size=800MiB'
+                '--file=/mnt/shared/buffer.dat'
+                '--read-barrier=/mnt/resources/read-barrier.txt'
+                '--read-size=8MiB'
+                '--data-src=/mnt/resources/models/model.tensors'
+                '--report-timestamps'
+                '--repeats=1'
+                '--chunk=find:/mnt/resources/index.txt'
+                '--max-chunks=40'
+                '--barrier=/mnt/resources/barrier.txt'
+                '--finish-barrier=/mnt/resources/finish-barrier.txt'
+                '--barrier-poll-period=10'
+              );
+              CEPH_PATH='/mnt/shared';
+              VAST_PATH='/mnt/shared-alt';
+              CLEAN_BUFFERS() {
+                rm "$CEPH_PATH/${1}*.dat" 2>/dev/null || :;
+                rm "$VAST_PATH/${1}*.dat" 2>/dev/null || :;
+              };
+              BENCHMARK() {
+                NAME="$1" && \
+                DIR="$2" && \
+                shift && \
+                shift && \
+                echo "*** $NAME" && \
+                python3 shared-fs-benchmark.py "--file=$DIR/$NAME.dat" "$@" && \
+                CLEAN_BUFFERS "$NAME";
+              };
+              export PYTHONUNBUFFERED=1;
+              for ROUND in 0 1; do {
+                BENCHMARK "T1-$ROUND" "$CEPH_PATH" '--read-split=1'               "${common_args[@]}";
+                BENCHMARK "T2-$ROUND" "$CEPH_PATH" '--read-split=10'              "${common_args[@]}";
+                BENCHMARK "T3-$ROUND" "$CEPH_PATH" '--read-split=1'  '--separate' "${common_args[@]}";
+                BENCHMARK "T4-$ROUND" "$CEPH_PATH" '--read-split=10' '--separate' "${common_args[@]}";
+                BENCHMARK "T5-$ROUND" "$VAST_PATH" '--read-split=1'               "${common_args[@]}";
+                BENCHMARK "T6-$ROUND" "$VAST_PATH" '--read-split=10'              "${common_args[@]}";
+                BENCHMARK "T7-$ROUND" "$VAST_PATH" '--read-split=1'  '--separate' "${common_args[@]}";
+                BENCHMARK "T8-$ROUND" "$VAST_PATH" '--read-split=10' '--separate' "${common_args[@]}";
+              }; done;
+          env:
+            - name: "SHARED_FS_BENCHMARK_NAME"
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: shared
+              mountPath: /mnt/shared
+            - name: shared-alt
+              mountPath: /mnt/shared-alt
+            - name: resources
+              mountPath: /mnt/resources
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: sfs-ceph-nvme
+        - name: shared-alt
+          persistentVolumeClaim:
+            claimName: sfs-vast
+        - name: resources
+          persistentVolumeClaim:
+            claimName: sfs-resources
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values:
+                      - LAS1
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: job-name
+                      operator: In
+                      values:
+                        - shared-fs-benchmark
+                topologyKey: "kubernetes.io/hostname"
+              weight: 1
+
+      restartPolicy: Never
+  backoffLimit: 1
