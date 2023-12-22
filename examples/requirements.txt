@@ -1,4 +1,4 @@
-transformers~=4.27.1
+transformers~=4.36.0
 diffusers==0.14.0
 scipy~=1.10.0
 accelerate==0.17.1
