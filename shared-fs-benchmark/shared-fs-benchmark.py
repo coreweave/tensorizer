@@ -27,19 +27,19 @@ def non_negative_int(i: str) -> int:
 
 
 def byte_size(size: str) -> int:
-    match = re.match(r"(\d+)(?:\s*([KMGT])(?:i?B)?)?$", size, re.IGNORECASE)
+    match = re.match(r"(\d+)\s*(?:([KMGTPEZY])i?)?B?$", size, re.IGNORECASE)
     if not match:
         raise ValueError("not a valid size")
     val = positive_int(match.group(1))
-    multipliers = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
     multiplier = match.group(2)
     if multiplier:
-        val *= multipliers[multiplier.upper()]
+        multipliers = dict(zip("KMGTPEZY", range(10, 81, 10)))
+        val *= 1 << multipliers[multiplier.upper()]
     return val
 
 
 def atomic_increment(file) -> int:
-    with lock(file.fileno(), 0, 0):
+    with lock((fd := file.fileno()), 0, 0):
         file.seek(0)
         val = file.read()
         if val:
@@ -50,7 +50,7 @@ def atomic_increment(file) -> int:
         file.seek(0)
         file.write(str(val + 1))
         file.flush()
-        os.fdatasync(file.fileno())
+        os.fdatasync(fd)
     return val
 
 
@@ -139,6 +139,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--write-size", type=byte_size, default=2 << 20)
     parser.add_argument("--read-size", type=byte_size, default=2 << 40)
     parser.add_argument("--read-split", type=positive_int, default=1)
+    parser.add_argument("--max-chunks", type=positive_int)
     parser.add_argument("--separate", action="store_true")
     parser.add_argument("--super-separate", action="store_true")
     parser.add_argument("--fallocate", action="store_true")
@@ -146,7 +147,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--read-barrier", type=str)
     parser.add_argument("--finish-barrier", type=str)
     parser.add_argument("--barrier-poll-period", type=float, default=4)
-    parser.add_argument("--max-chunks", type=positive_int)
+    parser.add_argument("--pre-read-delay", type=float, default=0)
     parser.add_argument("--file", type=str, required=True)
     parser.add_argument("--repeats", type=positive_int, default=2)
     parser.add_argument("--no-lock", dest="lock", action="store_false")
@@ -246,6 +247,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     if args.barrier_poll_period < 0.1 or args.barrier_poll_period > 3600:
         parser.error("--barrier-poll-period must be between [0.1, 3600]")
+    if args.pre_read_delay < 0:
+        parser.error("--pre-read-delay must be non-negative")
     return args
 
 
@@ -340,6 +343,7 @@ def main(argv=None) -> None:
     file_paths: Sequence[str] = args.files
     read_specs: Sequence[SubChunkSpec] = args.read_specs
     read_size: int = args.read_size
+    pre_read_delay: float = args.pre_read_delay
     finish_barrier_path: Optional[str] = args.finish_barrier
 
     start_offset: int = chunk * chunk_size
@@ -415,6 +419,8 @@ def main(argv=None) -> None:
     empty = {}
     if read_barrier_path:
         assert read_specs
+        if pre_read_delay > 0:
+            time.sleep(pre_read_delay)
         barrier(read_barrier_path, max_chunks, barrier_poll_period)
         read_start_timestamp: float = time.time()
         read_start_time: int = time.monotonic_ns()
