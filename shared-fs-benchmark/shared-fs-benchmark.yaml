@@ -27,6 +27,7 @@ spec:
                 '--barrier=/mnt/resources/barrier.txt'
                 '--finish-barrier=/mnt/resources/finish-barrier.txt'
                 '--barrier-poll-period=10'
+                '--pre-read-delay=20'
               );
               CEPH_PATH='/mnt/shared';
               VAST_PATH='/mnt/shared-alt';
@@ -44,7 +45,7 @@ spec:
                 CLEAN_BUFFERS "$NAME";
               };
               export PYTHONUNBUFFERED=1;
-              for ROUND in 0 1; do {
+              for ROUND in {0..29}; do {
                 BENCHMARK "T1-$ROUND" "$CEPH_PATH" '--read-split=1'               "${common_args[@]}";
                 BENCHMARK "T2-$ROUND" "$CEPH_PATH" '--read-split=10'              "${common_args[@]}";
                 BENCHMARK "T3-$ROUND" "$CEPH_PATH" '--read-split=1'  '--separate' "${common_args[@]}";
