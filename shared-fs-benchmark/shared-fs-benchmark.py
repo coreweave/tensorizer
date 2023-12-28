@@ -401,8 +401,8 @@ def main(argv=None) -> None:
                     barrier_final_delay,
                 )
 
-            start_timestamp: float = time.time()
-            start_time: int = time.monotonic_ns()
+            write_start_timestamp: float = time.time()
+            write_start_time: int = time.monotonic_ns()
             if not super_separate or len(file_paths) == 1:
                 with open(file_path, "rb+") as file, lock(
                     (fd := file.fileno()),
@@ -410,32 +410,30 @@ def main(argv=None) -> None:
                     chunk_size,
                     enable=do_lock,
                 ):
-                    opened_time: int = time.monotonic_ns()
+                    write_opened_time: int = time.monotonic_ns()
                     for offset, block in zip(
                         range(start_offset, end_offset, data_chunk_size), blocks
                     ):
                         bytes_written += os.pwrite(fd, block, offset)
-                end_time: int = time.monotonic_ns()
-                end_timestamp: float = time.time()
-                open_duration: int = opened_time - start_time
-                write_duration: int = end_time - opened_time
+                write_end_time: int = time.monotonic_ns()
+                write_end_timestamp: float = time.time()
+                write_open_duration: int = write_opened_time - write_start_time
+                write_io_duration: int = write_end_time - write_opened_time
             else:
                 assert super_separate
-                open_durations = []
-                write_durations = []
+                write_open_duration: int = 0
+                write_io_duration: int = 0
                 for path, block in zip(file_paths, blocks):
                     open_start_time = time.monotonic_ns()
                     with open(path, "rb+") as file:
                         open_end_time: int = time.monotonic_ns()
-                        open_durations.append(open_end_time - open_start_time)
+                        write_open_duration += open_end_time - open_start_time
                         bytes_written += os.pwrite(file.fileno(), block, 0)
                         write_end_time: int = time.monotonic_ns()
-                        write_durations.append(write_end_time - open_end_time)
-                end_time: int = time.monotonic_ns()
-                end_timestamp: float = time.time()
-                open_duration: int = sum(open_durations)
-                write_duration: int = sum(write_durations)
-            total_duration: int = end_time - start_time
+                        write_io_duration += write_end_time - open_end_time
+                write_end_time: int = time.monotonic_ns()
+                write_end_timestamp: float = time.time()
+            write_total_duration: int = write_end_time - write_start_time
             assert (
                 bytes_written == chunk_size
             ), f"{bytes_written} != {chunk_size}"
@@ -443,6 +441,21 @@ def main(argv=None) -> None:
         del blocks, block
 
     empty = {}
+    write_timestamps = (
+        {
+            "write_start_timestamp": write_start_timestamp,
+            "write_end_timestamp": write_end_timestamp,
+        }
+        if report_timestamps
+        else empty
+    )
+    write_times = {
+        **write_timestamps,
+        "write_open_duration_ms": write_open_duration / 1e6,
+        "write_io_duration_ms": write_io_duration / 1e6,
+        "write_total_duration_ms": write_total_duration / 1e6,
+    }
+
     if read_barrier_path:
         assert read_specs
         if pre_read_delay > 0:
@@ -506,21 +519,10 @@ def main(argv=None) -> None:
         read_times = empty
     node_name = os.getenv("SHARED_FS_BENCHMARK_NAME", "")
     node = {"node": node_name} if node_name else empty
-    timestamps = (
-        {
-            "start_timestamp": start_timestamp,
-            "end_timestamp": end_timestamp,
-        }
-        if report_timestamps
-        else empty
-    )
     log_entry = {
         "chunk": original_chunk,
         **node,
-        **timestamps,
-        "open_duration_ms": open_duration / 1e6,
-        "write_duration_ms": write_duration / 1e6,
-        "total_duration_ms": total_duration / 1e6,
+        **write_times,
         **read_times,
     }
     print(json.dumps(log_entry, indent=None), flush=True)

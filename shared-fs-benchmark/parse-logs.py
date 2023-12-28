@@ -1,8 +1,11 @@
 #!/bin/env python
 
 import argparse
+import bisect
+import dataclasses
 import json
 import statistics
+from typing import List, MutableMapping, Optional
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -18,12 +21,38 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+@dataclasses.dataclass
+class Times:
+    __slots__ = ("times", "durations")
+    times: List[float]
+    durations: MutableMapping[str, List[float]]
+
+    def __init__(self, duration_keys=("open", "io", "total")):
+        self.times = []
+        self.durations = {k: [] for k in duration_keys}
+
+    def log_time(self, t: float):
+        bisect.insort(self.times, t)
+
+    @property
+    def min_time(self) -> Optional[float]:
+        return self.times[0] if self.times else None
+
+    @property
+    def max_time(self) -> Optional[float]:
+        return self.times[-1] if self.times else None
+
+    @property
+    def range(self) -> Optional[float]:
+        return self.max_time - self.min_time if self.times else None
+
+    def __bool__(self) -> bool:
+        return bool(self.times or any(self.durations.values()))
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
-    times = []
-    read_times = []
-    durations = {"open": [], "write": [], "total": []}
-    read_durations = {"open": [], "io": [], "total": []}
+    timings = {"write": Times(), "read": Times()}
     objs = []
     for line in args.infile:
         line = line.strip()
@@ -35,45 +64,36 @@ def main(argv=None) -> None:
                 raise TypeError("Not an object")
         except (json.JSONDecodeError, TypeError) as e:
             raise ValueError("Invalid JSONL") from e
-        if "read_start_timestamp" in obj:
-            modes = (
-                ("", times, durations),
-                ("read_", read_times, read_durations),
-            )
-        else:
-            modes = (("", times, durations),)
-        for mode, time_log, duration_log in modes:
-            time_log.append(obj[f"{mode}start_timestamp"] * 1e3)
-            time_log.append(obj[f"{mode}end_timestamp"] * 1e3)
-            for key, l in duration_log.items():
-                l.append(obj[f"{mode}{key}_duration_ms"])
+        for mode, timing in timings.items():
+            try:
+                timing.log_time(obj[f"{mode}_start_timestamp"] * 1e3)
+                timing.log_time(obj[f"{mode}_end_timestamp"] * 1e3)
+                for key, l in timing.durations.items():
+                    l.append(obj[f"{mode}_{key}_duration_ms"])
+            except KeyError:
+                pass
         objs.append(obj)
+
     results = {}
-    for key, l in durations.items():
-        results[f"median_{key}_duration_ms"] = statistics.median(l)
-        results[f"stddev_{key}_duration_ms"] = statistics.stdev(l)
-    if read_times:
-        for key, l in read_durations.items():
-            results[f"median_read_{key}_duration_ms"] = statistics.median(l)
-            results[f"stddev_read_{key}_duration_ms"] = statistics.stdev(l)
-    global_start, global_end = min(times), max(times)
-    global_read_start, global_read_end = min(read_times), max(read_times)
-    results["combined_duration_ms"] = global_end - global_start
-    results["combined_read_duration_ms"] = global_read_end - global_read_start
+    if not timings["read"]:
+        del timings["read"]
+
+    for mode, timing in timings.items():
+        for key, l in timing.durations.items():
+            results[f"median_{mode}_{key}_duration_ms"] = statistics.median(l)
+            results[f"stddev_{mode}_{key}_duration_ms"] = statistics.stdev(l)
+    for mode, timing in timings.items():
+        results[f"combined_{mode}_duration_ms"] = timing.range
     objs.sort(key=lambda o: o["chunk"])
     for obj in objs:
-        for timestamp in "start_timestamp", "end_timestamp":
-            if args.keep_timestamps:
-                obj[timestamp] = obj[timestamp] * 1e3 - global_start
-            else:
-                del obj[timestamp]
-        for timestamp in "read_start_timestamp", "read_end_timestamp":
-            if timestamp not in obj:
-                continue
-            if args.keep_timestamps:
-                obj[timestamp] = obj[timestamp] * 1e3 - global_read_start
-            else:
-                del obj[timestamp]
+        for mode, timing in timings.items():
+            for timestamp in f"{mode}_start_timestamp", f"{mode}_end_timestamp":
+                if timestamp not in obj:
+                    continue
+                elif args.keep_timestamps:
+                    obj[timestamp] = obj[timestamp] * 1e3 - timing.min_time
+                else:
+                    del obj[timestamp]
     for obj in (*objs, results):
         if args.round:
             for k, v in obj.items():
