@@ -26,7 +26,8 @@ spec:
                 '--max-chunks=40'
                 '--barrier=/mnt/resources/barrier.txt'
                 '--finish-barrier=/mnt/resources/finish-barrier.txt'
-                '--barrier-poll-period=10'
+                '--barrier-poll-period=2'
+                '--barrier-final-delay=10'
                 '--pre-read-delay=20'
               );
               CEPH_PATH='/mnt/shared';

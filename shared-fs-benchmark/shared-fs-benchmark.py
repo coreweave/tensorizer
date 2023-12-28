@@ -6,10 +6,11 @@ import itertools
 import json
 import os
 import re
+import struct
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 
 def positive_int(i: str) -> int:
@@ -38,24 +39,29 @@ def byte_size(size: str) -> int:
     return val
 
 
-def atomic_increment(file) -> int:
+def atomic_increment(
+    file, metadata_func: Optional[Callable[..., bytes]] = None
+) -> int:
     with lock((fd := file.fileno()), 0, 0):
         file.seek(0)
-        val = file.read()
-        if val:
-            val = int(val)
+        val_bytes: bytes = file.read().split(b",", maxsplit=1)[0]
+        if val_bytes:
+            val = int(val_bytes)
         else:
             val = 0
         file.truncate(0)
         file.seek(0)
-        file.write(str(val + 1))
+        if metadata_func:
+            file.write(b"%d,%s" % (val + 1, metadata_func()))
+        else:
+            file.write(b"%d" % (val + 1))
         file.flush()
         os.fdatasync(fd)
     return val
 
 
 def find_index(path: str) -> int:
-    with open(path, "a+") as file:
+    with open(path, "ab+") as file:
         return atomic_increment(file)
 
 
@@ -65,21 +71,29 @@ def synchronized_sleep(max_delay: float) -> None:
     time.sleep(duration)
 
 
-def barrier(path: str, count: int, poll_period: float) -> None:
+def barrier(
+    path: str, count: int, poll_period: float, final_delay: float = 0
+) -> None:
+    def time_metadata() -> bytes:
+        return struct.pack("<d", time.time())
+
+    def parse_time(t: bytes) -> float:
+        return struct.unpack("<d", t)[0]
+
+    sleep_until = 0
     try:
-        with open(path, "a+") as file:
-            rank = atomic_increment(file)
+        with open(path, "ab+") as file:
+            rank = atomic_increment(file, time_metadata)
             assert rank <= count
             if rank == count - 1:
                 os.unlink(path)
-                synchronized_sleep(poll_period)
-                return
             fd = file.fileno()
             for sec in range(300):
                 with lock(fd, 0, 0, shared=True):
                     file.seek(0)
-                    current = int(file.read())
-                    if current == count:
+                    current, timestamp = file.read().split(b",", 1)
+                    if int(current) == count:
+                        sleep_until = parse_time(timestamp) + final_delay
                         break
                 synchronized_sleep(poll_period)
             else:
@@ -88,6 +102,9 @@ def barrier(path: str, count: int, poll_period: float) -> None:
         if os.path.exists(path):
             os.unlink(path)
         raise
+    now = time.time()
+    if sleep_until > now:
+        time.sleep(sleep_until - now)
 
 
 def index(arg: str) -> int:
@@ -147,6 +164,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--read-barrier", type=str)
     parser.add_argument("--finish-barrier", type=str)
     parser.add_argument("--barrier-poll-period", type=float, default=4)
+    parser.add_argument("--barrier-final-delay", type=float, default=4)
     parser.add_argument("--pre-read-delay", type=float, default=0)
     parser.add_argument("--file", type=str, required=True)
     parser.add_argument("--repeats", type=positive_int, default=2)
@@ -247,6 +265,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     if args.barrier_poll_period < 0.1 or args.barrier_poll_period > 3600:
         parser.error("--barrier-poll-period must be between [0.1, 3600]")
+    if args.barrier_final_delay < 0 or args.barrier_final_delay > 3600:
+        parser.error("--barrier-final-delay must be between [0, 3600]")
     if args.pre_read_delay < 0:
         parser.error("--pre-read-delay must be non-negative")
     return args
@@ -338,6 +358,7 @@ def main(argv=None) -> None:
     data_src: Optional[str] = args.data_src
     report_timestamps: bool = args.report_timestamps
     barrier_poll_period: float = args.barrier_poll_period
+    barrier_final_delay: float = args.barrier_final_delay
     write_size: Optional[int] = args.write_size
     super_separate: bool = args.super_separate
     file_paths: Sequence[str] = args.files
@@ -373,7 +394,12 @@ def main(argv=None) -> None:
             bytes_written: int = 0
 
             if barrier_path:
-                barrier(barrier_path, max_chunks, barrier_poll_period)
+                barrier(
+                    barrier_path,
+                    max_chunks,
+                    barrier_poll_period,
+                    barrier_final_delay,
+                )
 
             start_timestamp: float = time.time()
             start_time: int = time.monotonic_ns()
@@ -421,7 +447,12 @@ def main(argv=None) -> None:
         assert read_specs
         if pre_read_delay > 0:
             time.sleep(pre_read_delay)
-        barrier(read_barrier_path, max_chunks, barrier_poll_period)
+        barrier(
+            read_barrier_path,
+            max_chunks,
+            barrier_poll_period,
+            barrier_final_delay,
+        )
         read_start_timestamp: float = time.time()
         read_start_time: int = time.monotonic_ns()
         bytes_read: int = 0
