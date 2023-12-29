@@ -335,6 +335,36 @@ class TestSerialization(unittest.TestCase):
         finally:
             os.unlink(tensorized_file.name)
 
+    def test_meta_tensor_module(self):
+        meta_model = AutoModelForCausalLM.from_pretrained(model_name).to(
+            device="meta"
+        )
+        sd = meta_model.state_dict()
+        sd.update(meta_model.named_buffers())
+        self.assertDictEqual(
+            {name: t.device.type for name, t in sd.items()},
+            dict.fromkeys(sd, "meta"),
+        )
+        serialized_file = tempfile.NamedTemporaryFile("wb+", delete=False)
+        try:
+            serializer = TensorSerializer(serialized_file)
+            serializer.write_module(meta_model)
+            serializer.close()
+            with TensorDeserializer(
+                serialized_file.name, device="cpu"
+            ) as deserializer, torch.no_grad():
+                self.assertSetEqual(set(sd.keys()), set(deserializer.keys()))
+                for k in deserializer.keys():
+                    zero = torch.zeros_like(sd[k], device="cpu")
+                    if torch.any(zero):
+                        # Some torch bug causes zeros_like to yield nonzero
+                        # results sometimes (TM) when converting from
+                        # a meta tensor
+                        zero.zero_()
+                    self.assertTrue(torch.equal(zero, deserializer[k]))
+        finally:
+            os.unlink(serialized_file.name)
+
     def test_persistent_buffers(self):
         shape = (50, 50)
         persistent_buffer = torch.normal(0, 0.5, shape)
