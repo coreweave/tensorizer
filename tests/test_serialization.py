@@ -273,6 +273,50 @@ class TestSerialization(unittest.TestCase):
             os.unlink(tensorized_file.name)
 
         self.assertTrue(torch.equal(tensor, deserialized_tensor))
+    
+    def test_meta_tensors(self):
+        # this test is modeled after self.test_persistent_buffers
+        shape = (50,50)
+        materialized_tensor = torch.normal(0, 0.5, shape)
+        meta_tensor = torch.empty(shape, device='meta')
+        nested_module = torch.nn.Module()
+        nested_module.register_parameter('materialized_tensor', torch.nn.Parameter(materialized_tensor))
+        nested_module.register_parameter('meta_tensor', torch.nn.Parameter(meta_tensor))
+        module = torch.nn.Module()
+        module.register_module('nested', nested_module)
+        model = torch.nn.Module()
+        model.register_module('module', module)
+
+
+        tensorized_file = tempfile.NamedTemporaryFile(
+            "wb+", delete=False
+        )
+        try:
+            serializer = TensorSerializer(tensorized_file)
+            serializer.write_module(model)
+            serializer.close()
+
+            with open(tensorized_file.name, "rb") as in_file:
+                with TensorDeserializer(
+                    in_file, device="cpu", lazy_load=True
+                ) as deserializer:
+                    self.assertIn(
+                        "module.nested.meta_tensor",
+                        deserializer.keys(),
+                    )
+                    self.assertIn(
+                        "module.nested.materialized_tensor",
+                        deserializer.keys(),
+                    )
+                    self.assertEqual(
+                        deserializer["module.nested.meta_tensor"].shape, shape
+                    )
+                    self.assertEqual(
+                        deserializer["module.nested.meta_tensor"].sum(), 0
+                    )
+        finally:
+            os.unlink(tensorized_file.name)
+
 
     def test_persistent_buffers(self):
         shape = (50, 50)
