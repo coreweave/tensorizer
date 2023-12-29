@@ -308,6 +308,12 @@ class TestSerialization(unittest.TestCase):
                         "module.nested.materialized_tensor",
                         deserializer.keys(),
                     )
+                    self.assertEqual(
+                        deserializer["module.nested.meta_tensor"].shape, shape
+                    )
+                    self.assertEqual(
+                        deserializer["module.nested.meta_tensor"].sum(), 0
+                    )
         finally:
             os.unlink(tensorized_file.name)
 
