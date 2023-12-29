@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Tensors on the `meta` device may now be serialized
+  - These store no tensor data (only metadata) in the tensorized file
+  - These have no hashes for their tensor data, since there is nothing to hash
+  - These cannot have their data encrypted, since there is nothing to encrypt
+  - During deserialization, these are returned as zero-filled buffers on
+    the same device as other tensors
+    - Essentially equivalent to `torch.zeros_like(meta_tensor, device=...)`
+
 ## [2.7.1] - 2023-12-06
 
 ### Fixed
@@ -265,7 +277,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
-[2.7.0]: https://github.com/coreweave/tensorizer/compare/v2.7.0...v2.7.1
+[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.7.1...HEAD
+[2.7.1]: https://github.com/coreweave/tensorizer/compare/v2.7.0...v2.7.1
 [2.7.0]: https://github.com/coreweave/tensorizer/compare/v2.6.0...v2.7.0
 [2.6.0]: https://github.com/coreweave/tensorizer/compare/v2.5.1...v2.6.0
 [2.5.1]: https://github.com/coreweave/tensorizer/compare/v2.5.0...v2.5.1
