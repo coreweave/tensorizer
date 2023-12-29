@@ -3753,7 +3753,10 @@ class TensorSerializer:
         if fallocate and self._fd:
             size = sum(len(t.name) for t in tensors)
             size += sum(
-                t.tensor.element_size() * t.tensor.nelement() for t in tensors
+                t.tensor.element_size()
+                * t.tensor.nelement()
+                * (not t.tensor.is_meta)
+                for t in tensors
             )
             # Rough underestimate of header size
             header_min_size = 24
@@ -3779,7 +3782,7 @@ class TensorSerializer:
             shared = []
             seen_addresses = set()
             for t in reversed(tensors):
-                if t.tensor.device.type == "cuda":
+                if t.tensor.device.type in ("cuda", "meta"):
                     shared.append(False)
                 else:
                     address = t.tensor.data_ptr()
