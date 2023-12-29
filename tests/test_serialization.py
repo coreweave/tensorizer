@@ -278,7 +278,8 @@ class TestSerialization(unittest.TestCase):
         # This test is modeled after self.test_persistent_buffers
         shape = (50, 50)
         materialized_tensor = torch.normal(0, 0.5, shape)
-        meta_tensor = torch.empty(shape, device="meta")
+        meta_tensor = torch.empty_like(materialized_tensor, device="meta")
+        zero_tensor = torch.zeros_like(materialized_tensor)
         nested_module = torch.nn.Module()
         nested_module.register_parameter(
             "materialized_tensor", torch.nn.Parameter(materialized_tensor)
@@ -297,23 +298,39 @@ class TestSerialization(unittest.TestCase):
             serializer.write_module(model)
             serializer.close()
 
-            with open(tensorized_file.name, "rb") as in_file:
-                with TensorDeserializer(
-                    in_file, device="cpu", lazy_load=True
+            for device, lazy_load, plaid_mode in itertools.product(
+                ("cpu", "cuda"), (True, False), (True, False)
+            ):
+                if device == "cuda" and not is_cuda_available:
+                    continue
+                if device == "cpu" and plaid_mode:
+                    continue
+                with self.subTest(
+                    lazy_load=lazy_load,
+                    device=device,
+                    plaid_mode=plaid_mode,
+                ), open(
+                    tensorized_file.name, "rb"
+                ) as in_file, TensorDeserializer(
+                    in_file, device="cpu", lazy_load=lazy_load
                 ) as deserializer:
-                    self.assertIn(
-                        "module.nested.meta_tensor",
-                        deserializer.keys(),
-                    )
-                    self.assertIn(
+                    print(f"{lazy_load=}, {device=}, {plaid_mode=}")
+                    expected_keys = {
                         "module.nested.materialized_tensor",
-                        deserializer.keys(),
+                        "module.nested.meta_tensor",
+                    }
+                    self.assertSetEqual(set(deserializer.keys()), expected_keys)
+                    self.assertTrue(
+                        torch.equal(
+                            deserializer["module.nested.materialized_tensor"],
+                            materialized_tensor,
+                        )
                     )
-                    self.assertEqual(
-                        deserializer["module.nested.meta_tensor"].shape, shape
-                    )
-                    self.assertEqual(
-                        deserializer["module.nested.meta_tensor"].sum(), 0
+                    self.assertTrue(
+                        torch.equal(
+                            deserializer["module.nested.meta_tensor"],
+                            zero_tensor,
+                        )
                     )
         finally:
             os.unlink(tensorized_file.name)
