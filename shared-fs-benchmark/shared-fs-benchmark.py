@@ -401,7 +401,7 @@ def main(argv=None) -> None:
                     barrier_final_delay,
                 )
 
-            write_start_timestamp: float = time.time()
+            write_start_timestamp: int = time.time_ns()
             write_start_time: int = time.monotonic_ns()
             if not super_separate or len(file_paths) == 1:
                 with open(file_path, "rb+") as file, lock(
@@ -416,7 +416,7 @@ def main(argv=None) -> None:
                     ):
                         bytes_written += os.pwrite(fd, block, offset)
                 write_end_time: int = time.monotonic_ns()
-                write_end_timestamp: float = time.time()
+                write_end_timestamp: int = time.time_ns()
                 write_open_duration: int = write_opened_time - write_start_time
                 write_io_duration: int = write_end_time - write_opened_time
             else:
@@ -432,7 +432,7 @@ def main(argv=None) -> None:
                         write_end_time: int = time.monotonic_ns()
                         write_io_duration += write_end_time - open_end_time
                 write_end_time: int = time.monotonic_ns()
-                write_end_timestamp: float = time.time()
+                write_end_timestamp: int = time.time_ns()
             write_total_duration: int = write_end_time - write_start_time
             assert (
                 bytes_written == chunk_size
@@ -466,11 +466,11 @@ def main(argv=None) -> None:
             barrier_poll_period,
             barrier_final_delay,
         )
-        read_start_timestamp: float = time.time()
+        read_start_timestamp: int = time.time_ns()
         read_start_time: int = time.monotonic_ns()
         bytes_read: int = 0
-        read_open_durations = []
-        read_io_durations = []
+        read_open_duration: int = 0
+        read_io_duration: int = 0
         for spec in read_specs:
             read_offset: int = spec.sub_chunk_file_offset
             read_chunk_size: int = spec.sub_chunk_size
@@ -484,9 +484,7 @@ def main(argv=None) -> None:
                 enable=do_lock,
             ):
                 read_open_end_time: int = time.monotonic_ns()
-                read_open_durations.append(
-                    read_open_end_time - read_open_start_time
-                )
+                read_open_duration += read_open_end_time - read_open_start_time
                 for read_block_offset in range(
                     read_offset, read_offset + read_chunk_size, read_size
                 ):
@@ -494,11 +492,9 @@ def main(argv=None) -> None:
                         os.pread(fd, read_size, read_block_offset)
                     )
             read_io_end_time: int = time.monotonic_ns()
-            read_io_durations.append(read_io_end_time - read_open_end_time)
+            read_io_duration += read_io_end_time - read_open_end_time
         read_end_time: int = time.monotonic_ns()
-        read_end_timestamp: float = time.time()
-        read_open_duration = sum(read_open_durations)
-        read_io_duration = sum(read_io_durations)
+        read_end_timestamp: int = time.time_ns()
         read_total_duration = read_end_time - read_start_time
         assert bytes_read == chunk_size, f"{bytes_read} != {chunk_size}"
         read_timestamps = (

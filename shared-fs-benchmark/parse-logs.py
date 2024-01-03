@@ -5,6 +5,8 @@ import bisect
 import dataclasses
 import json
 import statistics
+import typing
+from decimal import Decimal
 from typing import List, MutableMapping, Optional
 
 
@@ -24,34 +26,46 @@ def parse_args(argv=None) -> argparse.Namespace:
 @dataclasses.dataclass
 class Times:
     __slots__ = ("times", "durations")
-    times: List[float]
-    durations: MutableMapping[str, List[float]]
+    times: List[Decimal]
+    durations: MutableMapping[str, List[Decimal]]
 
     def __init__(self, duration_keys=("open", "io", "total")):
         self.times = []
         self.durations = {k: [] for k in duration_keys}
 
-    def log_time(self, t: float):
+    def log_time(self, t: Decimal):
         bisect.insort(self.times, t)
 
     @property
-    def min_time(self) -> Optional[float]:
+    def min_time(self) -> Optional[Decimal]:
         return self.times[0] if self.times else None
 
     @property
-    def max_time(self) -> Optional[float]:
+    def max_time(self) -> Optional[Decimal]:
         return self.times[-1] if self.times else None
 
     @property
-    def range(self) -> Optional[float]:
+    def range(self) -> Optional[Decimal]:
         return self.max_time - self.min_time if self.times else None
 
     def __bool__(self) -> bool:
         return bool(self.times or any(self.durations.values()))
 
 
+class DecimalSerializer(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, Decimal):
+            return float(o)
+        return super().default(o)
+
+
+def round_d(d: Decimal, precision: int) -> Decimal:
+    return typing.cast(Decimal, round(d, precision))
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
+    timestamp_to_ms = Decimal("1e-6")
     timings = {"write": Times(), "read": Times()}
     objs = []
     for line in args.infile:
@@ -59,17 +73,17 @@ def main(argv=None) -> None:
         if not line:
             continue
         try:
-            obj = json.loads(line)
+            obj = json.loads(line, parse_float=Decimal)
             if not isinstance(obj, dict):
                 raise TypeError("Not an object")
         except (json.JSONDecodeError, TypeError) as e:
             raise ValueError("Invalid JSONL") from e
         for mode, timing in timings.items():
             try:
-                timing.log_time(obj[f"{mode}_start_timestamp"] * 1e3)
-                timing.log_time(obj[f"{mode}_end_timestamp"] * 1e3)
+                timing.log_time(obj[f"{mode}_start_timestamp"])
+                timing.log_time(obj[f"{mode}_end_timestamp"])
                 for key, l in timing.durations.items():
-                    l.append(obj[f"{mode}_{key}_duration_ms"])
+                    l.append(round_d(obj[f"{mode}_{key}_duration_ms"], 6))
             except KeyError:
                 pass
         objs.append(obj)
@@ -83,7 +97,7 @@ def main(argv=None) -> None:
             results[f"median_{mode}_{key}_duration_ms"] = statistics.median(l)
             results[f"stddev_{mode}_{key}_duration_ms"] = statistics.stdev(l)
     for mode, timing in timings.items():
-        results[f"combined_{mode}_duration_ms"] = timing.range
+        results[f"combined_{mode}_duration_ms"] = timing.range * timestamp_to_ms
     objs.sort(key=lambda o: o["chunk"])
     for obj in objs:
         for mode, timing in timings.items():
@@ -91,15 +105,16 @@ def main(argv=None) -> None:
                 if timestamp not in obj:
                     continue
                 elif args.keep_timestamps:
-                    obj[timestamp] = obj[timestamp] * 1e3 - timing.min_time
+                    obj[timestamp] -= timing.min_time
+                    obj[timestamp] *= timestamp_to_ms
                 else:
                     del obj[timestamp]
     for obj in (*objs, results):
         if args.round:
             for k, v in obj.items():
-                if isinstance(v, float):
-                    obj[k] = round(v, 3)
-        json.dump(obj, args.outfile, indent=None)
+                if isinstance(v, Decimal):
+                    obj[k] = round_d(v, 3)
+        json.dump(obj, args.outfile, indent=None, cls=DecimalSerializer)
         args.outfile.write("\n")
 
 
