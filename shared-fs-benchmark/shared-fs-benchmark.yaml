@@ -96,16 +96,14 @@ spec:
                     values:
                       - LAS1
         podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - podAffinityTerm:
-                labelSelector:
-                  matchExpressions:
-                    - key: job-name
-                      operator: In
-                      values:
-                        - shared-fs-benchmark
-                topologyKey: "kubernetes.io/hostname"
-              weight: 1
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: job-name
+                    operator: In
+                    values:
+                      - shared-fs-benchmark
+              topologyKey: "kubernetes.io/hostname"
 
       restartPolicy: Never
   backoffLimit: 1
