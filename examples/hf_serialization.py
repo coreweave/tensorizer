@@ -47,7 +47,7 @@ def serialize_model(
 ):
     """
     Remove the tensors from a PyTorch model, convert them to NumPy
-    arrays and serialize them to GooseTensor format. The stripped
+    arrays and serialize them to Tensorizer format. The stripped
     model is also serialized to pytorch format.
 
     Args:
@@ -243,9 +243,6 @@ def hf_main(args):
     logger.info("PYTHON USED RAM: " + utils.get_mem_usage())
 
     serialize_model(model, model_config, output_prefix)
-
-    tokenizer = AutoTokenizer.from_pretrained(args.input_directory)
-    tokenizer.save_pretrained(output_prefix)
 
     if args.validate:
         del model, model_config
