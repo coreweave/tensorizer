@@ -40,10 +40,10 @@ logger.addHandler(fh)
 
 
 def serialize_model(
-    model: torch.nn.Module,
-    config: Optional[Union[ConfigMixin, AutoConfig, dict]],
-    model_directory: str,
-    model_prefix: str = "model",
+        model: torch.nn.Module,
+        config: Optional[Union[ConfigMixin, AutoConfig, dict]],
+        model_directory: str,
+        model_prefix: str = "model",
 ):
     """
     Remove the tensors from a PyTorch model, convert them to NumPy
@@ -68,11 +68,14 @@ def serialize_model(
     if config is None:
         config = model
     if config is not None:
-        if hasattr(config, "to_json_file"):
-            config.to_json_file(f"{dir_prefix}-config.json")
-        if isinstance(config, dict):
-            with open(f"{dir_prefix}-config.json", "w") as config_file:
-                config_file.write(json.dumps(config, indent=2))
+        config_path = f"{dir_prefix}-config.json"
+        logger.info(f"Writing config to {config_path}")
+        with stream_io.open_stream(config_path, "wb") as f:
+            if hasattr(config, "to_dict"):
+                f.write(bytes(json.dumps(config.to_dict()), "utf-8"))
+            elif isinstance(config, dict):
+                f.write(bytes(json.dumps(config), "utf-8"))
+            f.close() ## This shouldn't be necessary, but doesn't save for me without it
 
     ts = TensorSerializer(f"{dir_prefix}.tensors")
     ts.write_module(model)
@@ -80,16 +83,16 @@ def serialize_model(
 
 
 def load_model(
-    path_uri: str,
-    model_class: Union[
-        Type[PreTrainedModel], Type[ModelMixin], Type[ConfigMixin]
-    ],
-    config_class: Optional[
-        Union[Type[PretrainedConfig], Type[ConfigMixin], Type[AutoConfig]]
-    ] = None,
-    model_prefix: Optional[str] = "model",
-    device: torch.device = utils.get_device(),
-    dtype: Optional[str] = None,
+        path_uri: str,
+        model_class: Union[
+            Type[PreTrainedModel], Type[ModelMixin], Type[ConfigMixin]
+        ],
+        config_class: Optional[
+            Union[Type[PretrainedConfig], Type[ConfigMixin], Type[AutoConfig]]
+        ] = None,
+        model_prefix: Optional[str] = "model",
+        device: torch.device = utils.get_device(),
+        dtype: Optional[str] = None,
 ) -> torch.nn.Module:
     """
     Given a path prefix, load the model with a custom extension
@@ -105,7 +108,6 @@ def load_model(
         dtype: The dtype to load the tensors into. If None, the dtype is inferred from
             the model.
     """
-
     if model_prefix is None:
         model_prefix = "model"
 
@@ -114,9 +116,9 @@ def load_model(
 
     config_uri = f"{path_uri}/{model_prefix}-config.json"
     tensors_uri = f"{path_uri}/{model_prefix}.tensors"
-    tensor_stream = stream_io.open_stream(tensors_uri)
 
     logger.info(f"Loading {tensors_uri}, {ram_usage}")
+    tensor_stream = stream_io.open_stream(tensors_uri)
 
     tensor_deserializer = TensorDeserializer(
         tensor_stream, device=device, dtype=dtype, lazy_load=True
@@ -127,6 +129,7 @@ def load_model(
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_config_path = os.path.join(temp_dir, "config.json")
                 with open(temp_config_path, "wb") as temp_config:
+                    logger.info(f"Loading {config_uri}, {ram_usage}")
                     temp_config.write(stream_io.open_stream(config_uri).read())
                 config = config_class.from_pretrained(temp_dir)
                 config.gradient_checkpointing = True
@@ -226,6 +229,11 @@ def df_main(args: argparse.Namespace) -> None:
 
 def hf_main(args):
     output_prefix = args.output_prefix
+
+    # May not be necessary if users can be assumed won't accidentally
+    # include trailing slashes in their output_prefix
+    output_prefix = output_prefix[:-1] if output_prefix[-1] == "/" else output_prefix
+
     print("MODEL PATH:", args.input_directory)
     print("OUTPUT PREFIX:", output_prefix)
 
@@ -268,6 +276,7 @@ def hf_main(args):
             dtype,
         ).eval()
         # Comparing model parameters
+        logger.info("Testing for sameness of model parameters")
         for name, param in model.named_parameters():
             param2 = model2.state_dict()[name]
             assert torch.allclose(param, param2, atol=1e-3)
@@ -301,6 +310,11 @@ def main():
         "--validate",
         action="store_true",
         help="Validate serialization by running a test inference",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force upload serialized tensors to output_prefix even if they already exist",
     )
     args = parser.parse_args()
 
