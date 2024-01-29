@@ -245,11 +245,21 @@ def hf_main(args):
     serialize_model(model, model_config, output_prefix)
 
     if args.validate:
-        del model, model_config
+        # Not sure if this part is needed as, although I doubt it,
+        # I'm not absolutely certain whether or not TensorSerializer
+        # changes the model's state in any way
+        del model
         gc.collect()
         device = utils.get_device()
+        model = AutoModelForCausalLM.from_pretrained(
+            args.input_directory,
+            config=model_config,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        model.to(device)
         logger.info("Validating serialization")
-        model = load_model(
+        model2 = load_model(
             output_prefix,
             AutoModelForCausalLM,
             AutoConfig,
@@ -257,19 +267,10 @@ def hf_main(args):
             device,
             dtype,
         ).eval()
-        # test generation
-        eos = tokenizer.eos_token_id
-        input_ids = tokenizer.encode(
-            "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
-        ).to(device)
-        with torch.no_grad():
-            output = model.generate(
-                input_ids, max_new_tokens=50, do_sample=True, pad_token_id=eos
-            )
-        logger.info(
-            "Test Output:"
-            f" {tokenizer.decode(output[0], skip_special_tokens=True)}"
-        )
+        # Comparing model parameters
+        for name, param in model.named_parameters():
+            param2 = model2.state_dict()[name]
+            assert torch.allclose(param, param2, atol=1e-3)
 
 
 def main():
