@@ -39,10 +39,18 @@ fh.setFormatter(fh_formatter)
 logger.addHandler(fh)
 
 
-# Now you can use these credentials to create a boto3 client
+def check_file_exists(
+        file: str,
+):
+    """
+    Check if file exists and is not empty. If the file is found locally,
+    it is checked for emptiness with `os.path.exists`. If the file is found
+    on S3, it is checked for emptiness by reading the first byte of the file.
 
-
-def check_file_exists(file):
+    Args:
+        file: The path to check for existence and emptiness. This can
+           either be a local path or an S3 URI.
+    """
     if os.path.exists(file):
         return True
     else:
