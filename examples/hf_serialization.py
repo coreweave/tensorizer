@@ -39,11 +39,26 @@ fh.setFormatter(fh_formatter)
 logger.addHandler(fh)
 
 
+# Now you can use these credentials to create a boto3 client
+
+
+def check_file_exists(file):
+    if os.path.exists(file):
+        return True
+    else:
+        with stream_io.open_stream(file, "rb") as f:
+            if f.read(1) == b'':
+                return False
+            else:
+                return True
+
+
 def serialize_model(
         model: torch.nn.Module,
         config: Optional[Union[ConfigMixin, AutoConfig, dict]],
         model_directory: str,
-        model_prefix: str = "model",
+        model_prefix: str = None,
+        force: bool = False,
 ):
     """
     Remove the tensors from a PyTorch model, convert them to NumPy
@@ -60,26 +75,34 @@ def serialize_model(
             is purely optional, and it allows for multiple models to be
             serialized to the same directory. A good example are Stable
             Diffusion models. Default is "model".
+        force: Force upload serialized tensors to `output_prefix`
+            even if they already exist
     """
 
-    os.makedirs(model_directory, exist_ok=True)
-    dir_prefix = f"{model_directory}/{model_prefix}"
+    if model_prefix is None:
+        model_prefix = "model"
 
+    dir_prefix = f"{model_directory}/{model_prefix}"
+    config_file_exists, weights_file_exists = (check_file_exists(f"{dir_prefix}-config.json"),
+                                               check_file_exists(f"{dir_prefix}.tensors"))
     if config is None:
         config = model
     if config is not None:
         config_path = f"{dir_prefix}-config.json"
-        logger.info(f"Writing config to {config_path}")
-        with stream_io.open_stream(config_path, "wb") as f:
-            if hasattr(config, "to_dict"):
-                f.write(bytes(json.dumps(config.to_dict()), "utf-8"))
-            elif isinstance(config, dict):
-                f.write(bytes(json.dumps(config), "utf-8"))
-            f.close() ## This shouldn't be necessary, but doesn't save for me without it
+        if (not config_file_exists) or force:
+            logger.info(f"Writing config to {config_path}")
+            with stream_io.open_stream(config_path, "wb") as f:
+                if hasattr(config, "to_dict"):
+                    f.write(bytes(json.dumps(config.to_dict()), "utf-8"))
+                elif isinstance(config, dict):
+                    f.write(bytes(json.dumps(config), "utf-8"))
+                f.close()  ## Remove after PR
 
-    ts = TensorSerializer(f"{dir_prefix}.tensors")
-    ts.write_module(model)
-    ts.close()
+    if (not weights_file_exists) or force:
+        logger.info(f"Writing tensors to {dir_prefix}.tensors")
+        ts = TensorSerializer(f"{dir_prefix}.tensors")
+        ts.write_module(model)
+        ts.close()
 
 
 def load_model(
@@ -181,12 +204,7 @@ def df_main(args: argparse.Namespace) -> None:
     logger.info("GPU: " + utils.get_gpu_name())
     logger.info("PYTHON USED RAM: " + utils.get_mem_usage())
 
-    serialize_model(
-        pipeline.text_encoder.eval(),
-        pipeline.text_encoder.config,
-        output_prefix,
-        "encoder",
-    )
+    serialize_model(pipeline.text_encoder.eval(), pipeline.text_encoder.config, output_prefix, "encoder")
     serialize_model(pipeline.vae.eval(), None, output_prefix, "vae")
     serialize_model(pipeline.unet.eval(), None, output_prefix, "unet")
 
@@ -250,7 +268,11 @@ def hf_main(args):
     logger.info("GPU: " + utils.get_gpu_name())
     logger.info("PYTHON USED RAM: " + utils.get_mem_usage())
 
-    serialize_model(model, model_config, output_prefix)
+    serialize_model(model,
+                    model_config,
+                    output_prefix,
+                    None,
+                    args.force)
 
     if args.validate:
         # Not sure if this part is needed as, although I doubt it,
