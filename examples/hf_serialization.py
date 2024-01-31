@@ -30,7 +30,7 @@ from tensorizer import TensorDeserializer, TensorSerializer, stream_io, utils
 
 s3_access_key_id = os.environ.get("S3_ACCESS_KEY_ID") or None
 s3_secret_access_key = os.environ.get("S3_SECRET_ACCESS_KEY") or None
-default_s3_write_endpoint  = default_s3_read_endpoint = (
+default_s3_write_endpoint = default_s3_read_endpoint = (
     os.environ.get("S3_ENDPOINT_URL") or None
 )
 
@@ -329,7 +329,7 @@ def hf_main(args):
             low_cpu_mem_usage=True,
         ).to(device)
         logger.info("Validating serialization")
-        model2 = load_model(
+        tensorizer_model = load_model(
             output_prefix,
             AutoModelForCausalLM,
             AutoConfig,
@@ -338,10 +338,20 @@ def hf_main(args):
             dtype,
         ).eval()
         # Comparing model parameters
-        logger.info("Testing for sameness of model parameters")
-        for name, param in model.named_parameters():
-            param2 = model2.state_dict()[name]
-            assert torch.allclose(param, param2, atol=1e-3)
+        logger.debug("Testing for sameness of model parameters")
+        original_sd = model.state_dict()
+        tensorizer_sd = tensorizer_model.state_dict()
+        if tensorizer_sd.keys() != original_sd.keys():
+            raise RuntimeError(
+                "Validating deserialized model failed: different keys"
+            )
+        for name, original_tensor in original_sd.items():
+            tensorizer_tensor = tensorizer_sd[name]
+            if not torch.equal(original_tensor, tensorizer_tensor):
+                raise RuntimeError(
+                    "Validating deserialized model failed:"
+                    f" weights for tensor {name} don't match"
+                )
 
 
 def main():
