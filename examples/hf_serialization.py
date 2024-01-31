@@ -65,7 +65,7 @@ logger.addHandler(fh)
 def check_file_exists(file: str):
     """
     Check if file exists and is not empty. If the file is found locally,
-    it is checked for emptiness with `os.path.exists`. If the file is found
+    it is checked for emptiness with `os.stat`. If the file is found
     on S3, it is checked for emptiness by reading the first byte of the file.
 
     Args:
@@ -75,7 +75,8 @@ def check_file_exists(file: str):
     try:
         return os.stat(file).st_size > 0
     except FileNotFoundError:
-        if not file.lower().startswith("s3://"):
+        uri = file.lower()
+        if not any(map(uri.startswith, ("s3://", "http://", "https://"))):
             return False
         try:
             with _read_stream(file) as f:
