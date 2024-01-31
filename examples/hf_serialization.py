@@ -38,6 +38,18 @@ else:
     default_s3_read_endpoint = "accel-object.ord1.coreweave.com"
     default_s3_write_endpoint = "object.ord1.coreweave.com"
 
+s3_read_credentials = (
+    s3_access_key_id,
+    s3_secret_access_key,
+    default_s3_read_endpoint,
+)
+
+s3_write_credentials = (
+    s3_access_key_id,
+    s3_secret_access_key,
+    default_s3_write_endpoint,
+)
+
 # Setup logger
 logger = logging.getLogger(__name__)
 logger.setLevel(level=logging.INFO)
@@ -68,9 +80,7 @@ def check_file_exists(
             with stream_io.open_stream(
                 file,
                 "rb",
-                s3_access_key_id,
-                s3_secret_access_key,
-                default_s3_read_endpoint,
+                *s3_read_credentials,
             ) as f:
                 f.read(1)
                 return True
@@ -119,11 +129,7 @@ def serialize_model(
         if (not config_file_exists) or force:
             logger.info(f"Writing config to {config_path}")
             with stream_io.open_stream(
-                config_path,
-                "wb+",
-                s3_access_key_id,
-                s3_secret_access_key,
-                default_s3_write_endpoint,
+                config_path, "wb+", *s3_write_credentials
             ) as f:
                 if hasattr(config, "to_dict"):
                     f.write(bytes(json.dumps(config.to_dict()), "utf-8"))
@@ -133,11 +139,7 @@ def serialize_model(
     if (not weights_file_exists) or force:
         logger.info(f"Writing tensors to {dir_prefix}.tensors")
         with stream_io.open_stream(
-            f"{dir_prefix}.tensors",
-            "wb+",
-            s3_access_key_id,
-            s3_secret_access_key,
-            default_s3_write_endpoint,
+            f"{dir_prefix}.tensors", "wb+", *s3_write_credentials
         ) as f:
             ts = TensorSerializer(f)
             ts.write_module(model)
@@ -182,11 +184,7 @@ def load_model(
     logger.info(f"Loading {tensors_uri}, {ram_usage}")
 
     tensor_stream = stream_io.open_stream(
-        tensors_uri,
-        "rb",
-        s3_access_key_id,
-        s3_secret_access_key,
-        default_s3_read_endpoint,
+        tensors_uri, "rb", *s3_read_credentials
     )
 
     tensor_deserializer = TensorDeserializer(
@@ -199,7 +197,11 @@ def load_model(
                 temp_config_path = os.path.join(temp_dir, "config.json")
                 with open(temp_config_path, "wb") as temp_config:
                     logger.info(f"Loading {config_uri}, {ram_usage}")
-                    temp_config.write(stream_io.open_stream(config_uri).read())
+                    temp_config.write(
+                        stream_io.open_stream(
+                            config_uri, "rb", *s3_read_credentials
+                        ).read()
+                    )
                 config = config_class.from_pretrained(temp_dir)
                 config.gradient_checkpointing = True
         except ValueError:
@@ -212,7 +214,9 @@ def load_model(
     else:
         try:
             config = json.loads(
-                stream_io.open_stream(config_uri).read().decode("utf-8")
+                stream_io.open_stream(config_uri, "rb", *s3_read_credentials)
+                .read()
+                .decode("utf-8")
             )
         except ValueError:
             with open(config_uri, "r") as f:
@@ -385,7 +389,10 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Force upload serialized tensors to output_prefix even if they already exist",
+        help=(
+            "Force upload serialized tensors to output_prefix even if they"
+            " already exist"
+        ),
     )
     args = parser.parse_args()
 
