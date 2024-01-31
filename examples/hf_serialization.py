@@ -164,7 +164,7 @@ def load_model(
     if model_prefix is None:
         model_prefix = "model"
 
-    begin_load = time.time()
+    begin_load = time.perf_counter()
     ram_usage = utils.get_mem_usage()
 
     config_uri = f"{path_uri}/{model_prefix}-config.json"
@@ -199,7 +199,7 @@ def load_model(
         tensor_stream, device=device, dtype=dtype, lazy_load=True
     ) as tensor_deserializer:
         tensor_deserializer.load_into_module(model)
-        tensor_load_s = time.time() - begin_load
+        tensor_load_s = time.perf_counter() - begin_load
         bytes_read: int = tensor_deserializer.total_bytes_read
 
     rate_str = utils.convert_bytes(bytes_read / tensor_load_s)
