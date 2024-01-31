@@ -129,7 +129,7 @@ def serialize_model(
             logger.info(f"Writing tensors to {dir_prefix}.tensors")
             with _write_stream(f"{dir_prefix}.tensors") as f:
                 ts = TensorSerializer(f)
-                ts.write_module(model)
+                ts.write_module(model, include_non_persistent_buffers=False)
                 ts.close()
 
 
