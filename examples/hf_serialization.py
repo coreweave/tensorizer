@@ -72,9 +72,11 @@ def check_file_exists(file: str):
         file: The path to check for existence and emptiness. This can
            either be a local path or an S3 URI.
     """
-    if os.path.exists(file):
-        return True
-    else:
+    try:
+        return os.stat(file).st_size > 0
+    except FileNotFoundError:
+        if not file.lower().startswith("s3://"):
+            return False
         try:
             with _read_stream(file) as f:
                 return bool(f.read(1))
