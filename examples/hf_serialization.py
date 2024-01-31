@@ -64,17 +64,18 @@ def check_file_exists(
     if os.path.exists(file):
         return True
     else:
-        with stream_io.open_stream(
-            file,
-            "wb",
-            s3_access_key_id,
-            s3_secret_access_key,
-            default_s3_read_endpoint,
-        ) as f:
-            if f.read(1) == b"":
-                return False
-            else:
+        try:
+            with stream_io.open_stream(
+                file,
+                "rb",
+                s3_access_key_id,
+                s3_secret_access_key,
+                default_s3_read_endpoint,
+            ) as f:
+                f.read(1)
                 return True
+        except OSError as e:
+            return False
 
 
 def serialize_model(
@@ -119,7 +120,7 @@ def serialize_model(
             logger.info(f"Writing config to {config_path}")
             with stream_io.open_stream(
                 config_path,
-                "wb",
+                "wb+",
                 s3_access_key_id,
                 s3_secret_access_key,
                 default_s3_write_endpoint,
@@ -128,13 +129,12 @@ def serialize_model(
                     f.write(bytes(json.dumps(config.to_dict()), "utf-8"))
                 elif isinstance(config, dict):
                     f.write(bytes(json.dumps(config), "utf-8"))
-                f.close()  ## Remove after PR merged
 
     if (not weights_file_exists) or force:
         logger.info(f"Writing tensors to {dir_prefix}.tensors")
         with stream_io.open_stream(
             f"{dir_prefix}.tensors",
-            "wb",
+            "wb+",
             s3_access_key_id,
             s3_secret_access_key,
             default_s3_write_endpoint,
@@ -180,7 +180,14 @@ def load_model(
     tensors_uri = f"{path_uri}/{model_prefix}.tensors"
 
     logger.info(f"Loading {tensors_uri}, {ram_usage}")
-    tensor_stream = stream_io.open_stream(tensors_uri)
+
+    tensor_stream = stream_io.open_stream(
+        tensors_uri,
+        "rb",
+        s3_access_key_id,
+        s3_secret_access_key,
+        default_s3_read_endpoint,
+    )
 
     tensor_deserializer = TensorDeserializer(
         tensor_stream, device=device, dtype=dtype, lazy_load=True
