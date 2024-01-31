@@ -28,15 +28,11 @@ from transformers import (
 
 from tensorizer import TensorDeserializer, TensorSerializer, stream_io, utils
 
-s3_access_key_id = os.environ.get("AWS_ACCESS_KEY_ID")
-s3_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
-
-if os.environ.get("AWS_ENDPOINT_URL"):
-    default_s3_read_endpoint = os.environ.get("AWS_ENDPOINT_URL")
-    default_s3_write_endpoint = os.environ.get("AWS_ENDPOINT_URL")
-else:
-    default_s3_read_endpoint = "accel-object.ord1.coreweave.com"
-    default_s3_write_endpoint = "object.ord1.coreweave.com"
+s3_access_key_id = os.environ.get("S3_ACCESS_KEY_ID") or None
+s3_secret_access_key = os.environ.get("S3_SECRET_ACCESS_KEY") or None
+default_s3_write_endpoint  = default_s3_read_endpoint = (
+    os.environ.get("S3_ENDPOINT_URL") or None
+)
 
 s3_read_credentials = (
     s3_access_key_id,
