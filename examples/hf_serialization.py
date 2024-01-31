@@ -292,7 +292,7 @@ def hf_main(args):
     logger.info("GPU: " + utils.get_gpu_name())
     logger.info("PYTHON USED RAM: " + utils.get_mem_usage())
 
-    serialize_model(model, model_config, output_prefix, None, args.force)
+    serialize_model(model, model_config, output_prefix, force=args.force)
 
     if args.validate:
         # Not sure if this part is needed as, although I doubt it,
