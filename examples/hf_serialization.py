@@ -87,7 +87,7 @@ def serialize_model(
     model: torch.nn.Module,
     config: Optional[Union[ConfigMixin, AutoConfig, dict]],
     model_directory: str,
-    model_prefix: str = None,
+    model_prefix: str = "model",
     force: bool = False,
 ):
     """
@@ -109,9 +109,6 @@ def serialize_model(
             even if they already exist
     """
 
-    if model_prefix is None:
-        model_prefix = "model"
-
     dir_prefix = f"{model_directory}/{model_prefix}"
     config_file_exists, weights_file_exists = (
         check_file_exists(f"{dir_prefix}-config.json"),
@@ -126,10 +123,10 @@ def serialize_model(
             with stream_io.open_stream(
                 config_path, "wb+", *s3_write_credentials
             ) as f:
-                if hasattr(config, "to_dict"):
-                    f.write(bytes(json.dumps(config.to_dict()), "utf-8"))
-                elif isinstance(config, dict):
-                    f.write(bytes(json.dumps(config), "utf-8"))
+                config_dict = (
+                    config.to_dict() if hasattr(config, "to_dict") else config
+                )
+                f.write(json.dumps(config_dict).encode("utf-8"))
 
     if (not weights_file_exists) or force:
         logger.info(f"Writing tensors to {dir_prefix}.tensors")
@@ -298,11 +295,7 @@ def df_main(args: argparse.Namespace) -> None:
 def hf_main(args):
     output_prefix = args.output_prefix
 
-    # May not be necessary if users can be assumed won't accidentally
-    # include trailing slashes in their output_prefix
-    output_prefix = (
-        output_prefix[:-1] if output_prefix[-1] == "/" else output_prefix
-    )
+    output_prefix = output_prefix.rstrip("/")
 
     print("MODEL PATH:", args.input_directory)
     print("OUTPUT PREFIX:", output_prefix)
@@ -334,8 +327,7 @@ def hf_main(args):
             config=model_config,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
-        )
-        model.to(device)
+        ).to(device)
         logger.info("Validating serialization")
         model2 = load_model(
             output_prefix,
