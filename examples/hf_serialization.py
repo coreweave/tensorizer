@@ -31,16 +31,14 @@ from tensorizer import TensorDeserializer, TensorSerializer, stream_io, utils
 
 s3_access_key_id = os.environ.get("S3_ACCESS_KEY_ID") or None
 s3_secret_access_key = os.environ.get("S3_SECRET_ACCESS_KEY") or None
-default_s3_write_endpoint = default_s3_read_endpoint = (
-    os.environ.get("S3_ENDPOINT_URL") or None
-)
+s3_endpoint = os.environ.get("S3_ENDPOINT_URL") or None
 
 _read_stream = partial(
     stream_io.open_stream,
     mode="rb",
     s3_access_key_id=s3_access_key_id,
     s3_secret_access_key=s3_secret_access_key,
-    s3_endpoint=default_s3_read_endpoint,
+    s3_endpoint=s3_endpoint,
 )
 
 _write_stream = partial(
@@ -48,8 +46,9 @@ _write_stream = partial(
     mode="wb+",
     s3_access_key_id=s3_access_key_id,
     s3_secret_access_key=s3_secret_access_key,
-    s3_endpoint=default_s3_write_endpoint,
+    s3_endpoint=s3_endpoint,
 )
+
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -116,24 +115,22 @@ def serialize_model(
         check_file_exists(f"{dir_prefix}-config.json"),
         check_file_exists(f"{dir_prefix}.tensors"),
     )
-    if config is None:
-        config = model
-    if config is not None:
-        config_path = f"{dir_prefix}-config.json"
-        if (not config_file_exists) or force:
+    overwrite = force or not all([config_file_exists, weights_file_exists])
+    if overwrite:
+        if config:
+            config_path = f"{dir_prefix}-config.json"
             logger.info(f"Writing config to {config_path}")
             with _write_stream(config_path) as f:
                 config_dict = (
                     config.to_dict() if hasattr(config, "to_dict") else config
                 )
                 f.write(json.dumps(config_dict, indent=2).encode("utf-8"))
-
-    if (not weights_file_exists) or force:
-        logger.info(f"Writing tensors to {dir_prefix}.tensors")
-        with _write_stream(f"{dir_prefix}.tensors") as f:
-            ts = TensorSerializer(f)
-            ts.write_module(model)
-            ts.close()
+        if model:
+            logger.info(f"Writing tensors to {dir_prefix}.tensors")
+            with _write_stream(f"{dir_prefix}.tensors") as f:
+                ts = TensorSerializer(f)
+                ts.write_module(model)
+                ts.close()
 
 
 def load_model(
@@ -147,6 +144,7 @@ def load_model(
     model_prefix: Optional[str] = "model",
     device: torch.device = utils.get_device(),
     dtype: Optional[str] = None,
+    hf_id: Optional[str] = None,
 ) -> torch.nn.Module:
     """
     Given a path prefix, load the model with a custom extension
@@ -191,10 +189,9 @@ def load_model(
             config_loader = getattr(model_class, "from_config", model_class)
             model = config_loader(config)
     else:
-        with _read_stream(config_uri) as config_file:
-            config = json.loads(config_file.read())
-        with utils.no_init_or_tensor():
-            model = model_class(**config)
+        model = model_class.from_config(
+            model_class.load_config(hf_id, subfolder=model_prefix)
+        )
 
     with _read_stream(tensors_uri) as tensor_stream, TensorDeserializer(
         tensor_stream, device=device, dtype=dtype
@@ -219,6 +216,7 @@ def df_main(args: argparse.Namespace) -> None:
     print("OUTPUT PREFIX:", output_prefix)
 
     hf_api_token = os.environ.get("HF_API_TOKEN")
+    hf_id = args.input_directory
 
     pipeline = StableDiffusionPipeline.from_pretrained(
         args.input_directory, use_auth_token=hf_api_token
@@ -246,12 +244,24 @@ def df_main(args: argparse.Namespace) -> None:
         device = utils.get_device()
 
         logger.info("Validating serialization")
-        vae = load_model(output_prefix, AutoencoderKL, None, "vae", device)
+        vae = load_model(
+            output_prefix, AutoencoderKL, None, "vae", device, hf_id=hf_id
+        )
         unet = load_model(
-            output_prefix, UNet2DConditionModel, None, "unet", device
+            output_prefix,
+            UNet2DConditionModel,
+            None,
+            "unet",
+            device,
+            hf_id=hf_id,
         )
         encoder = load_model(
-            output_prefix, CLIPTextModel, CLIPTextConfig, "encoder", device
+            output_prefix,
+            CLIPTextModel,
+            CLIPTextConfig,
+            "encoder",
+            device,
+            hf_id=hf_id,
         )
 
         pipeline = StableDiffusionPipeline(
@@ -285,10 +295,7 @@ def hf_main(args):
     dtype = torch.float16
     model_config = AutoConfig.from_pretrained(args.input_directory)
     model = AutoModelForCausalLM.from_pretrained(
-        args.input_directory,
-        config=model_config,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
+        args.input_directory, config=model_config, torch_dtype=dtype
     )
 
     logger.info("Serializing model")
@@ -305,10 +312,7 @@ def hf_main(args):
         gc.collect()
         device = utils.get_device()
         model = AutoModelForCausalLM.from_pretrained(
-            args.input_directory,
-            config=model_config,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
+            args.input_directory, config=model_config, torch_dtype=dtype
         ).to(device)
         logger.info("Validating serialization")
         tensorizer_model = load_model(
@@ -374,7 +378,8 @@ def main():
         ),
     )
     args = parser.parse_args()
-
+    if args.force:
+        logger.info(f"Forcing serialization to {args.output_prefix}")
     if args.model_type == "transformers":
         hf_main(args)
     elif args.model_type == "diffusers":
