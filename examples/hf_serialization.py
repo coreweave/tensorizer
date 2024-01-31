@@ -340,13 +340,11 @@ def hf_main(args):
                 )
 
 
-def main():
-    # usage: hf_serialization.py [-h] --model_type {transformers,diffusers} [--validate] input_directory output_prefix
-
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "An example script that uses Tensorizer to serialize"
-            "a HuggingFace model to an output directory."
+            " a HuggingFace model to an output directory."
         )
     )
     parser.add_argument(
@@ -358,7 +356,7 @@ def main():
         "output_prefix", type=str, help="Path to output directory"
     )
     parser.add_argument(
-        "--model_type",
+        "--model-type",
         type=str,
         choices=["transformers", "diffusers"],
         required=True,
@@ -367,17 +365,14 @@ def main():
     parser.add_argument(
         "--validate",
         action="store_true",
-        help="Validate serialization by running a test inference",
+        help="Validate serialization by checking if deserialized weights match",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help=(
-            "Force upload serialized tensors to output_prefix even if they"
-            " already exist"
-        ),
+        help="Overwrite existing serialized tensors in the output directory",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.force:
         logger.info(f"Forcing serialization to {args.output_prefix}")
     if args.model_type == "transformers":
