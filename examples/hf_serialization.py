@@ -78,9 +78,8 @@ def check_file_exists(
                 "rb",
                 *s3_read_credentials,
             ) as f:
-                f.read(1)
-                return True
-        except OSError as e:
+                return bool(f.read(1))
+        except OSError:
             return False
 
 
