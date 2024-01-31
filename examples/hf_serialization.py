@@ -123,7 +123,7 @@ def serialize_model(
                 config_dict = (
                     config.to_dict() if hasattr(config, "to_dict") else config
                 )
-                f.write(json.dumps(config_dict).encode("utf-8"))
+                f.write(json.dumps(config_dict, indent=2).encode("utf-8"))
 
     if (not weights_file_exists) or force:
         logger.info(f"Writing tensors to {dir_prefix}.tensors")
