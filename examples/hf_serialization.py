@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 import time
+from functools import partial
 from typing import Optional, Type, Union
 
 import torch
@@ -34,16 +35,20 @@ default_s3_write_endpoint = default_s3_read_endpoint = (
     os.environ.get("S3_ENDPOINT_URL") or None
 )
 
-s3_read_credentials = (
-    s3_access_key_id,
-    s3_secret_access_key,
-    default_s3_read_endpoint,
+_read_stream = partial(
+    stream_io.open_stream,
+    mode="rb",
+    s3_access_key_id=s3_access_key_id,
+    s3_secret_access_key=s3_secret_access_key,
+    s3_endpoint=default_s3_read_endpoint,
 )
 
-s3_write_credentials = (
-    s3_access_key_id,
-    s3_secret_access_key,
-    default_s3_write_endpoint,
+_write_stream = partial(
+    stream_io.open_stream,
+    mode="wb+",
+    s3_access_key_id=s3_access_key_id,
+    s3_secret_access_key=s3_secret_access_key,
+    s3_endpoint=default_s3_write_endpoint,
 )
 
 # Setup logger
@@ -57,9 +62,7 @@ fh.setFormatter(fh_formatter)
 logger.addHandler(fh)
 
 
-def check_file_exists(
-    file: str,
-):
+def check_file_exists(file: str):
     """
     Check if file exists and is not empty. If the file is found locally,
     it is checked for emptiness with `os.path.exists`. If the file is found
@@ -73,11 +76,7 @@ def check_file_exists(
         return True
     else:
         try:
-            with stream_io.open_stream(
-                file,
-                "rb",
-                *s3_read_credentials,
-            ) as f:
+            with _read_stream(file) as f:
                 return bool(f.read(1))
         except OSError:
             return False
@@ -120,9 +119,7 @@ def serialize_model(
         config_path = f"{dir_prefix}-config.json"
         if (not config_file_exists) or force:
             logger.info(f"Writing config to {config_path}")
-            with stream_io.open_stream(
-                config_path, "wb+", *s3_write_credentials
-            ) as f:
+            with _write_stream(config_path) as f:
                 config_dict = (
                     config.to_dict() if hasattr(config, "to_dict") else config
                 )
@@ -130,9 +127,7 @@ def serialize_model(
 
     if (not weights_file_exists) or force:
         logger.info(f"Writing tensors to {dir_prefix}.tensors")
-        with stream_io.open_stream(
-            f"{dir_prefix}.tensors", "wb+", *s3_write_credentials
-        ) as f:
+        with _write_stream(f"{dir_prefix}.tensors") as f:
             ts = TensorSerializer(f)
             ts.write_module(model)
             ts.close()
@@ -175,25 +170,14 @@ def load_model(
 
     logger.info(f"Loading {tensors_uri}, {ram_usage}")
 
-    tensor_stream = stream_io.open_stream(
-        tensors_uri, "rb", *s3_read_credentials
-    )
-
-    tensor_deserializer = TensorDeserializer(
-        tensor_stream, device=device, dtype=dtype, lazy_load=True
-    )
-
     if config_class is not None:
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_config_path = os.path.join(temp_dir, "config.json")
                 with open(temp_config_path, "wb") as temp_config:
-                    logger.info(f"Loading {config_uri}, {ram_usage}")
-                    temp_config.write(
-                        stream_io.open_stream(
-                            config_uri, "rb", *s3_read_credentials
-                        ).read()
-                    )
+                    logger.info(f"Loading {config_uri}")
+                    with _read_stream(config_uri) as config_file:
+                        temp_config.write(config_file.read())
                 config = config_class.from_pretrained(temp_dir)
                 config.gradient_checkpointing = True
         except ValueError:
@@ -204,25 +188,20 @@ def load_model(
             config_loader = getattr(model_class, "from_config", model_class)
             model = config_loader(config)
     else:
-        try:
-            config = json.loads(
-                stream_io.open_stream(config_uri, "rb", *s3_read_credentials)
-                .read()
-                .decode("utf-8")
-            )
-        except ValueError:
-            with open(config_uri, "r") as f:
-                config = json.load(f)
+        with _read_stream(config_uri) as config_file:
+            config = json.loads(config_file.read())
         with utils.no_init_or_tensor():
             model = model_class(**config)
 
-    tensor_deserializer.load_into_module(model)
+    with _read_stream(tensors_uri) as tensor_stream, TensorDeserializer(
+        tensor_stream, device=device, dtype=dtype, lazy_load=True
+    ) as tensor_deserializer:
+        tensor_deserializer.load_into_module(model)
+        tensor_load_s = time.time() - begin_load
+        bytes_read: int = tensor_deserializer.total_bytes_read
 
-    tensor_load_s = time.time() - begin_load
-    rate_str = utils.convert_bytes(
-        tensor_deserializer.total_bytes_read / tensor_load_s
-    )
-    tensors_sz = utils.convert_bytes(tensor_deserializer.total_bytes_read)
+    rate_str = utils.convert_bytes(bytes_read / tensor_load_s)
+    tensors_sz = utils.convert_bytes(bytes_read)
     logger.info(
         f"Model tensors loaded in {tensor_load_s:0.2f}s, read "
         f"{tensors_sz} @ {rate_str}/s, {utils.get_mem_usage()}"
