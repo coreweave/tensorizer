@@ -196,7 +196,7 @@ def load_model(
             model = model_class(**config)
 
     with _read_stream(tensors_uri) as tensor_stream, TensorDeserializer(
-        tensor_stream, device=device, dtype=dtype, lazy_load=True
+        tensor_stream, device=device, dtype=dtype
     ) as tensor_deserializer:
         tensor_deserializer.load_into_module(model)
         tensor_load_s = time.perf_counter() - begin_load
