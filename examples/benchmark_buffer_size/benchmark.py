@@ -31,7 +31,7 @@ mebibyte = 1 << 20
 gibibyte = 1 << 30
 
 # Read in model name from command line, or env var, or default to gpt-neo-2.7B
-model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/gpt-neo-2.7B/fp16"
+model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/pythia-12b/fp16"
 parser = argparse.ArgumentParser(
     description="Test CURLStreamFile download speeds"
 )
@@ -162,7 +162,7 @@ try:
     gpu_name = torch.cuda.get_device_name(cudadev)
     map_device = torch.device("cuda")
     has_gpu = True
-except AssertionError:
+except (AssertionError, RuntimeError):
     gpu_gb = psutil.virtual_memory().total // gibibyte
     gpu_name = cpu_name
     has_gpu = False

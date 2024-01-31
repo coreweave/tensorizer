@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.2] - 2024-01-30
+
+### Fixed
+
+- File objects opened with `stream_io.open_stream("s3://...", "wb")` for writing
+  to object storage now correctly upload their content when closed implicitly
+  at the end of a `with` block, without requiring an explicit call to their
+  `.close()` method
+  - Since `TensorSerializer` objects already call `.close()` explicitly on
+    their output file objects, either when `TensorSerializer.close()` is invoked
+    or when the `TensorSerializer` is garbage collected, this bug mainly applies
+    to manual usage of `stream_io.open_stream()` for object storage uploads
+    not involving a `TensorSerializer`
+
+
 ## [2.7.1] - 2023-12-06
 
 ### Fixed
@@ -265,7 +280,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
-[2.7.0]: https://github.com/coreweave/tensorizer/compare/v2.7.0...v2.7.1
+[2.7.2]: https://github.com/coreweave/tensorizer/compare/v2.7.1...v2.7.2
+[2.7.1]: https://github.com/coreweave/tensorizer/compare/v2.7.0...v2.7.1
 [2.7.0]: https://github.com/coreweave/tensorizer/compare/v2.6.0...v2.7.0
 [2.6.0]: https://github.com/coreweave/tensorizer/compare/v2.5.1...v2.6.0
 [2.5.1]: https://github.com/coreweave/tensorizer/compare/v2.5.0...v2.5.1
