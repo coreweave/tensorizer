@@ -400,20 +400,23 @@ def df_main(args: argparse.Namespace) -> None:
                 "Validating deserialized scheduler failed"
             )
 
-        deserialized_pipeline = StableDiffusionPipeline(
-            text_encoder=encoder,
-            vae=vae,
-            unet=unet,
-            tokenizer=tokenizer,
-            scheduler=scheduler,
-            safety_checker=None,
-            feature_extractor=None,
-            requires_safety_checker=False,
-        ).to(device)
+        # To reassemble these components into a StableDiffusionPipeline
+        # and generate an image, the following code would work:
 
-        prompt = "a photo of an astronaut riding a horse on mars"
-        with torch.autocast(device.type):
-            deserialized_pipeline(prompt).images[0].save("test.png")
+        # deserialized_pipeline = StableDiffusionPipeline(
+        #     text_encoder=encoder,
+        #     vae=vae,
+        #     unet=unet,
+        #     tokenizer=tokenizer,
+        #     scheduler=scheduler,
+        #     safety_checker=None,
+        #     feature_extractor=None,
+        #     requires_safety_checker=False,
+        # ).to(device)
+        #
+        # prompt = "a photo of an astronaut riding a horse on mars"
+        # with torch.autocast(device.type):
+        #     deserialized_pipeline(prompt).images[0].save("test.png")
 
 
 def hf_main(args):
