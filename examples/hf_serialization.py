@@ -264,12 +264,13 @@ def load_model(
         model_loader = getattr(model_class, "from_config", model_class)
         model = model_loader(config)
 
+    is_cuda: bool = torch.device(device).type == "cuda"
     ram_usage = utils.get_mem_usage()
     logger.info(f"Loading {tensors_uri}, {ram_usage}")
     begin_load = time.perf_counter()
 
     with _read_stream(tensors_uri) as tensor_stream, TensorDeserializer(
-        tensor_stream, device=device, dtype=dtype
+        tensor_stream, device=device, dtype=dtype, plaid_mode=is_cuda
     ) as tensor_deserializer:
         tensor_deserializer.load_into_module(model)
         tensor_load_s = time.perf_counter() - begin_load
