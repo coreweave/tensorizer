@@ -72,7 +72,19 @@ def set_logger_verbosity(verbosity: int = 2):
     logger.setLevel(levels[verbosity])
 
 
-class ModuleValidationError(RuntimeError):
+class ValidationError(RuntimeError):
+    pass
+
+
+class ModuleValidationError(ValidationError):
+    pass
+
+
+class TokenizerValidationError(ValidationError):
+    pass
+
+
+class SchedulerValidationError(ValidationError):
     pass
 
 
@@ -103,6 +115,24 @@ def assert_module_equal(
                 f"{label}Validating deserialized model failed:"
                 f" weights for tensor {name} don't match"
             )
+
+
+def assert_tokenizer_equal(
+    before: PreTrainedTokenizer, after: PreTrainedTokenizer
+) -> None:
+    msg = "Validating deserialized tokenizer failed: different {}".format
+    if type(before) is not type(after):
+        raise TokenizerValidationError(msg("types"))
+    missing = object()
+    for prop in (
+        "vocab_size",
+        "model_max_length",
+        "is_fast",
+        "special_tokens",
+        "added_tokens_decoder",
+    ):
+        if getattr(before, prop, missing) != getattr(after, prop, missing):
+            raise TokenizerValidationError(msg(prop))
 
 
 def file_is_non_empty(file: str):
@@ -259,6 +289,7 @@ def serialize_pretrained(
 ):
     save_path: str = f"{path_uri.rstrip('/')}/{prefix}.zip"
     if force or not file_is_non_empty(save_path):
+        logger.info(f"Writing {save_path}")
         with _write_stream(save_path) as stream, zipfile.ZipFile(
             stream, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=5
         ) as file, tempfile.TemporaryDirectory() as directory:
@@ -274,11 +305,14 @@ def serialize_pretrained(
 
 
 def load_pretrained(
-    component_class: Union[Type[PreTrainedTokenizer], Type[ConfigMixin]],
+    component_class: Union[
+        Type[PreTrainedTokenizer], Type[AutoTokenizer], Type[ConfigMixin]
+    ],
     path_uri: str,
     prefix: str,
 ):
     load_path: str = f"{path_uri.rstrip('/')}/{prefix}.zip"
+    logger.info(f"Loading {load_path}")
     with _read_stream(load_path) as stream, zipfile.ZipFile(
         stream, mode="r"
     ) as file, tempfile.TemporaryDirectory() as directory:
@@ -359,7 +393,12 @@ def df_main(args: argparse.Namespace) -> None:
         assert_module_equal(pipeline.text_encoder, encoder, "encoder")
 
         tokenizer = load_pretrained(tokenizer_type, output_prefix, "tokenizer")
+        assert_tokenizer_equal(pipeline.tokenizer, tokenizer)
         scheduler = load_pretrained(scheduler_type, output_prefix, "scheduler")
+        if not isinstance(scheduler, scheduler_type):
+            raise SchedulerValidationError(
+                "Validating deserialized scheduler failed"
+            )
 
         deserialized_pipeline = StableDiffusionPipeline(
             text_encoder=encoder,
