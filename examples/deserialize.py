@@ -1,6 +1,7 @@
 import time
 import torch
 from tensorizer import TensorDeserializer
+import tensorizer.serialization
 from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -9,9 +10,10 @@ model_ref = "EleutherAI/gpt-j-6B"
 # To run this at home, swap this with the line below for a smaller example:
 # model_ref = "EleutherAI/gpt-neo-125M"
 model_name = model_ref.split("/")[-1]
+
 # Change this to your S3 bucket.
-s3_bucket = "bucket"
-s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
+# s3_bucket = "bucket"
+# s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 
 config = AutoConfig.from_pretrained(model_ref)
 
@@ -23,7 +25,7 @@ before_mem = get_mem_usage()
 
 # Lazy load the tensors from S3 into the model.
 start = time.time()
-deserializer = TensorDeserializer(s3_uri, plaid_mode=True)
+deserializer = TensorDeserializer(f"/scratch/{model_name}.tensors", plaid_mode=True)
 deserializer.load_into_module(model)
 end = time.time()
 
@@ -51,3 +53,5 @@ with torch.no_grad():
     )
 
 print(f"Output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
+cuda_stats = tensorizer.serialization.cuda_stats()
+print(f"to CUDA stats: {cuda_stats['cuda_bytes']} bytes in {cuda_stats['cuda_to_device_secs']}s, {cuda_stats['cuda_bytes']/cuda_stats['cuda_to_device_secs']/1024/1024/1024:.3f} GiB/s")

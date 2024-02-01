@@ -42,6 +42,7 @@ from typing import (
     Union,
 )
 
+from atomics.base import AtomicUint
 import numpy
 import redis
 import torch
@@ -62,6 +63,9 @@ if torch.cuda.is_available():
     cudart = torch.cuda.cudart()
 else:
     cudart = None
+
+cuda_to_device_millisecs = AtomicUint(width=8)
+cuda_bytes = AtomicUint(width=8)
 
 lz4 = None
 
@@ -2101,6 +2105,7 @@ class TensorDeserializer(
                     key = None
                     encryption_method = None
 
+                # BCHESS
                 # We use memoryview to avoid copying the data.
                 mv: memoryview
                 if not self._plaid_mode and not self._lazy_load:
@@ -2341,10 +2346,24 @@ class TensorDeserializer(
 
         gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
-        return torch.nn.Parameter(
-            tensor.to(device=self._device, dtype=target_dtype),
+        assert not tensor.is_sparse
+        assert not tensor.is_cuda
+
+        global cuda_bytes
+        global cuda_to_device_millisecs
+
+        start = time.time()
+        tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
+        end = time.time()
+        cuda_to_device_millisecs.add(int(1000 * (end - start)))
+        # BCHESS: gradient?
+
+        result = torch.nn.Parameter(
+            tensor_on_device,
             requires_grad=gradient,
         )
+        cuda_bytes.add(result.nbytes)
+        return result
 
     def _generate_state_dict(self) -> None:
         """
@@ -3942,3 +3961,13 @@ class TensorSerializer:
             )
             for name, param in state_dict.items()
         )
+
+
+def cuda_stats():
+    global cuda_bytes
+    global cuda_to_device_millisecs
+
+    return dict(
+        cuda_to_device_secs=float(cuda_to_device_millisecs.load()) / 1000.0,
+        cuda_bytes=cuda_bytes.load()
+    )
