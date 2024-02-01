@@ -1,5 +1,6 @@
 import argparse
 import gc
+import io
 import json
 import logging
 import os
@@ -314,11 +315,19 @@ def load_pretrained(
 ):
     load_path: str = f"{path_uri.rstrip('/')}/{prefix}.zip"
     logger.info(f"Loading {load_path}")
-    with _read_stream(load_path) as stream, zipfile.ZipFile(
-        stream, mode="r"
-    ) as file, tempfile.TemporaryDirectory() as directory:
-        file.extractall(path=directory)
-        return component_class.from_pretrained(directory, local_files_only=True)
+    with io.BytesIO() as downloaded:
+        # Download to a BytesIO object first, because ZipFile doesn't play nice
+        # with streams that don't fully support random access
+        with _read_stream(load_path) as stream:
+            downloaded.write(stream.read())
+        downloaded.seek(0)
+        with zipfile.ZipFile(
+            downloaded, mode="r"
+        ) as file, tempfile.TemporaryDirectory() as directory:
+            file.extractall(path=directory)
+            return component_class.from_pretrained(
+                directory, cache_dir=None, local_files_only=True
+            )
 
 
 def df_main(args: argparse.Namespace) -> None:
