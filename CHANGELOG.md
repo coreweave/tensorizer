@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Passing `include_non_persistent_buffers=False` to
+  `TensorSerializer.write_module()` now works as intended
+  - Previously, setting this flag to `False` filtered out both non-persistent
+    buffers **and** parameters, leaving only persistent buffers
+  - The corrected behaviour only filters out non-persistent buffers,
+    leaving parameters untouched
+
 ## [2.7.2] - 2024-01-30
 
 ### Fixed
@@ -280,6 +291,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.7.2...HEAD
 [2.7.2]: https://github.com/coreweave/tensorizer/compare/v2.7.1...v2.7.2
 [2.7.1]: https://github.com/coreweave/tensorizer/compare/v2.7.0...v2.7.1
 [2.7.0]: https://github.com/coreweave/tensorizer/compare/v2.6.0...v2.7.0
