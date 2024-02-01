@@ -238,14 +238,9 @@ def load_model(
     if model_prefix is None:
         model_prefix = "model"
 
-    begin_load = time.perf_counter()
-    ram_usage = utils.get_mem_usage()
-
     path_uri: str = path_uri.rstrip("/")
     config_uri: str = f"{path_uri}/{model_prefix}-config.json"
     tensors_uri: str = f"{path_uri}/{model_prefix}.tensors"
-
-    logger.info(f"Loading {tensors_uri}, {ram_usage}")
 
     if config_class is None:
         config_loader = model_class.load_config
@@ -268,6 +263,10 @@ def load_model(
         # method, while other classes can usually be instantiated directly.
         model_loader = getattr(model_class, "from_config", model_class)
         model = model_loader(config)
+
+    ram_usage = utils.get_mem_usage()
+    logger.info(f"Loading {tensors_uri}, {ram_usage}")
+    begin_load = time.perf_counter()
 
     with _read_stream(tensors_uri) as tensor_stream, TensorDeserializer(
         tensor_stream, device=device, dtype=dtype
