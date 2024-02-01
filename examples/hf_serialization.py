@@ -481,6 +481,8 @@ def main(argv=None) -> None:
         description=(
             "An example script that uses Tensorizer to serialize"
             " a HuggingFace model to an output directory or object storage."
+            " Supports HuggingFace transformers models"
+            " and Stable Diffusion v1.x diffusers models."
         )
     )
     parser.add_argument(
