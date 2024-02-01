@@ -21,6 +21,7 @@ from diffusers import (
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
+    AutoTokenizer,
     CLIPTextConfig,
     CLIPTextModel,
     PretrainedConfig,
@@ -438,6 +439,11 @@ def hf_main(args):
 
     serialize_model(model, model_config, output_prefix, force=args.force)
 
+    tokenizer = AutoTokenizer.from_pretrained(args.input_directory)
+    serialize_pretrained(
+        tokenizer, output_prefix, "tokenizer", force=args.force
+    )
+
     if args.validate:
         device = utils.get_device()
         model = model.to(device)
@@ -451,6 +457,11 @@ def hf_main(args):
             device,
             dtype,
         ).eval()
+        deserialized_tokenizer = load_pretrained(
+            AutoTokenizer, output_prefix, "tokenizer"
+        )
+        assert_tokenizer_equal(tokenizer, deserialized_tokenizer)
+
         # Comparing model parameters
         logger.debug("Testing for sameness of model parameters")
         assert_module_equal(model, tensorizer_model)
