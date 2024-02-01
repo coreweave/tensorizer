@@ -275,10 +275,14 @@ class TestSerialization(unittest.TestCase):
         self.assertTrue(torch.equal(tensor, deserialized_tensor))
 
     def test_persistent_buffers(self):
-        shape = (50, 50)
-        persistent_buffer = torch.normal(0, 0.5, shape)
-        non_persistent_buffer = torch.normal(0, 0.5, shape)
+        def random_tensor(shape=(50, 50)):
+            return torch.normal(0, 0.5, shape)
+
+        parameter = torch.nn.Parameter(random_tensor(), requires_grad=False)
+        persistent_buffer = random_tensor()
+        non_persistent_buffer = random_tensor()
         nested_module = torch.nn.Module()
+        nested_module.register_parameter("parameter", parameter)
         nested_module.register_buffer(
             "persistent_buffer", persistent_buffer, persistent=True
         )
@@ -291,11 +295,20 @@ class TestSerialization(unittest.TestCase):
         module.register_module("nested", nested_module)
         model = torch.nn.Module()
         model.register_module("module", module)
+        model.eval()
 
         for include in (True, False):
             with self.subTest(
                 msg=f"Testing include_non_persistent_buffers={include}"
             ):
+                expected: dict = {
+                    "module.nested.parameter": parameter,
+                    "module.nested.persistent_buffer": persistent_buffer,
+                }
+                if include:
+                    expected["module.nested.non_persistent_buffer"] = (
+                        non_persistent_buffer
+                    )
                 tensorized_file = tempfile.NamedTemporaryFile(
                     "wb+", delete=False
                 )
@@ -306,20 +319,22 @@ class TestSerialization(unittest.TestCase):
                     )
                     serializer.close()
 
-                    with open(tensorized_file.name, "rb") as in_file:
-                        with TensorDeserializer(
-                            in_file, device="cpu", lazy_load=True
-                        ) as deserializer:
-                            self.assertIn(
-                                "module.nested.persistent_buffer",
-                                deserializer.keys(),
-                            )
-                            assertion = (
-                                self.assertIn if include else self.assertNotIn
-                            )
-                            assertion(
-                                "module.nested.non_persistent_buffer",
-                                deserializer.keys(),
+                    with open(
+                        tensorized_file.name, "rb"
+                    ) as in_file, TensorDeserializer(
+                        in_file, device="cpu"
+                    ) as deserializer:
+                        self.assertSetEqual(
+                            set(deserializer.keys()),
+                            set(expected.keys()),
+                        )
+                        for name in deserializer.keys():
+                            self.assertTrue(
+                                torch.equal(deserializer[name], expected[name]),
+                                msg=(
+                                    f"Contents of tensor {name!r}"
+                                    " are different after deserialization"
+                                ),
                             )
                 finally:
                     os.unlink(tensorized_file.name)

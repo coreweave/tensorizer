@@ -3914,7 +3914,10 @@ class TensorSerializer:
         if not include_non_persistent_buffers:
             persistent = persistent_buffers()
             all_tensors = (
-                spec for spec in all_tensors if spec.name in persistent
+                spec
+                for spec in all_tensors
+                if spec.tensor_type != TensorType.BUFFER
+                or spec.name in persistent
             )
 
         self._bulk_write(all_tensors)
