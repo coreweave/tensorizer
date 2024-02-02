@@ -64,8 +64,14 @@ if torch.cuda.is_available():
 else:
     cudart = None
 
-cuda_to_device_millisecs = AtomicUint(width=8)
-cuda_bytes = AtomicUint(width=8)
+@dataclasses.dataclass
+class PerfStats:
+    file_readinto_millisecs: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
+    file_readinto_bytes: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
+    cuda_to_device_millisecs: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
+    cuda_bytes: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
+
+perf_stats = PerfStats()
 
 lz4 = None
 
@@ -2133,7 +2139,13 @@ class TensorDeserializer(
                     mv = memoryview(buffer)
 
                 if not self._encrypted or mv.nbytes == 0:
+                    global perf_stats
+                    assert mv.contiguous
+                    start = time.perf_counter()
                     self._file.readinto(mv)
+                    duration = time.perf_counter() - start
+                    perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
+                    perf_stats.file_readinto_bytes.add(mv.nbytes)
                 elif self._encrypted and mv.nbytes > 0:
                     with self._release_on_exc(mv):
                         self._stream_decrypt(encryption_method, key, mv)
@@ -2349,20 +2361,19 @@ class TensorDeserializer(
         assert not tensor.is_sparse
         assert not tensor.is_cuda
 
-        global cuda_bytes
-        global cuda_to_device_millisecs
+        global perf_stats
 
-        start = time.time()
+        start = time.perf_counter()
         tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
-        end = time.time()
-        cuda_to_device_millisecs.add(int(1000 * (end - start)))
+        duration = time.perf_counter() - start
+        perf_stats.cuda_to_device_millisecs.add(int(1000.0 * duration))
         # BCHESS: gradient?
 
         result = torch.nn.Parameter(
             tensor_on_device,
             requires_grad=gradient,
         )
-        cuda_bytes.add(result.nbytes)
+        perf_stats.cuda_bytes.add(result.nbytes)
         return result
 
     def _generate_state_dict(self) -> None:
@@ -3963,11 +3974,12 @@ class TensorSerializer:
         )
 
 
-def cuda_stats():
-    global cuda_bytes
-    global cuda_to_device_millisecs
+def get_perf_stats():
+    global perf_stats
 
     return dict(
-        cuda_to_device_secs=float(cuda_to_device_millisecs.load()) / 1000.0,
-        cuda_bytes=cuda_bytes.load()
+        cuda_to_device_secs=float(perf_stats.cuda_to_device_millisecs.load()) / 1000.0,
+        cuda_bytes=perf_stats.cuda_bytes.load(),
+        file_readinto_secs=float(perf_stats.file_readinto_millisecs.load()) / 1000.0,
+        file_readinto_bytes=perf_stats.file_readinto_bytes.load()
     )

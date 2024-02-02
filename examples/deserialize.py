@@ -53,5 +53,6 @@ with torch.no_grad():
     )
 
 print(f"Output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
-cuda_stats = tensorizer.serialization.cuda_stats()
-print(f"to CUDA stats: {cuda_stats['cuda_bytes']} bytes in {cuda_stats['cuda_to_device_secs']}s, {cuda_stats['cuda_bytes']/cuda_stats['cuda_to_device_secs']/1024/1024/1024:.3f} GiB/s")
+perf_stats = tensorizer.serialization.get_perf_stats()
+print(f"to CUDA stats: {perf_stats['cuda_bytes']} bytes in {perf_stats['cuda_to_device_secs']}s, {perf_stats['cuda_bytes']/perf_stats['cuda_to_device_secs']/1024/1024/1024:.3f} GiB/s")
+print(f"readinto stats: {perf_stats['file_readinto_bytes']} bytes in {perf_stats['file_readinto_secs']}s, {perf_stats['file_readinto_bytes']/perf_stats['file_readinto_secs']/1024/1024/1024:.3f} GiB/s")
