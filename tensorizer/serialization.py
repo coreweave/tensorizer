@@ -1379,7 +1379,7 @@ class TensorDeserializer(
             # Public `tensorized` bucket hosted by CoreWeave; see the docs
             s3_uri = f"s3://tensorized/{model_ref}/fp16/model.tensors"
 
-            deserializer = TensorDeserializer(s3_uri, plaid_mode=True)
+            deserializer = TensorDeserializer(s3_uri)
             deserializer.load_into_module(model)
 
         ## From a private S3 bucket::
@@ -1394,7 +1394,7 @@ class TensorDeserializer(
             )
             # Set up `model` as an empty torch.nn.Module in the shape of
             # my-model.tensors, then:
-            deserializer = TensorDeserializer(s3, plaid_mode=True)
+            deserializer = TensorDeserializer(s3)
             deserializer.load_into_module(model)
 
         .. _pre-serialized: https://github.com/coreweave/tensorizer/tree/main#available-pre-tensorized-models-on-the-coreweave-cloud
