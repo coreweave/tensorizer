@@ -17,6 +17,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the same device as other tensors
     - Essentially equivalent to `torch.zeros_like(meta_tensor, device=...)`
 
+### Changed
+
+- `TensorDeserializer` now defaults to `plaid_mode=True`
+  when deserializing to CUDA devices for better performance
+  - There is no difference between `plaid_mode`-deserialized tensors
+    and regular deserialized tensors (beyond deserialization performance),
+    so this is not a breaking change
+- Removed incorrect warnings in the documentation about `plaid_mode`
+  being unsafe
+
+### Fixed
+
+- Passing `include_non_persistent_buffers=False` to
+  `TensorSerializer.write_module()` now works as intended
+  - Previously, setting this flag to `False` filtered out both non-persistent
+    buffers **and** parameters, leaving only persistent buffers
+  - The corrected behaviour only filters out non-persistent buffers,
+    leaving parameters untouched
+
+## [2.7.2] - 2024-01-30
+
+### Fixed
+
+- File objects opened with `stream_io.open_stream("s3://...", "wb")` for writing
+  to object storage now correctly upload their content when closed implicitly
+  at the end of a `with` block, without requiring an explicit call to their
+  `.close()` method
+  - Since `TensorSerializer` objects already call `.close()` explicitly on
+    their output file objects, either when `TensorSerializer.close()` is invoked
+    or when the `TensorSerializer` is garbage collected, this bug mainly applies
+    to manual usage of `stream_io.open_stream()` for object storage uploads
+    not involving a `TensorSerializer`
+
 ## [2.7.1] - 2023-12-06
 
 ### Fixed
@@ -277,7 +310,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
-[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.7.1...HEAD
+[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.7.2...HEAD
+[2.7.2]: https://github.com/coreweave/tensorizer/compare/v2.7.1...v2.7.2
 [2.7.1]: https://github.com/coreweave/tensorizer/compare/v2.7.0...v2.7.1
 [2.7.0]: https://github.com/coreweave/tensorizer/compare/v2.6.0...v2.7.0
 [2.6.0]: https://github.com/coreweave/tensorizer/compare/v2.5.1...v2.6.0

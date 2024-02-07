@@ -1053,9 +1053,9 @@ def _infer_credentials(
 def _temp_file_closer(file: io.IOBase, file_name: str, *upload_args):
     """
     Close, upload by name, and then delete the file.
-    Meant to replace .close() on a particular instance
-    of a temporary file-like wrapper object, as an unbound
-    callback to a weakref.finalize() registration on the wrapper.
+    Meant to be placed as a hook before both .close() and .__exit__()
+    on a particular instance of a temporary file-like wrapper object,
+    as a callback to a weakref.finalize() registration on the wrapper.
 
     The reason this implementation is necessary is really complicated.
 
@@ -1077,17 +1077,6 @@ def _temp_file_closer(file: io.IOBase, file_name: str, *upload_args):
     so they have to buffer it all in memory.
     """
 
-    if file.closed:
-        # Makes closure idempotent.
-
-        # If the file object is used as a context
-        # manager, close() is called twice (once in the
-        # serializer code, once after, when leaving the
-        # context).
-
-        # Without this check, this would trigger two
-        # separate uploads.
-        return
     try:
         file.close()
         s3_upload(file_name, *upload_args)
@@ -1281,6 +1270,9 @@ def open_stream(
             # with primitive temporary file support (e.g. Windows)
             temp_file = tempfile.NamedTemporaryFile(mode="wb+", delete=False)
 
+            # Attach a callback to upload the temporary file when it closes.
+            # weakref finalizers are idempotent, so this upload callback
+            # is guaranteed to run at most once.
             guaranteed_closer = weakref.finalize(
                 temp_file,
                 _temp_file_closer,
@@ -1291,7 +1283,35 @@ def open_stream(
                 s3_secret_access_key,
                 s3_endpoint,
             )
-            temp_file.close = guaranteed_closer
+
+            # Always run the close + upload procedure
+            # before any code from Python's NamedTemporaryFile wrapper.
+            # It isn't safe to call a bound method from a weakref finalizer,
+            # but calling a weakref finalizer alongside a bound method
+            # creates no problems, other than that the code outside the
+            # finalizer is not guaranteed to be run at any point.
+            # In this case, the weakref finalizer performs all necessary
+            # cleanup itself, but the original NamedTemporaryFile methods
+            # are invoked as well, just in case.
+            wrapped_close = temp_file.close
+
+            def close_wrapper():
+                guaranteed_closer()
+                return wrapped_close()
+
+            # Python 3.12+ doesn't call NamedTemporaryFile.close() during
+            # .__exit__(), so it must be wrapped separately.
+            # Since guaranteed_closer is idempotent, it's fine to call it in
+            # both methods, even if both are called back-to-back.
+            wrapped_exit = temp_file.__exit__
+
+            def exit_wrapper(exc, value, tb):
+                guaranteed_closer()
+                return wrapped_exit(exc, value, tb)
+
+            temp_file.close = close_wrapper
+            temp_file.__exit__ = exit_wrapper
+
             return temp_file
         else:
             s3_endpoint = s3_endpoint or default_s3_read_endpoint
