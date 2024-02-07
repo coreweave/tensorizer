@@ -23,7 +23,7 @@ before_mem = get_mem_usage()
 
 # Lazy load the tensors from S3 into the model.
 start = time.time()
-deserializer = TensorDeserializer(s3_uri, plaid_mode=True)
+deserializer = TensorDeserializer(s3_uri)
 deserializer.load_into_module(model)
 end = time.time()
 

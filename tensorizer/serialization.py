@@ -1347,10 +1347,8 @@ class TensorDeserializer(
             accessed. If False, all tensors will be loaded into memory up
             front.
         plaid_mode: If True, tensors will be loaded extremely fast into the
-            target device. This is only supported on CUDA devices, and the
-            buffers are going to be inconsistent due to the extreme
-            naughtiness of reusing a backing buffer. This is only recommended
-            for use with inference, and not training.
+            target device. This is only supported on CUDA devices.
+            Defaults to True on CUDA devices and False for CPU loading.
         plaid_mode_buffers: The number of buffers to use in plaid mode. This
             is only used if ``plaid_mode=True``. These buffers are used to
             pipeline the loading and processing of tensors.
@@ -1381,7 +1379,7 @@ class TensorDeserializer(
             # Public `tensorized` bucket hosted by CoreWeave; see the docs
             s3_uri = f"s3://tensorized/{model_ref}/fp16/model.tensors"
 
-            deserializer = TensorDeserializer(s3_uri, plaid_mode=True)
+            deserializer = TensorDeserializer(s3_uri)
             deserializer.load_into_module(model)
 
         ## From a private S3 bucket::
@@ -1396,7 +1394,7 @@ class TensorDeserializer(
             )
             # Set up `model` as an empty torch.nn.Module in the shape of
             # my-model.tensors, then:
-            deserializer = TensorDeserializer(s3, plaid_mode=True)
+            deserializer = TensorDeserializer(s3)
             deserializer.load_into_module(model)
 
         .. _pre-serialized: https://github.com/coreweave/tensorizer/tree/main#available-pre-tensorized-models-on-the-coreweave-cloud
@@ -1418,7 +1416,7 @@ class TensorDeserializer(
         dtype: Optional[torch.dtype] = None,
         *,
         lazy_load: bool = False,
-        plaid_mode: bool = False,
+        plaid_mode: Optional[bool] = None,
         plaid_mode_buffers: Optional[int] = None,
         verify_hash: bool = False,
         encryption: Optional[DecryptionParams] = None,
@@ -1477,7 +1475,7 @@ class TensorDeserializer(
                 utils.get_device() if device is None else torch.device(device)
             )
             self._device: torch.device = device
-            is_cuda = self._device.type == "cuda"
+            is_cuda: bool = self._device.type == "cuda"
             if is_cuda and not torch.cuda.is_available():
                 raise RuntimeError(
                     "Cannot deserialize to CUDA device"
@@ -1486,7 +1484,9 @@ class TensorDeserializer(
 
             self._dtype: Optional[torch.dtype] = dtype
 
-            self._plaid_mode: bool = plaid_mode
+            self._plaid_mode: bool = (
+                is_cuda if plaid_mode is None else plaid_mode
+            )
 
             self._lazy_load: bool = lazy_load
 
@@ -1555,6 +1555,7 @@ class TensorDeserializer(
                     for name, entry in self._metadata.items()
                     if filter_func(name)
                 }
+            num_tensors: int = len(self._metadata)
 
             # We calculate the total tensor bytes here so that we can use mmap,
             # based on the total size of the tensors that we're going to read,
@@ -1576,6 +1577,9 @@ class TensorDeserializer(
                 self._plaid_mode_buffer_count = 1
             else:
                 self._plaid_mode_buffer_count = 2
+            self._plaid_mode_buffer_count = (
+                min(num_tensors, self._plaid_mode_buffer_count) or 1
+            )
             single_largest_tensor = max(tensor_sizes.values(), default=0)
             # Round up to the nearest multiple of the page size
             # Just so that more reads happen on page boundaries
@@ -1587,6 +1591,22 @@ class TensorDeserializer(
             ) * self._plaid_mode_buffer_count
 
             self._buffers = {}
+
+            if logger.isEnabledFor(logging.DEBUG):
+                # Skip creating this string unless debug logging is enabled
+                logger.debug(
+                    f"Deserializing {self.total_tensor_bytes} bytes"
+                    f" from {num_tensors}"
+                    f" tensor{'s' * (num_tensors != 1)} using"
+                    f" plaid_mode={self._plaid_mode},"
+                    " plaid_mode_buffers="
+                    f"{self._plaid_mode_buffer_count * self._plaid_mode},"
+                    f" lazy_load={self._lazy_load},"
+                    f" verify_hash={self._verify_hash},"
+                    f" encrypted={bool(self._encrypted)},"
+                    f" device={self._device},"
+                    f" dtype={self._dtype}"
+                )
 
             # Allocate the buffer for the tensors.
             # Check if our platform supports mmap.MAP_ANONYMOUS and
@@ -2112,11 +2132,9 @@ class TensorDeserializer(
                     self._allocated += header.data_length
                 elif self._plaid_mode:
                     # In plaid_mode, we don't allocate a buffer, we just
-                    # reuse the same one. This is a filthy hack, as we're
-                    # overwriting the buffer contents that is used to back
-                    # the prior tensor. This works because we don't use
-                    # the buffer contents after we yield the tensor, which
-                    # is loaded straight into the GPU memory.
+                    # reuse the same one. Since we're overwriting previously
+                    # loaded tensors, this only works for CUDA tensors that have
+                    # already been moved out of this CPU RAM buffer to GPU RAM.
                     mv = self._buffers[header.name]
                 else:
                     # In lazy_load mode, we allocate a new buffer for each

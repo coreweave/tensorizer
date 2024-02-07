@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `TensorDeserializer` now defaults to `plaid_mode=True`
+  when deserializing to CUDA devices for better performance
+  - There is no difference between `plaid_mode`-deserialized tensors
+    and regular deserialized tensors (beyond deserialization performance),
+    so this is not a breaking change
+- Removed incorrect warnings in the documentation about `plaid_mode`
+  being unsafe
+
 ### Fixed
 
 - Passing `include_non_persistent_buffers=False` to
