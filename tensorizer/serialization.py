@@ -1347,10 +1347,8 @@ class TensorDeserializer(
             accessed. If False, all tensors will be loaded into memory up
             front.
         plaid_mode: If True, tensors will be loaded extremely fast into the
-            target device. This is only supported on CUDA devices, and the
-            buffers are going to be inconsistent due to the extreme
-            naughtiness of reusing a backing buffer. This is only recommended
-            for use with inference, and not training.
+            target device. This is only supported on CUDA devices.
+            Defaults to True on CUDA devices and False for CPU loading.
         plaid_mode_buffers: The number of buffers to use in plaid mode. This
             is only used if ``plaid_mode=True``. These buffers are used to
             pipeline the loading and processing of tensors.
@@ -1418,7 +1416,7 @@ class TensorDeserializer(
         dtype: Optional[torch.dtype] = None,
         *,
         lazy_load: bool = False,
-        plaid_mode: bool = False,
+        plaid_mode: Optional[bool] = None,
         plaid_mode_buffers: Optional[int] = None,
         verify_hash: bool = False,
         encryption: Optional[DecryptionParams] = None,
@@ -1477,7 +1475,7 @@ class TensorDeserializer(
                 utils.get_device() if device is None else torch.device(device)
             )
             self._device: torch.device = device
-            is_cuda = self._device.type == "cuda"
+            is_cuda: bool = self._device.type == "cuda"
             if is_cuda and not torch.cuda.is_available():
                 raise RuntimeError(
                     "Cannot deserialize to CUDA device"
@@ -1486,7 +1484,9 @@ class TensorDeserializer(
 
             self._dtype: Optional[torch.dtype] = dtype
 
-            self._plaid_mode: bool = plaid_mode
+            self._plaid_mode: bool = (
+                is_cuda if plaid_mode is None else plaid_mode
+            )
 
             self._lazy_load: bool = lazy_load
 
@@ -2112,11 +2112,9 @@ class TensorDeserializer(
                     self._allocated += header.data_length
                 elif self._plaid_mode:
                     # In plaid_mode, we don't allocate a buffer, we just
-                    # reuse the same one. This is a filthy hack, as we're
-                    # overwriting the buffer contents that is used to back
-                    # the prior tensor. This works because we don't use
-                    # the buffer contents after we yield the tensor, which
-                    # is loaded straight into the GPU memory.
+                    # reuse the same one. Since we're overwriting previously
+                    # loaded tensors, this only works for CUDA tensors that have
+                    # already been moved out of this CPU RAM buffer to GPU RAM.
                     mv = self._buffers[header.name]
                 else:
                     # In lazy_load mode, we allocate a new buffer for each
