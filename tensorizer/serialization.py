@@ -1555,6 +1555,7 @@ class TensorDeserializer(
                     for name, entry in self._metadata.items()
                     if filter_func(name)
                 }
+            num_tensors: int = len(self._metadata)
 
             # We calculate the total tensor bytes here so that we can use mmap,
             # based on the total size of the tensors that we're going to read,
@@ -1576,6 +1577,9 @@ class TensorDeserializer(
                 self._plaid_mode_buffer_count = 1
             else:
                 self._plaid_mode_buffer_count = 2
+            self._plaid_mode_buffer_count = (
+                min(num_tensors, self._plaid_mode_buffer_count) or 1
+            )
             single_largest_tensor = max(tensor_sizes.values(), default=0)
             # Round up to the nearest multiple of the page size
             # Just so that more reads happen on page boundaries
@@ -1587,6 +1591,22 @@ class TensorDeserializer(
             ) * self._plaid_mode_buffer_count
 
             self._buffers = {}
+
+            if logger.isEnabledFor(logging.DEBUG):
+                # Skip creating this string unless debug logging is enabled
+                logger.debug(
+                    f"Deserializing {self.total_tensor_bytes} bytes"
+                    f" from {num_tensors}"
+                    f" tensor{'s' * (num_tensors != 1)} using"
+                    f" plaid_mode={self._plaid_mode},"
+                    " plaid_mode_buffers="
+                    f"{self._plaid_mode_buffer_count * self._plaid_mode},"
+                    f" lazy_load={self._lazy_load},"
+                    f" verify_hash={self._verify_hash},"
+                    f" encrypted={bool(self._encrypted)},"
+                    f" device={self._device},"
+                    f" dtype={self._dtype}"
+                )
 
             # Allocate the buffer for the tensors.
             # Check if our platform supports mmap.MAP_ANONYMOUS and
