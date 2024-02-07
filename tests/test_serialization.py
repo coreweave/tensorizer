@@ -484,7 +484,6 @@ class TestEncryption(unittest.TestCase):
         incorrect_decryption: DecryptionParams,
     ):
         device = default_device
-        plaid_mode = device != "cpu"
 
         with self._serialize(encryption, device) as encrypted_model:
             # Ensure that it works when given a key
@@ -492,12 +491,10 @@ class TestEncryption(unittest.TestCase):
                 msg="Deserializing with a correct key",
                 device=device,
                 lazy_load=False,
-                plaid_mode=plaid_mode,
             ), open(encrypted_model, "rb") as in_file, TensorDeserializer(
                 in_file,
                 device=device,
                 lazy_load=False,
-                plaid_mode=plaid_mode,
                 verify_hash=True,
                 encryption=decryption,
             ) as deserialized:
@@ -553,6 +550,9 @@ class TestDeserialization(unittest.TestCase):
     def tearDownClass(cls):
         os.unlink(cls._serialized_model_path)
 
+    def open_serialized(self):
+        return open(self._serialized_model_path, "rb")
+
     def test_default_cpu(self):
         in_file = open(self._serialized_model_path, "rb")
         gc.collect()
@@ -575,40 +575,33 @@ class TestDeserialization(unittest.TestCase):
         deserialized.close()
         print(f"Before deserialization: {before_deserialization}")
         print(f"After deserialization:  {after_deserialization}")
-        del in_file
+        del in_file, deserialized
         gc.collect()
         after_del = utils.get_mem_usage()
         print(f"After del: {after_del}")
 
     def test_lazy_load(self):
-        in_file = open(self._serialized_model_path, "rb")
-        deserialized = TensorDeserializer(
-            in_file, device=default_device, lazy_load=True
-        )
+        for plaid_mode in (True, False):
+            if plaid_mode and default_device == "cpu":
+                continue
+            with self.subTest(
+                f"Testing lazy_load=True with plaid_mode={plaid_mode}"
+            ), self.open_serialized() as in_file, TensorDeserializer(
+                in_file,
+                device=default_device,
+                lazy_load=True,
+                plaid_mode=plaid_mode,
+            ) as deserialized:
+                check_deserialized(self, deserialized, model_name)
+                check_inference(self, deserialized, model_name, default_device)
 
-        check_deserialized(self, deserialized, model_name)
-        check_inference(self, deserialized, model_name, default_device)
-        deserialized.close()
-
-    @unittest.skipIf(not is_cuda_available, "plaid_mode requires CUDA")
-    def test_plaid_mode(self):
-        in_file = open(self._serialized_model_path, "rb")
-        deserialized = TensorDeserializer(
-            in_file, device="cuda", plaid_mode=True
-        )
-
-        check_deserialized(self, deserialized, model_name)
-        deserialized.close()
-
-    @unittest.skipIf(not is_cuda_available, "plaid_mode requires CUDA")
-    def test_plaid_mode_inference(self):
-        in_file = open(self._serialized_model_path, "rb")
-        deserialized = TensorDeserializer(
-            in_file, device="cuda", plaid_mode=True
-        )
-
-        check_inference(self, deserialized, model_name, "cuda")
-        deserialized.close()
+    @unittest.skipIf(not is_cuda_available, "Requires CUDA")
+    def test_cuda_non_plaid_mode(self):
+        with self.open_serialized() as in_file, TensorDeserializer(
+            in_file, device="cuda", plaid_mode=False
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            check_inference(self, deserialized, model_name, "cuda")
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
     @patch.object(stream_io, "default_s3_read_endpoint", default_read_endpoint)
