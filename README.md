@@ -442,17 +442,18 @@ of a model if you use the `accel-object.ord1.coreweave.com` endpoint.
 just a serialization/deserialization tool.
 
 ### Plaid Mode
-`tensorizer` has a `plaid_mode` argument that can be passed to the
-`TensorDeserializer` class. When `plaid_mode` is `True`, `tensorizer`
-will load the tensors extremely fast. This is done by loading the tensors
-into a `torch.nn.Module` that is not initialized, by overriding the
-`__init__` method of the `torch.nn.Module` to do nothing.
 
-The tensors are them loaded into a buffer, and the buffer is zero-copied
-into the uninitialized `torch.nn.Module`. This is unsafe, and should only
-be used in inference cases where the model is not being trained.
+`tensorizer` has a `plaid_mode` argument that can be passed to the
+`TensorDeserializer` class when deserializing tensors to the GPU.
+When `plaid_mode` is `True`, `tensorizer` will load tensors extremely fast
+by reusing a single small CPU buffer as a staging area to load tensors before
+transferring them to the GPU through DMA.
+This can also greatly decrease CPU RAM usage during deserialization.
+
+`plaid_mode` is enabled by default when available.
 
 ### `state_dict` Support
+
 The `TensorDeserializer` object can be used as-is as a `state_dict` for
 `torch.nn.Module.load_state_dict`. This is useful for loading the tensors
 into a `torch.nn.Module` that is already initialized, or for inspection.
