@@ -1,3 +1,6 @@
+import viztracer
+
+import argparse
 import time
 import torch
 from tensorizer import TensorDeserializer
@@ -6,14 +9,26 @@ from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
-model_ref = "EleutherAI/gpt-j-6B"
+
+parser = argparse.ArgumentParser('deserialize')
+parser.add_argument('--source', default=None, help='local path or URL')
+parser.add_argument('--model-ref', default="EleutherAI/gpt-j-6B")
+parser.add_argument('--no-plaid', action='store_true')
+
+args = parser.parse_args()
+
+model_ref = args.model_ref
 # To run this at home, swap this with the line below for a smaller example:
 # model_ref = "EleutherAI/gpt-neo-125M"
 model_name = model_ref.split("/")[-1]
 
+if args.source is None:
+    args.source = f"/scratch/{model_name}.tensors"
 # Change this to your S3 bucket.
 # s3_bucket = "bucket"
 # s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
+
+tracer = viztracer.VizTracer()
 
 config = AutoConfig.from_pretrained(model_ref)
 
@@ -23,11 +38,15 @@ with no_init_or_tensor():
 
 before_mem = get_mem_usage()
 
+
 # Lazy load the tensors from S3 into the model.
+tracer.start()
 start = time.time()
-deserializer = TensorDeserializer(f"/scratch/{model_name}.tensors", plaid_mode=True)
+deserializer = TensorDeserializer(args.source, plaid_mode=not args.no_plaid, num_readers=1)
 deserializer.load_into_module(model)
 end = time.time()
+tracer.stop()
+tracer.save()
 
 # Brag about how fast we are.
 total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
