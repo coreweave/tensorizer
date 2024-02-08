@@ -1948,8 +1948,13 @@ class TensorDeserializer(
         method = typing.cast(_crypt_info.KeyDerivationChunk, kd[0])
         return self._key_derivation.key(method)
 
+    @classmethod
     def _get_decryption_manager(
-        self, encryption_method: _crypt_info.CryptInfoChunk, key: bytes, buffer
+        cls,
+        decryption_pool: Optional[concurrent.futures.ThreadPoolExecutor],
+        encryption_method: _crypt_info.CryptInfoChunk,
+        key: bytes,
+        buffer
     ) -> Union["_crypt.ChunkedEncryption", "_crypt.SequentialEncryption"]:
         if isinstance(encryption_method, _crypt_info.XSalsa20ParallelChunk):
             if encryption_method.num_macs == 1:
@@ -1971,7 +1976,7 @@ class TensorDeserializer(
                     chunk_size=encryption_method.chunk_size,
                     nonces=nonces,
                     macs=encryption_method.macs,
-                    executor=self._decryption_pool,
+                    executor=decryption_pool,
                     intent=_crypt.ChunkedEncryption.INTENT.DECRYPTION,
                 )
         elif isinstance(encryption_method, _crypt_info.XSalsa20SequentialChunk):
@@ -1985,22 +1990,31 @@ class TensorDeserializer(
         else:
             raise CryptographyError("Unknown encryption method")
 
+    @classmethod
     def _stream_decrypt(
-        self, encryption_method: _crypt_info.CryptInfoChunk, key: bytes, buffer
+        cls,
+        file_,
+        decryption_pool: Optional[concurrent.futures.ThreadPoolExecutor],
+        encryption_method: _crypt_info.CryptInfoChunk,
+        key: bytes,
+        buffer
     ):
         try:
-            with self._get_decryption_manager(
-                encryption_method, key, buffer
+            with cls._get_decryption_manager(
+                decryption_pool, 
+                encryption_method,
+                key,
+                buffer
             ) as crypto:
                 if isinstance(crypto, _crypt.ChunkedEncryption):
                     fs = []
                     for chunk in range(crypto.num_chunks):
                         with crypto.chunk_view(chunk) as view:
-                            self._file.readinto(view)
+                            file_.readinto(view)
                         fs.append(crypto.decrypt_chunk(chunk))
                     crypto.wait_or_raise(fs, timeout=_TIMEOUT)
                 else:
-                    self._file.readinto(buffer)
+                    file_.readinto(buffer)
                     crypto.decrypt()
         except _crypt.CryptographyError as e:
             raise CryptographyError("Tensor decryption failed") from e
@@ -2570,6 +2584,7 @@ class TensorDeserializer(
 
         copy_threads = []
         barrier = threading.Barrier(len(tensors_per_reader))
+        halt = AtomicUint(width=4)
         for thread_idx, tensor_items in enumerate(tensors_per_reader):
             print(f'Thread #{thread_idx} will read {len(tensor_items)} tensors, {sum(v for _, v in tensor_items)/1024/1024:.3f}MiB, {max(v for _, v in tensor_items)/1024/1024:.3f}MiB max', file=sys.stderr)
 
@@ -2578,6 +2593,7 @@ class TensorDeserializer(
                 target=self._copy_thread,
                 args=(
                     thread_idx,
+                    halt,
                     barrier,
                     tensor_items,
                     transfer_out_queue)
@@ -2587,6 +2603,11 @@ class TensorDeserializer(
 
         for _ in range(len(keys)):
             name, result = transfer_out_queue.get()
+            if name is None and isinstance(result, Exception):
+                halt.store(1)
+                # error occurred; halt
+                raise result
+
             self._cache[name] = result
             yield name, result
 
@@ -2819,7 +2840,7 @@ class TensorDeserializer(
                     check.cancel()
                 raise
 
-    def _copy_thread(unsafe_self, thread_idx, barrier, tensor_items, transfer_out_queue):
+    def _copy_thread(unsafe_self, thread_idx, halt, barrier, tensor_items, transfer_out_queue):
         # Need to get rid of self or more safely have thread-local storage
 
         # cuda stream. First one is slow, spin it off? This is gross
@@ -2847,7 +2868,7 @@ class TensorDeserializer(
         end_offset = unsafe_self._metadata[tensor_items[-1][0]].data_offset + unsafe_self._metadata[tensor_items[-1][0]].data_length
         file_ = stream_io.open_stream(unsafe_self._file_spec, "rb", begin=begin_offset, end=end_offset, force_http=True)
 
-        with(contextlib.closing(file_)):  # TODO: I don't like so much indentation
+        try:
             # create CPU-pinned memory buffer
             # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
             total_tensor_bytes = max(size for _, size in tensor_items)
@@ -2860,6 +2881,9 @@ class TensorDeserializer(
             # then for each tensor in tensor_items
             tensors_read = 0
             while tensors_read < len(tensor_items):
+                if halt.load() > 0:
+                    break
+
                 header = _TensorHeaderDeserializer.from_io(
                     file_,
                     zero_hashes=True,
@@ -2919,13 +2943,19 @@ class TensorDeserializer(
                 global perf_stats
                 start = time.perf_counter()
 
-                bytes_read = file_.readinto(mv)
+                if unsafe_self._encrypted and mv.nbytes > 0:
+                    TensorDeserializer._stream_decrypt(
+                        file_,
+                        unsafe_self._decryption_pool, # decryption_pool safe to be shared
+                        encryption_method,
+                        key,
+                        mv)
+                else:
+                    file_.readinto(mv)
 
                 duration = time.perf_counter() - start
                 perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
                 perf_stats.file_readinto_bytes.add(mv.nbytes)
-
-                assert bytes_read == header.data_length, f"Only read {bytes_read} vs {header.data_length}"
 
                 # create a tensor around it and torch.to('cuda')
                 # buffer_tensor.view(numpy_dtype) ?
@@ -2945,8 +2975,10 @@ class TensorDeserializer(
                 # put it on transfer_out_queue
                 transfer_out_queue.put((header.name, parameter))
                 tensors_read += 1
-
-
+        except Exception as e:
+            transfer_out_queue.put((None, e))
+        finally:
+            file_.close()
 
 
     def load_into_module(
