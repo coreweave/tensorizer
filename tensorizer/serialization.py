@@ -2397,7 +2397,7 @@ class TensorDeserializer(
             return
         with contextlib.ExitStack() as exit_stack:
             tensor_sizes = [
-                (key, self._metadata[key].data_length) for key in keys
+                (key, self._metadata[key].deserialized_length) for key in keys
             ]
             optimized_buffers = self._buffers.copy()
             with memoryview(self._buffer) as mv:
