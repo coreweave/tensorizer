@@ -117,11 +117,22 @@ class TensorType(Enum):
     STATE_DICT = 2
 
 
+# Current version
+TENSORIZER_VERSION = 4
+
+# To serialize meta tensors into metadata-only tensors
+# that deserialize back into zeroed-out buffers, data version 4 is required.
+META_TENSOR_TENSORIZER_VERSION = 4
+
+# To (de)serialize tensors with encryption, data version 3 is required.
+ENCRYPTION_TENSORIZER_VERSION = 3
+
 # If tensors with "opaque" dtypes (those that are not supported by numpy) are
 # saved, then a tensorizer data version of 2 is required to (de)serialize the
-# file. Otherwise, the file is compatible with tensorizer data version 1
-TENSORIZER_VERSION = 3
+# file.
 OPAQUE_TENSORIZER_VERSION = 2
+
+# Otherwise, the file is compatible with tensorizer data version 1.
 NON_OPAQUE_TENSORIZER_VERSION = 1
 
 TENSORIZER_MAGIC = b"|TZR|"
@@ -175,20 +186,30 @@ class TensorEntry:
         return element_size * num_elements
 
 
+class _FileFeatureFlags(enum.IntFlag):
+    encrypted = enum.auto()
+
+
 @dataclasses.dataclass
 class _FileHeader:
-    __slots__ = ("version_number", "tensor_size", "tensor_count")
+    __slots__ = (
+        "version_number",
+        "feature_flags",
+        "tensor_size",
+        "tensor_count",
+    )
     version_number_format: ClassVar[struct.Struct] = struct.Struct(
         "<I"  # Little-endian version number
     )
     format: ClassVar[struct.Struct] = struct.Struct(
         "<"
-        "32x"  # File hash (unused)
+        "32s"  # File feature flags, in data version 4+, otherwise empty
         "Q"  # Total size of tensor data (nominally, total file size)
         "8x"  # Nominally, total size of tensor data (actually unused)
         "Q"  # Total number of tensors
     )
     version_number: int
+    feature_flags: _FileFeatureFlags
     tensor_size: int
     tensor_count: int
 
@@ -200,9 +221,15 @@ class _FileHeader:
             self.version = version
 
     def to_bytes(self) -> bytes:
+        if self.version_number >= META_TENSOR_TENSORIZER_VERSION:
+            feature_flags: bytes = self.feature_flags.to_bytes(
+                32, "little", signed=False
+            )
+        else:
+            feature_flags: bytes = bytes(32)
         return self.version_number_format.pack(
             self.version_number
-        ) + self.format.pack(self.tensor_size, self.tensor_count)
+        ) + self.format.pack(feature_flags, self.tensor_size, self.tensor_count)
 
     @classmethod
     def from_io(
@@ -212,12 +239,15 @@ class _FileHeader:
             reader.read(cls.version_number_format.size)
         )[0]
         if version_number not in accepted_versions:
+            accepted_versions_str: str = ", ".join(
+                map(str, sorted(set(accepted_versions)))
+            )
             message = (
                 "Unsupported version: this data stream uses tensorizer"
                 f" data version {version_number}, which is not supported"
                 " in this release of tensorizer, or"
                 " for the serialization/deserialization features selected."
-                f"\nSupported data versions: {tuple(accepted_versions)}"
+                f"\nSupported data versions: {accepted_versions_str}"
             )
             raise cls.InvalidVersionError(message, version=version_number)
         data = reader.read(cls.format.size)
@@ -225,7 +255,16 @@ class _FileHeader:
             raise ValueError(
                 "File too small: ran out of data before reading a full header"
             )
-        return cls(version_number, *cls.format.unpack(data))
+        feature_flag_bytes, tensor_size, tensor_count = cls.format.unpack(data)
+        feature_flag_int = int.from_bytes(
+            feature_flag_bytes, "little", signed=False
+        )
+        feature_flags = _FileFeatureFlags(feature_flag_int)
+        if not (0 <= feature_flags <= max(_FileFeatureFlags)):
+            raise ValueError(
+                f"Unsupported feature flags: {_FileFeatureFlags!r}"
+            )
+        return cls(version_number, feature_flags, tensor_size, tensor_count)
 
 
 @dataclasses.dataclass(init=False)
@@ -310,10 +349,6 @@ class _TensorHeaderSerializer:
         "Q"  # Tensor length
     )
     metadata_entry: bytes
-
-    @classmethod
-    def decode(cls):
-        pass
 
     def __init__(
         self,
@@ -1508,14 +1543,18 @@ class TensorDeserializer(
             if magic != TENSORIZER_MAGIC:
                 raise ValueError("Not a tensorizer file")
 
-            # Read the file header
+            # Read the file header and check for a compatible data version
+            accepted_versions = (
+                NON_OPAQUE_TENSORIZER_VERSION,
+                OPAQUE_TENSORIZER_VERSION,
+                ENCRYPTION_TENSORIZER_VERSION,
+                META_TENSOR_TENSORIZER_VERSION,
+                TENSORIZER_VERSION,
+            )
+            encryption_ver: int = ENCRYPTION_TENSORIZER_VERSION
             if self._encrypted:
-                accepted_versions = (TENSORIZER_VERSION,)
-            else:
-                accepted_versions = (
-                    NON_OPAQUE_TENSORIZER_VERSION,
-                    OPAQUE_TENSORIZER_VERSION,
-                    TENSORIZER_VERSION,
+                accepted_versions = tuple(
+                    filter(lambda v: v >= encryption_ver, accepted_versions)
                 )
             try:
                 self._file_header = _FileHeader.from_io(
@@ -1536,9 +1575,23 @@ class TensorDeserializer(
                 else:
                     raise
 
+            version_number: int = self._file_header.version_number
             self._has_crypt_info: bool = (
-                self._file_header.version_number >= TENSORIZER_VERSION
+                version_number == encryption_ver
+                or version_number >= META_TENSOR_TENSORIZER_VERSION
+                and _FileFeatureFlags.encrypted in self._file_flags
             )
+            if self._encrypted and not self._has_crypt_info:
+                raise CryptographyError(
+                    "Tensor decryption was requested,"
+                    " but the file provided is not flagged as encrypted."
+                    " Either set encryption=None on the TensorDeserializer,"
+                    " or ensure that the correct file was provided."
+                )
+            elif self._has_crypt_info and not self._encrypted:
+                raise CryptographyError(
+                    "Tensor is encrypted, but decryption was not requested"
+                )
 
             # The total size of the file.
             # WARNING: this is not accurate. This field isn't used in the
@@ -1613,7 +1666,8 @@ class TensorDeserializer(
                     f" verify_hash={self._verify_hash},"
                     f" encrypted={bool(self._encrypted)},"
                     f" device={self._device},"
-                    f" dtype={self._dtype}"
+                    f" dtype={self._dtype},"
+                    f" data_version={self._file_header.version_number}"
                 )
 
             # Allocate the buffer for the tensors.
@@ -1732,6 +1786,14 @@ class TensorDeserializer(
             # around the CPU buffers anymore, and we can clean up early.
             if self._lazy_load or not is_cuda:
                 self._cleanup = self._cleanup.pop_all()
+
+    @property
+    def _file_flags(self) -> _FileFeatureFlags:
+        return self._file_header.feature_flags
+
+    @_file_flags.setter
+    def _file_flags(self, val: _FileFeatureFlags):
+        self._file_header.feature_flags = val
 
     @staticmethod
     def _mode_check(file_obj: io.IOBase) -> None:
@@ -1879,7 +1941,7 @@ class TensorDeserializer(
 
         Args:
             hashes: The list of hashes to verify.
-            headers: The headers of the tensor.
+            header_hashes: The pre-computed hashes for the tensor's headers.
             mv: The memoryview of the tensor data.
         """
         metadata_entry = self._metadata.get(name)
@@ -3126,16 +3188,22 @@ class TensorSerializer:
 
         # Write file header metadata
         if not self._encrypted:
-            # Can't tell if OPAQUE_TENSORIZER_VERSION is needed
-            # until a tensor is written later with an opaque dtype,
-            # so assume it is non-opaque until then.
+            # Can't tell if OPAQUE_TENSORIZER_VERSION
+            # or META_TENSOR_TENSORIZER_VERSION are needed
+            # until a tensor is written later with an opaque dtype
+            # or from the meta device,
+            # so assume it is compatible with version 1 until then.
             version_number = NON_OPAQUE_TENSORIZER_VERSION
         else:
             # File encryption requires a newer tensorizer version
-            version_number = TENSORIZER_VERSION
+            version_number = ENCRYPTION_TENSORIZER_VERSION
+        feature_flags = _FileFeatureFlags(0)
+        if self._encrypted:
+            feature_flags |= _FileFeatureFlags.encrypted
         self._file_header_loc = self._file.tell()
         self._file_header = _FileHeader(
             version_number=version_number,
+            feature_flags=feature_flags,
             tensor_size=0,
             tensor_count=0,
         )
@@ -3408,6 +3476,10 @@ class TensorSerializer:
                     _temporary_buffer = True
                 numpy_tensor = _NumpyTensor.from_tensor(tensor.contiguous())
             else:
+                self._file_header.version_number = max(
+                    META_TENSOR_TENSORIZER_VERSION,
+                    self._file_header.version_number,
+                )
                 _temporary_buffer = True
                 hollow_tensor = torch.empty(
                     (0,) * tensor.ndim, device="cpu", dtype=tensor.dtype
@@ -3481,7 +3553,9 @@ class TensorSerializer:
             crypt_info = _crypt_info.CryptInfo(chunks)
         else:
             encryptor = None
-            if self._file_header.version_number == TENSORIZER_VERSION:
+            if _FileFeatureFlags.encrypted in self._file_header.feature_flags:
+                # If the `encrypted` flag is present, all headers are expected
+                # to have crypt_info segments, so add an empty one
                 crypt_info = _crypt_info.CryptInfo()
             else:
                 crypt_info = None
