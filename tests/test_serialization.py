@@ -5,13 +5,15 @@ import functools
 import gc
 import hashlib
 import itertools
+import logging
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 import unittest
-from typing import Mapping, NamedTuple, Optional
+from typing import Iterator, Mapping, NamedTuple, Optional
 from unittest.mock import patch
 
 import torch
@@ -45,6 +47,32 @@ is_cuda_available = torch.cuda.is_available()
 default_device = "cuda" if is_cuda_available else "cpu"
 salt = secrets.token_bytes(4)
 default_read_endpoint = "object.ord1.coreweave.com"
+
+
+def _stdout_handler(level=logging.DEBUG) -> logging.Handler:
+    handler = logging.StreamHandler(stream=sys.stdout)
+    formatter = logging.Formatter("%(levelname)s %(name)s: %(msg)s")
+    handler.setFormatter(formatter)
+    handler.setLevel(level)
+    return handler
+
+
+debug_handler = _stdout_handler()
+
+
+@contextlib.contextmanager
+def debug_log():
+    serialization.logger.addHandler(debug_handler)
+    must_enable: bool = not serialization.logger.isEnabledFor(logging.DEBUG)
+    old_level = serialization.logger.level
+    if must_enable:
+        serialization.logger.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        if must_enable:
+            serialization.logger.setLevel(old_level)
+        serialization.logger.removeHandler(debug_handler)
 
 
 class SerializeMethod(enum.Enum):
@@ -292,46 +320,80 @@ class TestSerialization(unittest.TestCase):
         model = torch.nn.Module()
         model.register_module("module", module)
 
+        expected = {
+            "module.nested.materialized_tensor": materialized_tensor,
+            "module.nested.meta_tensor": zero_tensor,
+        }
+
+        def assert_deserialized(d: TensorDeserializer) -> None:
+            self.assertGreaterEqual(
+                d._file_header.version_number,
+                serialization.META_TENSOR_TENSORIZER_VERSION,
+            )
+            self.assertSetEqual(set(d.keys()), set(expected.keys()))
+            device = d._device
+            for name, value in expected.items():
+                self.assertTrue(
+                    torch.equal(d[name], expected[name].to(device=device)),
+                    msg=f"Tensor {name!r} is incorrect on deserialization",
+                )
+
+        def settings() -> Iterator[dict]:
+            devices = ("cpu", "cuda") if is_cuda_available else ("cpu",)
+            for device, lazy_load, plaid_mode in itertools.product(
+                devices, (True, False), (True, False)
+            ):
+                if device == "cpu" and plaid_mode:
+                    continue
+                yield dict(
+                    device=device, lazy_load=lazy_load, plaid_mode=plaid_mode
+                )
+
         tensorized_file = tempfile.NamedTemporaryFile("wb+", delete=False)
         try:
             serializer = TensorSerializer(tensorized_file)
             serializer.write_module(model)
             serializer.close()
 
-            for device, lazy_load, plaid_mode in itertools.product(
-                ("cpu", "cuda"), (True, False), (True, False)
-            ):
-                if device == "cuda" and not is_cuda_available:
-                    continue
-                if device == "cpu" and plaid_mode:
-                    continue
-                with self.subTest(
-                    lazy_load=lazy_load,
-                    device=device,
-                    plaid_mode=plaid_mode,
-                ), open(
+            for setting in settings():
+                with self.subTest(encrypted=False, **setting), open(
                     tensorized_file.name, "rb"
                 ) as in_file, TensorDeserializer(
-                    in_file, device="cpu", lazy_load=lazy_load
+                    in_file, **setting
                 ) as deserializer:
-                    print(f"{lazy_load=}, {device=}, {plaid_mode=}")
-                    expected_keys = {
-                        "module.nested.materialized_tensor",
-                        "module.nested.meta_tensor",
-                    }
-                    self.assertSetEqual(set(deserializer.keys()), expected_keys)
-                    self.assertTrue(
-                        torch.equal(
-                            deserializer["module.nested.materialized_tensor"],
-                            materialized_tensor,
-                        )
+                    assert_deserialized(deserializer)
+                    self.assertNotIn(
+                        serialization._FileFeatureFlags.encrypted,
+                        deserializer._file_flags,
                     )
-                    self.assertTrue(
-                        torch.equal(
-                            deserializer["module.nested.meta_tensor"],
-                            zero_tensor,
-                        )
+
+            with self.subTest("Meta tensors with encryption"):
+                if not encryption_available:
+                    self.skipTest(
+                        "libsodium must be installed to test encryption"
                     )
+                encryption_params = serialization.EncryptionParams.random()
+                decryption_params = serialization.DecryptionParams.from_key(
+                    encryption_params.key
+                )
+                serializer = TensorSerializer(
+                    tensorized_file.name, encryption=encryption_params
+                )
+                serializer.write_module(model)
+                serializer.close()
+
+                for setting in settings():
+                    with self.subTest(encrypted=True, **setting), open(
+                        tensorized_file.name, "rb"
+                    ) as in_file, TensorDeserializer(
+                        in_file, encryption=decryption_params, **setting
+                    ) as deserializer:
+                        assert_deserialized(deserializer)
+                        self.assertIn(
+                            serialization._FileFeatureFlags.encrypted,
+                            deserializer._file_flags,
+                        )
+
         finally:
             os.unlink(tensorized_file.name)
 
