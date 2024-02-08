@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Tensors on the `meta` device may now be serialized
+  - These store no tensor data (only metadata) in the tensorized file
+  - These have no hashes for their tensor data, since there is nothing to hash
+  - These cannot have their data encrypted, since there is nothing to encrypt
+  - During deserialization, these are returned as zero-filled buffers on
+    the same device as other tensors
+    - Essentially equivalent to `torch.zeros_like(meta_tensor, device=...)`
+
 ### Changed
 
 - `TensorDeserializer` now defaults to `plaid_mode=True`
@@ -39,7 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     or when the `TensorSerializer` is garbage collected, this bug mainly applies
     to manual usage of `stream_io.open_stream()` for object storage uploads
     not involving a `TensorSerializer`
-
 
 ## [2.7.1] - 2023-12-06
 
