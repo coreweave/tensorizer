@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
-from typing import Iterator, Mapping, NamedTuple, Optional
+from typing import Iterator, Mapping, NamedTuple, Optional, Tuple
 from unittest.mock import patch
 
 import torch
@@ -126,18 +126,22 @@ def serialize_model_temp(*args, **kwargs):
 # model in many repeated tests
 class TensorInfo(NamedTuple):
     size: int
+    shape: Tuple[int, ...]
     dtype: torch.dtype
     hash: bytes
 
     @classmethod
     def from_tensor(cls, tensor: torch.Tensor) -> "TensorInfo":
+        shape = tuple(tensor.size())
         storage = tensor.untyped_storage().cpu()
         data = ctypes.cast(
             storage.data_ptr(),
             ctypes.POINTER(ctypes.c_ubyte * storage.nbytes()),
         ).contents
         hash_val = hashlib.blake2b(data, digest_size=16, salt=salt).digest()
-        return cls(size=tensor.size(), dtype=tensor.dtype, hash=hash_val)
+        return cls(
+            size=tensor.size(), shape=shape, dtype=tensor.dtype, hash=hash_val
+        )
 
 
 @functools.lru_cache(maxsize=None)
@@ -184,6 +188,13 @@ def check_deserialized(
             orig_info.size,
             f"Sizes don't match for tensor {k}: {v_info.size} !="
             f" {orig_info.size}",
+        )
+
+        test_case.assertEqual(
+            v_info.shape,
+            orig_info.shape,
+            f"Shapes don't match for tensor {k}: {v_info.shape} !="
+            f" {orig_info.shape}",
         )
 
         test_case.assertEqual(
@@ -292,8 +303,19 @@ class TestSerialization(unittest.TestCase):
                     os.unlink(serialized_model)
 
     def test_large_unbuffered_tensor(self):
-        shape = (36000, 36000)  # 4.828 GiB, > 2^32 total bytes (as float32)
-        tensor = torch.empty(shape, device="cpu", dtype=torch.float32)
+        shape = (36000, 36000)  # 4.828 GiB
+        dtype = torch.float32
+        num_elements: int = 36000 * 36000
+        bytes_required: int = num_elements * 4
+        assert bytes_required > 1 << 32
+        free_mem = utils.CPUMemoryUsage.now().free
+        working_space: int = 10 << 20
+        if free_mem < bytes_required + working_space:
+            self.skipTest(
+                reason="Insufficient RAM to test large tensor serialization"
+            )
+        low_mem: bool = free_mem < bytes_required * 2 + working_space
+        tensor = torch.empty(shape, device="cpu", dtype=dtype)
         tensor[0, 0] = 1.0101
         tensor[18000, 18000] = 1.2345
         tensor[-1, -1] = 5.4331
@@ -302,12 +324,30 @@ class TestSerialization(unittest.TestCase):
                 serializer = TensorSerializer(tensorized_file)
                 serializer.write_state_dict({"tensor": tensor})
                 serializer.close()
+            del serializer
+            if low_mem:
+                serialized_digest = TensorInfo.from_tensor(tensor)
+                tensor = None
+                gc.collect()
+            else:
+                serialized_digest = None
             with open(
                 tensorized_file.name, "rb"
             ) as in_file, TensorDeserializer(
-                in_file, device=tensor.device
+                in_file, device="cpu"
             ) as deserializer:
-                self.assertTrue(torch.equal(tensor, deserializer["tensor"]))
+                deserialized_tensor = deserializer["tensor"]
+                if low_mem:
+                    deserialized_digest = TensorInfo.from_tensor(
+                        deserialized_tensor
+                    )
+                    self.assertTupleEqual(
+                        serialized_digest, deserialized_digest
+                    )
+                else:
+                    self.assertTrue(torch.equal(tensor, deserialized_tensor))
+        del deserializer, tensor, deserialized_tensor
+        gc.collect()
 
     def test_bfloat16(self):
         shape = (50, 50)
