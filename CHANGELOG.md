@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     buffers **and** parameters, leaving only persistent buffers
   - The corrected behaviour only filters out non-persistent buffers,
     leaving parameters untouched
+- Very large individual tensors (over approximately 2147479552 bytes)
+  now serialize correctly
+  - Previously, anything over the limit for a single `write` or `pwrite` syscall
+    could not be fully written, and an error was raised during serialization
+  - Now, multiple writes are used
+  - This also fixes large writes to unbuffered file-like objects if `pwrite`
+    is not supported, as they would encounter the same issue
 
 ## [2.7.2] - 2024-01-30
 
