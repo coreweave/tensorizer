@@ -308,6 +308,7 @@ class TestSerialization(unittest.TestCase):
         num_elements: int = 36000 * 36000
         bytes_required: int = num_elements * 4
         assert bytes_required > 1 << 32
+        gc.collect()
         free_mem = utils.CPUMemoryUsage.now().free
         working_space: int = 10 << 20
         if free_mem < bytes_required + working_space:
