@@ -1,8 +1,9 @@
 
 import argparse
+import os
 import time
 import torch
-from tensorizer import TensorDeserializer
+from tensorizer import TensorDeserializer, DecryptionParams
 import tensorizer.serialization
 from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
 
@@ -14,6 +15,8 @@ parser.add_argument('--source', default=None, help='local path or URL')
 parser.add_argument('--model-ref', default="EleutherAI/gpt-j-6B")
 parser.add_argument('--no-plaid', action='store_true')
 parser.add_argument('--lazy-load', action='store_true')
+parser.add_argument('--verify-hash', action='store_true')
+parser.add_argument('--encryption', action='store_true')
 parser.add_argument('--viztracer', action='store_true')
 parser.add_argument('--num-readers', type=int, default=1)
 
@@ -35,6 +38,10 @@ if args.viztracer:
     import viztracer
     tracer = viztracer.VizTracer(pid_suffix=True)
 
+decryption_params = None
+if args.encryption:
+    decryption_params = DecryptionParams.from_string(os.getenv("SUPER_SECRET_STRONG_PASSWORD"))
+
 config = AutoConfig.from_pretrained(model_ref)
 
 # This ensures that the model is not initialized.
@@ -52,7 +59,10 @@ deserializer = TensorDeserializer(
     args.source,
     plaid_mode=not args.no_plaid,
     lazy_load=args.lazy_load,
-    num_readers=args.num_readers)
+    encryption=decryption_params,
+    num_readers=args.num_readers,
+    verify_hash=args.verify_hash
+)
 deserializer.load_into_module(model)
 end = time.time()
 if tracer is not None:

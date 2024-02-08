@@ -2041,6 +2041,7 @@ class TensorDeserializer(
         verify_hash: Optional[bool] = None,
         raw: bool = False,
     ) -> Iterator[Tuple[int, int, str, Union[_NumpyTensor, memoryview]]]:
+        assert False, "This function going away"
         """
         A generator that deserializes tensors and returns the `module_idx`,
         `tensor_type`, parameter/buffer `name`, and a _NumpyTensor `tensor`.
@@ -2559,15 +2560,14 @@ class TensorDeserializer(
         else:
             total_tensor_bytes = sum(tensor_size for _, tensor_size in tensor_sizes)
             ideal_tensor_bytes_per_reader = int(total_tensor_bytes / self._num_readers)
-            # TODO: maybe account for max tensor size?
-            # ideal_tensor_bytes_per_reader = max(ideal_tensor_bytes_per_reader, max(tensor_size for _, tensor_size in tensor_sizes))
 
             tensors_per_reader = []
             running_total = 0
             chunk_start = 0
             for tensor_size_idx in range(len(tensor_sizes)):
+                # if this tensor would make this current reader more than ideal_tensor_bytes_per_reader, and there's at least one existing item in the reader
                 # TODO maybe allow for a bit of fudge room like 10%
-                if running_total + tensor_sizes[tensor_size_idx][1] > ideal_tensor_bytes_per_reader:
+                if running_total + tensor_sizes[tensor_size_idx][1] > ideal_tensor_bytes_per_reader and chunk_start != tensor_size_idx:
                     # break it
                     tensors_per_reader.append(tensor_sizes[chunk_start:tensor_size_idx])
                     chunk_start = tensor_size_idx
@@ -2585,6 +2585,7 @@ class TensorDeserializer(
         copy_threads = []
         barrier = threading.Barrier(len(tensors_per_reader))
         halt = AtomicUint(width=4)
+
         for thread_idx, tensor_items in enumerate(tensors_per_reader):
             print(f'Thread #{thread_idx} will read {len(tensor_items)} tensors, {sum(v for _, v in tensor_items)/1024/1024:.3f}MiB, {max(v for _, v in tensor_items)/1024/1024:.3f}MiB max', file=sys.stderr)
 
@@ -2595,6 +2596,7 @@ class TensorDeserializer(
                     thread_idx,
                     halt,
                     barrier,
+                    verify_hash,
                     tensor_items,
                     transfer_out_queue)
             )
@@ -2840,7 +2842,7 @@ class TensorDeserializer(
                     check.cancel()
                 raise
 
-    def _copy_thread(unsafe_self, thread_idx, halt, barrier, tensor_items, transfer_out_queue):
+    def _copy_thread(unsafe_self, thread_idx, halt, barrier, verify_hash, tensor_items, transfer_out_queue):
         # Need to get rid of self or more safely have thread-local storage
 
         # cuda stream. First one is slow, spin it off? This is gross
@@ -2952,6 +2954,9 @@ class TensorDeserializer(
                         mv)
                 else:
                     file_.readinto(mv)
+
+                if verify_hash:
+                    unsafe_self._verify_hashes(header.name, header.hashes, header_hashes, mv)
 
                 duration = time.perf_counter() - start
                 perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
