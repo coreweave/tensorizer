@@ -1,4 +1,3 @@
-import viztracer
 
 import argparse
 import time
@@ -14,6 +13,8 @@ parser = argparse.ArgumentParser('deserialize')
 parser.add_argument('--source', default=None, help='local path or URL')
 parser.add_argument('--model-ref', default="EleutherAI/gpt-j-6B")
 parser.add_argument('--no-plaid', action='store_true')
+parser.add_argument('--viztracer', action='store_true')
+parser.add_argument('--num-readers', type=int, default=1)
 
 args = parser.parse_args()
 
@@ -28,7 +29,10 @@ if args.source is None:
 # s3_bucket = "bucket"
 # s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 
-tracer = viztracer.VizTracer()
+tracer = None
+if args.viztracer:
+    import viztracer
+    tracer = viztracer.VizTracer(pid_suffix=True)
 
 config = AutoConfig.from_pretrained(model_ref)
 
@@ -40,13 +44,15 @@ before_mem = get_mem_usage()
 
 
 # Lazy load the tensors from S3 into the model.
-tracer.start()
+if tracer is not None:
+    tracer.start()
 start = time.time()
-deserializer = TensorDeserializer(args.source, plaid_mode=not args.no_plaid, num_readers=1)
+deserializer = TensorDeserializer(args.source, plaid_mode=not args.no_plaid, num_readers=args.num_readers)
 deserializer.load_into_module(model)
 end = time.time()
-tracer.stop()
-tracer.save()
+if tracer is not None:
+    tracer.stop()
+    tracer.save()
 
 # Brag about how fast we are.
 total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)

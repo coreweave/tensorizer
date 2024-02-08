@@ -942,6 +942,8 @@ def s3_download(
     s3_endpoint: str = default_s3_read_endpoint,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
+    begin: Optional[int] = None,
+    end: Optional[int] = None,
     certificate_handling: Optional[CAInfo] = None,
 ) -> CURLStreamFile:
     url = _s3_download_url(
@@ -956,6 +958,8 @@ def s3_download(
         url,
         buffer_size=buffer_size,
         certificate_handling=certificate_handling,
+        begin=begin,
+        end=end
     )
 
 
@@ -1096,6 +1100,8 @@ def open_stream(
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
+    begin: Optional[int] = None,
+    end: Optional[int] = None,
     *,
     certificate_handling: Optional[CAInfo] = None,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
@@ -1139,6 +1145,11 @@ def open_stream(
         force_http: If True, force the use of HTTP instead of HTTPS for
             S3 downloads. This will double the throughput, but at the cost
             of security.
+        begin: if specified, the file or request will begin at this byte offset.
+            Uses seek() for files and Range for HTTP and S3. This has no effect
+            on writes.
+        end: if specified, HTTP and S3 requests will use this as the end of the
+            Range header. This has no effect on files or on writes.
         certificate_handling: Customize handling of SSL CA certificates for
             HTTPS and S3 downloads.
             Pass None to use default certificate verification, or an instance of
@@ -1210,6 +1221,8 @@ def open_stream(
         return CURLStreamFile(
             path_uri,
             buffer_size=buffer_size,
+            begin=begin,
+            end=end,
             certificate_handling=certificate_handling,
         )
     elif scheme == "redis":
@@ -1322,6 +1335,8 @@ def open_stream(
                 s3_endpoint,
                 buffer_size=buffer_size,
                 force_http=force_http,
+                begin=begin,
+                end=end,
                 certificate_handling=certificate_handling,
             )
             if error_context:
@@ -1334,11 +1349,12 @@ def open_stream(
                 'Only binary modes ("rb", "wb", "wb+", etc.)'
                 " are valid when opening local file streams."
             )
-        dirname = os.path.dirname(path_uri)
-        if dirname:
-            os.makedirs(os.path.dirname(path_uri), exist_ok=True)
+        if "w" in normalized_mode:
+            dirname = os.path.dirname(path_uri)
+            if dirname:
+                os.makedirs(os.path.dirname(path_uri), exist_ok=True)
         if buffer_size is None:
             buffer_size = io.DEFAULT_BUFFER_SIZE
         handle: typing.BinaryIO = open(path_uri, mode, buffering=buffer_size)
-        handle.seek(0)
+        handle.seek(begin or 0)
         return handle

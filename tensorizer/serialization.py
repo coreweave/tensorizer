@@ -18,6 +18,7 @@ import mmap
 import os
 import queue
 import struct
+import sys
 import threading
 import time
 import typing
@@ -1474,7 +1475,7 @@ class TensorDeserializer(
 
             self._file_spec = file_obj
             if isinstance(self._file_spec, (str, bytes, os.PathLike, int)):
-                self._file = stream_io.open_stream(self._file_spec, "rb")
+                self._file = stream_io.open_stream(self._file_spec, "rb", force_http=True)
             else:
                 self._mode_check(self._file_spec)
                 self._file = self._file_spec
@@ -2500,10 +2501,9 @@ class TensorDeserializer(
 
     def _bulk_load(
         self, keys: Iterable[str], verify_hash: Optional[bool] = None
-    ) -> Generator[torch.nn.Parameter, None, None]:
+    ) -> Generator[Tuple[str, torch.nn.Parameter], None, None]:
+
         keys: Tuple[str, ...] = tuple(keys)
-        # TODO: the yield order of _bulk_load will no longer match the order of the `keys` arg
-        
         # Ensure all keys are present and in sorted order with self.keys()
         self_keys_enumerated = {k: i for i, k in enumerate(self.keys())}
         key_indices = list(map(self_keys_enumerated.get, keys))
@@ -2513,6 +2513,7 @@ class TensorDeserializer(
         except ValueError:
             pass
         if list(sorted(key_indices)) != key_indices:
+            # we could just re-sort, I suppose
             raise Exception("Keys must be specified in same order as TensorDeserializer.keys()")
 
         # Splice cached values with freshly loaded values
@@ -2550,6 +2551,7 @@ class TensorDeserializer(
             running_total = 0
             chunk_start = 0
             for tensor_size_idx in range(len(tensor_sizes)):
+                # TODO maybe allow for a bit of fudge room like 10%
                 if running_total + tensor_sizes[tensor_size_idx][1] > ideal_tensor_bytes_per_reader:
                     # break it
                     tensors_per_reader.append(tensor_sizes[chunk_start:tensor_size_idx])
@@ -2561,35 +2563,31 @@ class TensorDeserializer(
                 # The last one gets the leftovers
                 tensors_per_reader[-1].extend(tensor_sizes[chunk_start:])
 
-        # bchess move this all to asyncio?
         transfer_out_queue = queue.SimpleQueue()
         if not isinstance(self._file_spec, (str, bytes, os.PathLike, int)):
             raise Exception("File specifier must be a string to support concurrent readers ")
 
-        with contextlib.ExitStack() as exit_stack:
-            copy_threads = []
-            for thread_idx, tensor_items in enumerate(tensors_per_reader):
-                file_ = stream_io.open_stream(self._file_spec, "rb")
-                exit_stack.enter_context(contextlib.closing(file_))
+        copy_threads = []
+        barrier = threading.Barrier(len(tensors_per_reader))
+        for thread_idx, tensor_items in enumerate(tensors_per_reader):
+            print(f'Thread #{thread_idx} will read {len(tensor_items)} tensors, {sum(v for _, v in tensor_items)/1024/1024:.3f}MiB, {max(v for _, v in tensor_items)/1024/1024:.3f}MiB max', file=sys.stderr)
 
-                file_.seek(self._metadata[tensor_items[0][0]].offset)
+            thread = threading.Thread(
+                name=f'TensorDeserializerCopy-{thread_idx}',
+                target=self._copy_thread,
+                args=(
+                    thread_idx,
+                    barrier,
+                    tensor_items,
+                    transfer_out_queue)
+            )
+            copy_threads.append(thread)
+            thread.start()
 
-                thread = threading.Thread(
-                    name=f'TensorDeserializerCopy-{thread_idx}',
-                    target=self._copy_thread,
-                    args=(
-                        thread_idx,
-                        file_,
-                        tensor_items,
-                        transfer_out_queue)
-                )
-                copy_threads.append(thread)
-                thread.start()
-
-            for _ in range(len(keys)):
-                name, result = transfer_out_queue.get()
-                self._cache[name] = result
-                yield name, result
+        for _ in range(len(keys)):
+            name, result = transfer_out_queue.get()
+            self._cache[name] = result
+            yield name, result
 
         return
 
@@ -2820,112 +2818,133 @@ class TensorDeserializer(
                     check.cancel()
                 raise
 
-    def _copy_thread(unsafe_self, thread_idx, file_, tensor_items, transfer_out_queue):
-        # separate cuda stream
-        # Need a file
+    def _copy_thread(unsafe_self, thread_idx, barrier, tensor_items, transfer_out_queue):
         # Need to get rid of self or more safely have thread-local storage
 
-        # create CPU-pinned memory buffer
-        #   use a cached one if available
-        total_tensor_bytes = max(size for _, size in tensor_items)
-        buffer_tensor = torch.empty((total_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
-        buffer_ptr = buffer_tensor.data_ptr()
-        mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * total_tensor_bytes)))
-
-        tensor_keys = set([k for k, _ in tensor_items])
-
+        # cuda stream. First one is slow, spin it off? This is gross
         is_cuda = unsafe_self._device.type == 'cuda'
-        cuda_stream = torch.cuda.Stream() if is_cuda else None
+        cuda_stream_thread = None
+        cuda_stream = None
+        if is_cuda:
+            def new_stream(holder):
+                holder.append(torch.cuda.Stream())
+            cuda_stream_holder = []
 
-        # then for each tensor in tensor_items
-        tensors_read = 0
-        while tensors_read < len(tensor_items):
-            header = _TensorHeaderDeserializer.from_io(
-                file_,
-                zero_hashes=True,
-                check_crypt_info=unsafe_self._has_crypt_info,
-            )
+            cuda_stream_thread = threading.Thread(name=f'NewCudaStream-{thread_idx}', target=new_stream, args=(cuda_stream_holder,))
+            cuda_stream_thread.start()
 
-            if header is None: # bchess how would this happen?
-                break
+        def cuda_stream_context():
+            if not cuda_stream_holder:
+                cuda_stream_thread.join()
+            return torch.cuda.stream(cuda_stream_holder[0])
 
-            # Skip it if this tensor is not one we're supposed to load
-            if header.name not in tensor_keys:
-                file_.seek(header.data_length, io.SEEK_CUR)
-                continue
+        # TODO: allocating pinned memory seems to block creating
+        # new thrads, so ensure all threads are created before we go
+        barrier.wait()         
 
-            numpy_dtype, *torch_dtype = header.dtype.split(OPAQUE_DTYPE_SEP)
-            if not torch_dtype:
-                torch_dtype = None
-            elif len(torch_dtype) == 1:
-                torch_dtype = torch_dtype[0]
-            else:
-                raise ValueError(
-                    "Can't deserialize a tensor with "
-                    "multiple opaque dtype separators "
-                    f"({OPAQUE_DTYPE_SEP!r}) in its dtype: "
-                    f"{header.dtype!r}"
+        begin_offset = unsafe_self._metadata[tensor_items[0][0]].offset
+        end_offset = unsafe_self._metadata[tensor_items[-1][0]].data_offset + unsafe_self._metadata[tensor_items[-1][0]].data_length
+        file_ = stream_io.open_stream(unsafe_self._file_spec, "rb", begin=begin_offset, end=end_offset, force_http=True)
+
+        with(contextlib.closing(file_)):  # TODO: I don't like so much indentation
+            # create CPU-pinned memory buffer
+            # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
+            total_tensor_bytes = max(size for _, size in tensor_items)
+            buffer_tensor = torch.empty((total_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
+            buffer_ptr = buffer_tensor.data_ptr()
+            mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * total_tensor_bytes)))
+
+            tensor_keys_set = set([k for k, _ in tensor_items])
+
+            # then for each tensor in tensor_items
+            tensors_read = 0
+            while tensors_read < len(tensor_items):
+                header = _TensorHeaderDeserializer.from_io(
+                    file_,
+                    zero_hashes=True,
+                    check_crypt_info=unsafe_self._has_crypt_info,
                 )
 
-            unsafe_self._metadata[header.name].hashes = header.hashes
+                if header is None: # bchess how would this happen?
+                    break
 
-            header_hashes = header.compute_hashes()
-            unsafe_self._metadata[header.name].header_hashes = header_hashes
+                # Skip it if this tensor is not one we're supposed to load
+                if header.name not in tensor_keys_set:
+                    file_.seek(header.data_length, io.SEEK_CUR)
+                    continue
 
-            is_encrypted: bool = (
-                header.crypt_info is not None
-                and header.crypt_info.num_chunks != 0
-            )
-            if unsafe_self._encrypted and not is_encrypted:
-                raise CryptographyError(
-                    "Tensor is not encrypted, but decryption was requested"
+                numpy_dtype, *torch_dtype = header.dtype.split(OPAQUE_DTYPE_SEP)
+                if not torch_dtype:
+                    torch_dtype = None
+                elif len(torch_dtype) == 1:
+                    torch_dtype = torch_dtype[0]
+                else:
+                    raise ValueError(
+                        "Can't deserialize a tensor with "
+                        "multiple opaque dtype separators "
+                        f"({OPAQUE_DTYPE_SEP!r}) in its dtype: "
+                        f"{header.dtype!r}"
+                    )
+
+                unsafe_self._metadata[header.name].hashes = header.hashes
+
+                header_hashes = header.compute_hashes()
+                unsafe_self._metadata[header.name].header_hashes = header_hashes
+
+                is_encrypted: bool = (
+                    header.crypt_info is not None
+                    and header.crypt_info.num_chunks != 0
                 )
-            elif is_encrypted and not unsafe_self._encrypted:
-                raise CryptographyError(
-                    "Tensor is encrypted, but decryption was not requested"
+                if unsafe_self._encrypted and not is_encrypted:
+                    raise CryptographyError(
+                        "Tensor is not encrypted, but decryption was requested"
+                    )
+                elif is_encrypted and not unsafe_self._encrypted:
+                    raise CryptographyError(
+                        "Tensor is encrypted, but decryption was not requested"
+                    )
+                elif unsafe_self._encrypted or is_encrypted:
+                    assert unsafe_self._encrypted and is_encrypted
+                    encryption_method = unsafe_self._get_encryption_method(
+                        header.crypt_info
+                    )
+                    key = unsafe_self._derive_encryption_key(header.crypt_info)
+                else:
+                    key = None
+                    encryption_method = None
+            
+                mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * header.data_length)).contents)
+
+                global perf_stats
+                start = time.perf_counter()
+
+                bytes_read = file_.readinto(mv)
+
+                duration = time.perf_counter() - start
+                perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
+                perf_stats.file_readinto_bytes.add(mv.nbytes)
+
+                assert bytes_read == header.data_length, f"Only read {bytes_read} vs {header.data_length}"
+
+                # create a tensor around it and torch.to('cuda')
+                # buffer_tensor.view(numpy_dtype) ?
+                tensor = _NumpyTensor.from_buffer(
+                    numpy_dtype,
+                    torch_dtype,
+                    header.shape,
+                    mv,
                 )
-            elif unsafe_self._encrypted or is_encrypted:
-                assert unsafe_self._encrypted and is_encrypted
-                encryption_method = unsafe_self._get_encryption_method(
-                    header.crypt_info
-                )
-                key = unsafe_self._derive_encryption_key(header.crypt_info)
-            else:
-                key = None
-                encryption_method = None
-        
-            mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * header.data_length)).contents)
+                tensor = tensor.to_tensor()
+                stream_context = cuda_stream_context() if is_cuda else contextlib.nullcontext()
+                with stream_context:
+                    parameter = unsafe_self._to_torch_parameter(tensor)
+                    if cuda_stream is not None:
+                        cuda_stream.synchronize()
 
-            global perf_stats
-            start = time.perf_counter()
+                # put it on transfer_out_queue
+                transfer_out_queue.put((header.name, parameter))
+                tensors_read += 1
 
-            bytes_read = file_.readinto(mv)
-
-            duration = time.perf_counter() - start
-            perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
-            perf_stats.file_readinto_bytes.add(mv.nbytes)
-
-            assert bytes_read == header.data_length, f"Only read {bytes_read} vs {header.data_length}"
-
-            # create a tensor around it and torch.to('cuda')
-            # buffer_tensor.view(torch_dtype) ?
-            tensor = _NumpyTensor.from_buffer(
-                numpy_dtype,
-                torch_dtype,
-                header.shape,
-                mv,
-            )
-            tensor = tensor.to_tensor()
-            stream_context = torch.cuda.stream(cuda_stream) if is_cuda else contextlib.nullcontext()
-            with stream_context:
-                parameter = unsafe_self._to_torch_parameter(tensor)
-                if cuda_stream is not None:
-                    cuda_stream.synchronize()
-
-            transfer_out_queue.put((header.name, parameter))
-            tensors_read += 1
-
-        # put it on transfer_out_queue
 
 
 
