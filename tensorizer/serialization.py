@@ -1569,6 +1569,7 @@ class TensorDeserializer(
                 }
 
             self._num_readers = num_readers
+            self.total_tensor_bytes = sum(entry.data_length for entry in self._metadata.values())
 
             if False:
                 # We calculate the total tensor bytes here so that we can use mmap,
