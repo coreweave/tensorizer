@@ -3184,7 +3184,7 @@ class TensorSerializer:
             self.lz4_frame = None
 
         # Write our magic bytes.
-        self._file.write(TENSORIZER_MAGIC)
+        self._write(TENSORIZER_MAGIC)
 
         # Write file header metadata
         if not self._encrypted:
@@ -3207,13 +3207,13 @@ class TensorSerializer:
             tensor_size=0,
             tensor_count=0,
         )
-        self._file.write(self._file_header.to_bytes())
+        self._write(self._file_header.to_bytes())
 
         # Reserve 256 KiB for metadata.
         metadata_size = 256 * 1024
-        self._file.write(struct.pack("<Q", metadata_size))
+        self._write(struct.pack("<Q", metadata_size))
         self._metadata_loc = self._file.tell()
-        self._file.write(bytes(metadata_size))
+        self._write(bytes(metadata_size))
         self._flush()
         self._metadata_cur = self._metadata_loc
         self._metadata_end = self._metadata_loc + metadata_size
@@ -3244,11 +3244,11 @@ class TensorSerializer:
 
         # Write our zero-length field, that indicates that this is the last
         # tensor. This will be overwritten if another tensor is written.
-        self._file.write(struct.pack("<Q", 0))
+        self._write(struct.pack("<Q", 0))
 
         # Write our new file header.
         self._file.seek(self._file_header_loc)
-        self._file.write(self._file_header.to_bytes())
+        self._write(self._file_header.to_bytes())
 
         # Reset our file pointer to the end of the file,
         # minus the zero-length field.
@@ -3277,16 +3277,55 @@ class TensorSerializer:
         # based on the capabilities of the platform and the file object used
         raise RuntimeError("pwrite was called before being initialized")
 
+    @staticmethod
+    def _mv_suffix(data, start: int):
+        if not isinstance(data, memoryview):
+            data = memoryview(data)
+        try:
+            if data.ndim != 1:
+                data = data.cast("B")
+            return data[start:]
+        finally:
+            del data
+
     def _pwrite_syscall(
         self, data, offset: int, verify: Union[bool, int] = True
     ) -> int:
         # This implementation of pwrite uses a Unix syscall, and is safe to
         # run even between normal file writes.
-        bytes_written = os.pwrite(self._fd, data, offset)
-        if isinstance(verify, int):
-            self._verify_bytes_written(bytes_written, verify)
-        elif verify:
-            self._verify_bytes_written(bytes_written, self._buffer_size(data))
+        bytes_written: int = 0
+        expected_bytes_written: int = (
+            verify if isinstance(verify, int) else self._buffer_size(data)
+        )
+        bytes_just_written: int = os.pwrite(self._fd, data, offset)
+        bytes_written += bytes_just_written
+        while bytes_written < expected_bytes_written and bytes_just_written > 0:
+            # Writes larger than ~2 GiB may not complete in a single pwrite call
+            offset += bytes_just_written
+            with self._mv_suffix(data, bytes_written) as mv:
+                bytes_just_written = os.pwrite(self._fd, mv, offset)
+            bytes_written += bytes_just_written
+        if isinstance(verify, int) or verify:
+            self._verify_bytes_written(bytes_written, expected_bytes_written)
+        return bytes_written
+
+    def _write(self, data, expected_bytes_written: Optional[int] = None) -> int:
+        # Thread-unsafe non-parallel write at the current file position
+        # Calls `.write()` on `self._file` one or more times,
+        # until all data is written or no more is being written,
+        # as unbuffered I/O objects are not guaranteed to write
+        # all data in a single call to `.write()`.
+        if expected_bytes_written is None:
+            expected_bytes_written = self._buffer_size(data)
+        bytes_written: int = 0
+        bytes_just_written: int = self._file.write(data)
+        bytes_written += bytes_just_written
+        if bytes_just_written > expected_bytes_written:
+            raise ValueError("Wrote more data than expected")
+        while bytes_written < expected_bytes_written and bytes_just_written > 0:
+            with self._mv_suffix(data, bytes_written) as mv:
+                bytes_just_written = self._file.write(mv)
+            bytes_written += bytes_just_written
         return bytes_written
 
     def _pwrite_fallback(
@@ -3296,16 +3335,17 @@ class TensorSerializer:
         # for the entire file object. It is not safe to run this
         # concurrently with any other code that could modify the file offset
         # except other calls to _pwrite_fallback.
+        expected_bytes_written: int = (
+            verify if isinstance(verify, int) else self._buffer_size(data)
+        )
         with self._write_lock:
             old_pos = self._file.tell()
             if old_pos != offset:
                 self._file.seek(offset)
-            bytes_written = self._file.write(data)
+            bytes_written = self._write(data, expected_bytes_written)
             self._file.seek(old_pos)
-        if isinstance(verify, int):
-            self._verify_bytes_written(bytes_written, verify)
-        elif verify:
-            self._verify_bytes_written(bytes_written, self._buffer_size(data))
+        if isinstance(verify, int) or verify:
+            self._verify_bytes_written(bytes_written, expected_bytes_written)
         return bytes_written
 
     @staticmethod

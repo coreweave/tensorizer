@@ -242,6 +242,18 @@ def check_inference(
         test_case.assertGreater(decoded.count("hello"), num_hellos)
 
 
+@contextlib.contextmanager
+@functools.wraps(tempfile.NamedTemporaryFile)
+def temporary_file(*args, **kwargs):
+    f = tempfile.NamedTemporaryFile(
+        *args, **kwargs, prefix="tensorizer-test", delete=False
+    )
+    try:
+        yield f
+    finally:
+        os.unlink(f.name)
+
+
 class TestSerialization(unittest.TestCase):
     def test_serialization(self):
         for device, method in itertools.product(
@@ -278,6 +290,24 @@ class TestSerialization(unittest.TestCase):
                         del deserialized
                 finally:
                     os.unlink(serialized_model)
+
+    def test_large_unbuffered_tensor(self):
+        shape = (36000, 36000)  # 4.828 GiB, > 2^32 total bytes (as float32)
+        tensor = torch.empty(shape, device="cpu", dtype=torch.float32)
+        tensor[0, 0] = 1.0101
+        tensor[18000, 18000] = 1.2345
+        tensor[-1, -1] = 5.4331
+        with temporary_file("wb+", buffering=0) as tensorized_file:
+            with tensorized_file:
+                serializer = TensorSerializer(tensorized_file)
+                serializer.write_state_dict({"tensor": tensor})
+                serializer.close()
+            with open(
+                tensorized_file.name, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file, device=tensor.device
+            ) as deserializer:
+                self.assertTrue(torch.equal(tensor, deserializer["tensor"]))
 
     def test_bfloat16(self):
         shape = (50, 50)
