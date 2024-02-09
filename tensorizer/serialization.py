@@ -1498,14 +1498,9 @@ class TensorDeserializer(
 
             self._dtype: Optional[torch.dtype] = dtype
 
-            self._plaid_mode: bool = plaid_mode
-
             self._lazy_load: bool = lazy_load
 
             self._metadata: Dict[str, TensorEntry] = {}
-
-            if self._plaid_mode and not is_cuda:
-                raise ValueError("Plaid mode requires CUDA")
 
             # Read the magic
             magic = self._file.read(5)
@@ -2426,6 +2421,7 @@ class TensorDeserializer(
     def _optimize_plaid_mode_buffers(
         self, keys: Iterable[str]
     ) -> Generator[None, None, None]:
+        assert False, "function goes away"
         """
         Optimize sub-buffers to alternate between which segment of the shared
         plaid mode buffer they use, so that more operations can overlap at once.
@@ -2873,10 +2869,12 @@ class TensorDeserializer(
         try:
             # create CPU-pinned memory buffer
             # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
-            total_tensor_bytes = max(size for _, size in tensor_items)
-            buffer_tensor = torch.empty((total_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
-            buffer_ptr = buffer_tensor.data_ptr()
-            mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * total_tensor_bytes)))
+
+            buffer_ptr = None
+            if is_cuda:
+                total_tensor_bytes = max(size for _, size in tensor_items)
+                buffer_tensor = torch.empty((total_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
+                buffer_ptr = buffer_tensor.data_ptr()
 
             tensor_keys_set = set([k for k, _ in tensor_items])
 
@@ -2940,6 +2938,11 @@ class TensorDeserializer(
                     key = None
                     encryption_method = None
             
+                if not is_cuda:
+                    # Not in CUDA, no pinned memory. Allocate a new buffer for each tensor because that's what we're going to be using long-term
+                    buffer_tensor = torch.empty((header.data_length,), dtype=torch.uint8)
+                    buffer_ptr = buffer_tensor.data_ptr()
+
                 mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * header.data_length)).contents)
 
                 global perf_stats
@@ -2971,6 +2974,13 @@ class TensorDeserializer(
                     mv,
                 )
                 tensor = tensor.to_tensor()
+                if not is_cuda:
+                    # if not cuda then we're not copying away from
+                    # buffer_tensor. Instead buffer_tensor memory lives on as
+                    # the actual tensor. So build a view based of buffer_tensor
+                    # to retain the reference
+                    tensor = buffer_tensor.view(tensor.dtype).view(header.shape) 
+
                 stream_context = cuda_stream_context() if is_cuda else contextlib.nullcontext()
                 with stream_context:
                     parameter = unsafe_self._to_torch_parameter(tensor)
