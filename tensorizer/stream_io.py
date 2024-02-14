@@ -186,7 +186,7 @@ class CAInfo:
         return hash(self._curl_flags)
 
 
-class CURLStreamFile(io.RawIOBase):
+class CURLStreamFile(io.BufferedIOBase):
     """
     CURLStreamFile implements a file-like object around an HTTP download, the
     intention being to not buffer more than we have to. It is intended for
@@ -550,7 +550,7 @@ else:
     _MAX_TCP_BUFFER_SIZE = 16 << 20  # 16 MiB
 
 
-class RedisStreamFile:
+class RedisStreamFile(io.BufferedIOBase):
     """
     RedisStreamFile implements a file-like object around a Redis key namespace. Each
     'file' is broken up into multiple keys, each of which is a slice of the file. Each
@@ -627,7 +627,6 @@ class RedisStreamFile:
         self._curr_buffer = bytearray(largest)
         self._curr_buffer_idx = -1
         self._curr_buffer_view = memoryview(self._curr_buffer)[0:0]
-        self.closed = False
 
         init_end = time.monotonic()
 
@@ -804,13 +803,13 @@ class RedisStreamFile:
         self._curr = position
 
     def close(self):
-        self.closed = True
         if self._redis is not None:
             self._redis.close()
             self._redis = None
         if self._redis_tcp is not None:
             self._redis_tcp.close()
             self._redis_tcp = None
+        super(RedisStreamFile, self).close()  # will set self.closed to True
 
     def readline(self):
         raise io.UnsupportedOperation("readline")
