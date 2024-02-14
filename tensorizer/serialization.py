@@ -2251,12 +2251,12 @@ class TensorDeserializer(
 
         # Allocating pinned memory seems to block creating new threads, so
         # ensure all threads are created before we go
-        barrier.wait()         
+        barrier.wait()
 
         begin_offset = unsafe_self._metadata[tensor_items[0][0]].offset
         end_offset = unsafe_self._metadata[tensor_items[-1][0]].data_offset + unsafe_self._metadata[tensor_items[-1][0]].data_length
 
-        if True or unsafe_self._num_readers > 1: # bchess TODO
+        if unsafe_self._num_readers > 1:
             assert isinstance(unsafe_self._file_spec, str)
             file_ = stream_io.open_stream(unsafe_self._file_spec, "rb", begin=begin_offset, end=end_offset)
         else:
