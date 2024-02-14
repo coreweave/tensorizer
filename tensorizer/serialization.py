@@ -1782,7 +1782,8 @@ class TensorDeserializer(
     def _read_single_tensor(
         self, expected_name: str, *args, **kwargs
     ) -> torch.Tensor:
-        tensors = tuple(self.read_tensors(*args, **kwargs, num_tensors=1))
+        this_one_tensor_filter = (lambda name: name == expected_name)
+        tensors = tuple(self.read_tensors(filter_func=this_one_tensor_filter, *args, **kwargs))
         num_tensors = len(tensors)
         if num_tensors == 0:
             raise RuntimeError("Tensor not found")
@@ -1808,11 +1809,8 @@ class TensorDeserializer(
         # of the time, access patterns are front to back, so seeking
         # forward in a stream works well even for HTTP/HTTPS streams.
         if name in self._metadata:
-            self._file.seek(self._metadata[name].offset)
             tensor = self._read_single_tensor(name)
-            # BCHESS TODO
-            self._cache[name] = self._to_torch_parameter(tensor)
-            return self._cache[name].parameter
+            return tensor
         else:
             raise KeyError(f"Tensor {name} not found")
 
