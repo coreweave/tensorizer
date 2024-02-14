@@ -588,6 +588,8 @@ class RedisStreamFile:
         self,
         uri: str,
         *,
+        begin: Optional[int] = None,
+        end: Optional[int] = None,
         buffer_size: Optional[int] = None,
     ) -> None:
         if buffer_size is None:
@@ -634,6 +636,9 @@ class RedisStreamFile:
         self.bytes_read = 0
         self.bytes_skipped = 0
         self.read_operations = 0
+
+        if begin:
+            self.seek(begin)
 
     def _find_key_index(self, position):
         for i, index in enumerate(self._indexes):
@@ -1230,7 +1235,12 @@ def open_stream(
             raise ValueError(
                 'Only the mode "rb" is valid when opening redis:// streams.'
             )
-        return RedisStreamFile(path_uri, buffer_size=buffer_size)
+        return RedisStreamFile(
+            path_uri,
+            buffer_size=buffer_size,
+            begin=begin,
+            end=end
+        )
 
     elif scheme == "s3":
         if normalized_mode not in ("br", "bw", "ab", "+bw", "+ab"):
