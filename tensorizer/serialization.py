@@ -2501,7 +2501,7 @@ class TensorDeserializer(
                 # The last one gets the leftovers
                 tensors_per_reader[-1].extend(tensor_sizes[chunk_start:])
 
-        transfer_out_queue: queue.SimpleQueue[Tuple[_TensorHeaderDeserializer, _NumpyTensor, torch.nn.Parameter]] = queue.SimpleQueue()
+        transfer_out_queue = queue.SimpleQueue()  # type: queue.SimpleQueue[Tuple[_TensorHeaderDeserializer, _NumpyTensor, torch.nn.Parameter]]
         if not isinstance(self._file_spec, (str, bytes, os.PathLike, int)):
             raise Exception("File specifier must be a string to support concurrent readers ")
 
@@ -2773,7 +2773,7 @@ class TensorDeserializer(
             barrier: threading.Barrier,
             verify_hash: bool,
             tensor_items: Sequence[str],
-            transfer_out_queue: queue.SimpleQueue[_CopiedData]
+            transfer_out_queue  # type: queue.SimpleQueue[_CopiedData]
     ):
         # Need to get rid of self or more safely have thread-local storage
 
