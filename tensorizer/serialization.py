@@ -2235,7 +2235,7 @@ class TensorDeserializer(
         # Each reader will sequentially read a segment of the file
         # Chunk up the keys into approximately similiar amounts of bytes to read per reader
         # there are probably algorithms to do this more optimally
-        tensor_sizes = [(name, self._metadata[name].data_length) for name in keys]
+        tensor_sizes = [(name, self._metadata[name].deserialized_length) for name in keys]
         if self._num_readers == 1:
             tensors_per_reader = [tensor_sizes]
         else:
@@ -2350,7 +2350,7 @@ class TensorDeserializer(
                 buffer_tensor = torch.empty((total_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
                 buffer_ptr = buffer_tensor.data_ptr()
 
-            tensor_keys_set = set([k for k, _ in tensor_items])
+            tensor_sizes_by_name = dict(tensor_items)
 
             # then for each tensor in tensor_items
             tensors_read = 0
@@ -2368,7 +2368,7 @@ class TensorDeserializer(
                     break
 
                 # Skip it if this tensor is not one we're supposed to load
-                if header.name not in tensor_keys_set:
+                if header.name not in tensor_sizes_by_name:
                     file_.seek(header.data_length, io.SEEK_CUR)
                     continue
 
@@ -2412,33 +2412,42 @@ class TensorDeserializer(
                     key = None
                     encryption_method = None
             
+                needed_buffer_size = tensor_sizes_by_name[header.name]
+                is_meta = needed_buffer_size > 0 and header.data_length == 0
+                assert is_meta or needed_buffer_size == header.data_length
+
                 if not is_cuda:
                     # Not in CUDA, no pinned memory. Allocate a new buffer for each tensor because that's what we're going to be using long-term
-                    buffer_tensor = torch.empty((header.data_length,), dtype=torch.uint8)
+                    buffer_tensor = torch.empty((needed_buffer_size,), dtype=torch.uint8)
                     buffer_ptr = buffer_tensor.data_ptr()
 
+                if is_meta:
+                    # meta tensor. Ensure that at least `deserialized_length` bytes are zero
+                    buffer_tensor.zero_()
+
                 assert buffer_ptr is not None
-                mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * header.data_length)).contents)
+                mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * tensor_sizes_by_name[header.name])).contents)
 
-                global perf_stats
-                start = time.perf_counter()
+                if not is_meta:
+                    global perf_stats
+                    start = time.perf_counter()
 
-                if unsafe_self._encrypted and mv.nbytes > 0:
-                    TensorDeserializer._stream_decrypt(
-                        file_,
-                        unsafe_self._decryption_pool, # decryption_pool safe to be shared
-                        encryption_method,
-                        key,
-                        mv)
-                else:
-                    file_.readinto(mv)
+                    if unsafe_self._encrypted and mv.nbytes > 0:
+                        TensorDeserializer._stream_decrypt(
+                            file_,
+                            unsafe_self._decryption_pool, # decryption_pool safe to be shared
+                            encryption_method,
+                            key,
+                            mv)
+                    else:
+                        file_.readinto(mv)
 
-                if verify_hash:
-                    unsafe_self._verify_hashes(header.name, header.hashes, header_hashes, mv)
+                    if verify_hash:
+                        unsafe_self._verify_hashes(header.name, header.hashes, header_hashes, mv)
 
-                duration = time.perf_counter() - start
-                perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
-                perf_stats.file_readinto_bytes.add(mv.nbytes)
+                    duration = time.perf_counter() - start
+                    perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
+                    perf_stats.file_readinto_bytes.add(mv.nbytes)
 
                 # create a tensor around it and torch.to('cuda')
                 # buffer_tensor.view(numpy_dtype) ?
