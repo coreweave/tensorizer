@@ -34,7 +34,7 @@ from tensorizer import TensorDeserializer, TensorSerializer, stream_io, utils
 
 s3_access_key_id = os.environ.get("S3_ACCESS_KEY_ID") or None
 s3_secret_access_key = os.environ.get("S3_SECRET_ACCESS_KEY") or None
-s3_endpoint = os.environ.get("S3_ENDPOINT_URL") or None
+s3_endpoint = "object.ord1.coreweave.com"  # To prevent caching old files
 
 _read_stream, _write_stream = (
     partial(
