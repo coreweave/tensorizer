@@ -1020,7 +1020,7 @@ class TestVerification(unittest.TestCase):
             if device == "cuda" and not is_cuda_available:
                 continue
             with self.subTest(msg=f"Verifying hashes with device {device}"):
-                deserialized = TensorDeserializer(self._serialized_model_path, device=device)
+                deserialized = TensorDeserializer(self._serialized_model_path, device=device, verify_hash=True)
                 model_to_verify = model_to_verify.to(device)
                 result, tensor_status = deserialized.verify_module(
                     model_to_verify
@@ -1037,7 +1037,7 @@ class TestVerification(unittest.TestCase):
             if device == "cuda" and not is_cuda_available:
                 continue
             with self.subTest(msg=f"Verifying hashes with device {device}"):
-                deserialized = TensorDeserializer(self._serialized_model_path, device=device)
+                deserialized = TensorDeserializer(self._serialized_model_path, device=device, verify_hash=True)
                 model_to_verify = model_to_verify.to(device)
                 model_to_verify.transformer.h[0].ln_2 = torch.nn.LayerNorm(
                     768, 768

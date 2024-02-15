@@ -2559,10 +2559,11 @@ class TensorDeserializer(
 
         Raises:
             RuntimeError: If this function is called before tensor data and
-                hashes have been loaded, for instance when instantiating the
-                `TensorDeserializer` with ``lazy_load=True`` and then calling
-                this function prior to loading the tensors into a module.
-                If ``lazy_load=False``, this error case is impossible.
+                hashes have been loaded or if verify_hashes=False. For instance
+                when instantiating the `TensorDeserializer` with
+                ``lazy_load=True`` and then calling this function prior to
+                loading the tensors into a module.  If ``lazy_load=False,
+                verify_hashes=True``, this error case is impossible.
         """
         modules: typing.OrderedDict[
             str, Union[torch.nn.Module, torch.Tensor]
@@ -2582,7 +2583,7 @@ class TensorDeserializer(
                 continue
             module: torch.nn.Module = modules[name]
             entry = self._metadata[name]
-            if entry.hashes is None:
+            if entry.hashes is None or entry.header_hashes is None:
                 raise RuntimeError(
                     f"No hashes found in metadata for {name}. This is usually"
                     " caused by a TensorDeserializer that was instantiated"
