@@ -48,6 +48,7 @@ import torch
 
 import tensorizer._crypt as _crypt
 import tensorizer._crypt_info as _crypt_info
+import tensorizer._syscalls as _syscalls
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 from tensorizer._crypt._cgroup_cpu_count import (
@@ -3882,9 +3883,7 @@ class TensorSerializer:
     def _bulk_write(self, tensors: Iterable[_WriteSpec]):
         tensors = collections.deque(tensors)
         next_pos = self._file.tell()
-
-        fallocate = getattr(os, "posix_fallocate", None)
-        if fallocate and self._fd:
+        if _syscalls.has_fallocate() and self._fd:
             size = sum(len(t.name) for t in tensors)
             size += sum(
                 t.tensor.element_size()
@@ -3895,10 +3894,9 @@ class TensorSerializer:
             # Rough underestimate of header size
             header_min_size = 24
             size += header_min_size * len(tensors)
-            try:
-                fallocate(self._fd, next_pos, size)
-            except OSError:
-                pass
+            _syscalls.try_fallocate(
+                self._fd, next_pos, size, suppress_all_errors=True
+            )
 
         cuda_tensors = [
             t.tensor for t in tensors if t.tensor.device.type == "cuda"
