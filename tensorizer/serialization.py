@@ -2300,20 +2300,9 @@ class TensorDeserializer(
 
         # cuda stream. First one is slow, spin it off? This is gross TOOD bchess
         is_cuda = unsafe_self._device.type == 'cuda'
-        cuda_stream_thread = None
         cuda_stream = None
         if is_cuda:
-            def new_stream(holder):
-                holder.append(torch.cuda.Stream())
-            cuda_stream_holder = []
-
-            cuda_stream_thread = threading.Thread(name=f'NewCudaStream-{thread_idx}', target=new_stream, args=(cuda_stream_holder,))
-            cuda_stream_thread.start()
-
-        def cuda_stream_context():
-            if not cuda_stream_holder:
-                cuda_stream_thread.join()
-            return torch.cuda.stream(cuda_stream_holder[0])
+            cuda_stream = torch.cuda.Stream()
 
         # Allocating pinned memory seems to block creating new threads, so
         # ensure all threads are created before we go
@@ -2376,8 +2365,9 @@ class TensorDeserializer(
 
                 unsafe_self._metadata[header.name].hashes = header.hashes
 
-                header_hashes = header.compute_hashes()
-                unsafe_self._metadata[header.name].header_hashes = header_hashes
+                if verify_hash:
+                    header_hashes = header.compute_hashes()
+                    unsafe_self._metadata[header.name].header_hashes = header_hashes
 
                 is_encrypted: bool = (
                     header.crypt_info is not None
@@ -2453,7 +2443,7 @@ class TensorDeserializer(
                     # to retain the reference
                     tensor = buffer_tensor.view(tensor.dtype).view(header.shape)
 
-                stream_context = cuda_stream_context() if is_cuda else contextlib.nullcontext()
+                stream_context = torch.cuda.stream(cuda_stream) if is_cuda else contextlib.nullcontext()
                 with stream_context:
                     parameter = unsafe_self._to_torch_parameter(tensor)
                     if cuda_stream is not None:
