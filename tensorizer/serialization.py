@@ -14,6 +14,7 @@ import hashlib
 import io
 import itertools
 import logging
+import mmap
 import os
 import queue
 import struct
@@ -56,6 +57,8 @@ from tensorizer._crypt._cgroup_cpu_count import (
 from tensorizer._internal_utils import Chunked as _Chunked
 from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor
+
+cudart = torch.cuda.cudart()
 
 @dataclasses.dataclass
 class PerfStats:
@@ -2237,21 +2240,24 @@ class TensorDeserializer(
             tensors_per_reader = []
             running_total = 0
             chunk_start = 0
-            for tensor_size_idx in range(len(tensor_sizes)):
-                # if this tensor would make this current reader more than ideal_tensor_bytes_per_reader, and there's at least one existing item in the reader
-                if running_total + tensor_sizes[tensor_size_idx][1] > ideal_tensor_bytes_per_reader and chunk_start != tensor_size_idx:
+            for tensor_size_idx, tensor_size in enumerate(tensor_sizes):
+                # if this tensor would make this current reader more than
+                # ideal_tensor_bytes_per_reader, and there's at least one
+                # existing item in the reader
+                if running_total + tensor_size[1] > ideal_tensor_bytes_per_reader and chunk_start != tensor_size_idx:
                     # break it
                     tensors_per_reader.append(tensor_sizes[chunk_start:tensor_size_idx])
                     chunk_start = tensor_size_idx
                     running_total = 0
-                running_total += tensor_sizes[tensor_size_idx][1]
+                running_total += tensor_size[1]
 
             if running_total:
-                # The last one gets the leftovers
-                if not tensors_per_reader:
+                if len(tensors_per_reader) < self._num_readers:
                     tensors_per_reader.append([])
 
+                # The last one gets the leftovers
                 tensors_per_reader[-1].extend(tensor_sizes[chunk_start:])
+
 
         transfer_out_queue = queue.SimpleQueue()  # type: queue.SimpleQueue[Union[Exception, TensorDeserializer._CopiedData]]
 
@@ -2260,7 +2266,7 @@ class TensorDeserializer(
         halt = AtomicUint(width=4)
 
         for thread_idx, tensor_items in enumerate(tensors_per_reader):
-            # print(f'Thread #{thread_idx} will read {len(tensor_items)} tensors, {sum(v for _, v in tensor_items)/1024/1024:.3f}MiB, {max(v for _, v in tensor_items)/1024/1024:.3f}MiB max', file=sys.stderr)
+            print(f'Thread #{thread_idx} will read {len(tensor_items)} tensors, {sum(v for _, v in tensor_items)/1024/1024:.3f}MiB, {max(v for _, v in tensor_items)/1024/1024:.3f}MiB max')
 
             thread = threading.Thread(
                 name=f'TensorDeserializerCopy-{thread_idx}',
@@ -2325,8 +2331,17 @@ class TensorDeserializer(
             buffer_ptr = None
             if is_cuda:
                 total_tensor_bytes = max(size for _, size in tensor_items)
-                buffer_tensor = torch.empty((total_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
-                buffer_ptr = buffer_tensor.data_ptr()
+                mode = 'mmap'
+                if mode == 'torch': # torch mode
+                    buffer_tensor = torch.empty((total_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
+                    buffer_ptr = buffer_tensor.data_ptr()
+                elif mode == 'mmap':
+                    buffer_mmap = mmap.mmap(-1, total_tensor_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | 0x2000 )
+                    buffer_ptr = ctypes.addressof((ctypes.c_char * total_tensor_bytes).from_buffer(buffer_mmap))
+                    with torch.cuda.stream(cuda_stream):
+                        result = cudart.cudaHostRegister(buffer_ptr, total_tensor_bytes, 0) # TODO: unregister
+                        print(thread_idx, 'result', int(result))
+                        # cuda_stream.synchronize()
 
             tensor_sizes_by_name = dict(tensor_items)
 
@@ -2443,11 +2458,16 @@ class TensorDeserializer(
                     # to retain the reference
                     tensor = buffer_tensor.view(tensor.dtype).view(header.shape)
 
-                stream_context = torch.cuda.stream(cuda_stream) if is_cuda else contextlib.nullcontext()
-                with stream_context:
+                if is_cuda:
+                    with torch.cuda.stream(cuda_stream):
+                        try:
+                            parameter = unsafe_self._to_torch_parameter(tensor)
+                        except Exception as e:
+                            print(thread_idx, 'param', tensor.shape, header.name)
+                            raise e
+                        # cuda_stream.synchronize()
+                else:
                     parameter = unsafe_self._to_torch_parameter(tensor)
-                    if cuda_stream is not None:
-                        cuda_stream.synchronize()
 
                 # put it on transfer_out_queue
                 transfer_out_queue.put(TensorDeserializer._CopiedData(header, numpy_tensor, parameter))
