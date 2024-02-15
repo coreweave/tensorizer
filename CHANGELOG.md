@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.1] - 2024-02-15
+
+### Changed
+
+- Performance has been improved when serializing to some filesystems
+  (e.g. NFS, CephFS) by skipping `fallocate` pre-allocation where it
+  is not natively supported
+  - Previously, `posix_fallocate`'s fallback behaviour was used, which
+    wasted time writing out zeroes that would only be overwritten later
+
+### Fixed
+
+- `examples/hf_serialization.py` is now more robust when overwriting an existing
+  serialized model in an object storage bucket
+  - Previously, it would sometimes find and use outdated, cached data,
+    and thus erroneously skip serialization and/or fail validation
+
 ## [2.8.0] - 2024-02-08
 
 ### Added
@@ -317,6 +334,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[2.8.1]: https://github.com/coreweave/tensorizer/compare/v2.8.0...v2.8.1
 [2.8.0]: https://github.com/coreweave/tensorizer/compare/v2.7.2...v2.8.0
 [2.7.2]: https://github.com/coreweave/tensorizer/compare/v2.7.1...v2.7.2
 [2.7.1]: https://github.com/coreweave/tensorizer/compare/v2.7.0...v2.7.1
