@@ -5,7 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.8.0] - 2024-02-08
+
+### Added
+
+- Tensors on the `meta` device may now be serialized
+  - These store no tensor data (only metadata) in the tensorized file
+  - These have no hashes for their tensor data, since there is nothing to hash
+  - These cannot have their data encrypted, since there is nothing to encrypt
+  - During deserialization, these are returned as zero-filled buffers on
+    the same device as other tensors
+    - Essentially equivalent to `torch.zeros_like(meta_tensor, device=...)`
+
+### Changed
+
+- `TensorDeserializer` now defaults to `plaid_mode=True`
+  when deserializing to CUDA devices for better performance
+  - There is no difference between `plaid_mode`-deserialized tensors
+    and regular deserialized tensors (beyond deserialization performance),
+    so this is not a breaking change
+- Removed incorrect warnings in the documentation about `plaid_mode`
+  being unsafe
 
 ### Fixed
 
@@ -15,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     buffers **and** parameters, leaving only persistent buffers
   - The corrected behaviour only filters out non-persistent buffers,
     leaving parameters untouched
+- Very large individual tensors (over approximately 2147479552 bytes)
+  now serialize correctly
+  - Previously, anything over the limit for a single `write` or `pwrite` syscall
+    could not be fully written, and an error was raised during serialization
+  - Now, multiple writes are used
+  - This also fixes large writes to unbuffered file-like objects if `pwrite`
+    is not supported, as they would encounter the same issue
 
 ## [2.7.2] - 2024-01-30
 
@@ -29,7 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     or when the `TensorSerializer` is garbage collected, this bug mainly applies
     to manual usage of `stream_io.open_stream()` for object storage uploads
     not involving a `TensorSerializer`
-
 
 ## [2.7.1] - 2023-12-06
 
@@ -291,7 +317,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
-[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.7.2...HEAD
+[2.8.0]: https://github.com/coreweave/tensorizer/compare/v2.7.2...v2.8.0
 [2.7.2]: https://github.com/coreweave/tensorizer/compare/v2.7.1...v2.7.2
 [2.7.1]: https://github.com/coreweave/tensorizer/compare/v2.7.0...v2.7.1
 [2.7.0]: https://github.com/coreweave/tensorizer/compare/v2.6.0...v2.7.0

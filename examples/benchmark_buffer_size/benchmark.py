@@ -220,7 +220,8 @@ def log(
 
     if response_headers is None:
         response_headers = {}
-    cached_by = response_headers.get("x-cache-trace", None)
+    response_headers = {k.lower(): v for k, v in response_headers.items()}
+    cached_by = response_headers.get("x-cache-location", None)
     cached = response_headers.get("x-cache-status", False)
 
     if cached_by is not None:

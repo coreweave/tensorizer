@@ -5,13 +5,15 @@ import functools
 import gc
 import hashlib
 import itertools
+import logging
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 import unittest
-from typing import Mapping, NamedTuple, Optional
+from typing import Iterator, Mapping, NamedTuple, Optional, Tuple
 from unittest.mock import patch
 
 import torch
@@ -45,6 +47,32 @@ is_cuda_available = torch.cuda.is_available()
 default_device = "cuda" if is_cuda_available else "cpu"
 salt = secrets.token_bytes(4)
 default_read_endpoint = "object.ord1.coreweave.com"
+
+
+def _stdout_handler(level=logging.DEBUG) -> logging.Handler:
+    handler = logging.StreamHandler(stream=sys.stdout)
+    formatter = logging.Formatter("%(levelname)s %(name)s: %(msg)s")
+    handler.setFormatter(formatter)
+    handler.setLevel(level)
+    return handler
+
+
+debug_handler = _stdout_handler()
+
+
+@contextlib.contextmanager
+def debug_log():
+    serialization.logger.addHandler(debug_handler)
+    must_enable: bool = not serialization.logger.isEnabledFor(logging.DEBUG)
+    old_level = serialization.logger.level
+    if must_enable:
+        serialization.logger.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        if must_enable:
+            serialization.logger.setLevel(old_level)
+        serialization.logger.removeHandler(debug_handler)
 
 
 class SerializeMethod(enum.Enum):
@@ -98,18 +126,22 @@ def serialize_model_temp(*args, **kwargs):
 # model in many repeated tests
 class TensorInfo(NamedTuple):
     size: int
+    shape: Tuple[int, ...]
     dtype: torch.dtype
     hash: bytes
 
     @classmethod
     def from_tensor(cls, tensor: torch.Tensor) -> "TensorInfo":
+        shape = tuple(tensor.size())
         storage = tensor.untyped_storage().cpu()
         data = ctypes.cast(
             storage.data_ptr(),
             ctypes.POINTER(ctypes.c_ubyte * storage.nbytes()),
         ).contents
         hash_val = hashlib.blake2b(data, digest_size=16, salt=salt).digest()
-        return cls(size=tensor.size(), dtype=tensor.dtype, hash=hash_val)
+        return cls(
+            size=tensor.size(), shape=shape, dtype=tensor.dtype, hash=hash_val
+        )
 
 
 @functools.lru_cache(maxsize=None)
@@ -156,6 +188,13 @@ def check_deserialized(
             orig_info.size,
             f"Sizes don't match for tensor {k}: {v_info.size} !="
             f" {orig_info.size}",
+        )
+
+        test_case.assertEqual(
+            v_info.shape,
+            orig_info.shape,
+            f"Shapes don't match for tensor {k}: {v_info.shape} !="
+            f" {orig_info.shape}",
         )
 
         test_case.assertEqual(
@@ -214,6 +253,18 @@ def check_inference(
         test_case.assertGreater(decoded.count("hello"), num_hellos)
 
 
+@contextlib.contextmanager
+@functools.wraps(tempfile.NamedTemporaryFile)
+def temporary_file(*args, **kwargs):
+    f = tempfile.NamedTemporaryFile(
+        *args, **kwargs, prefix="tensorizer-test", delete=False
+    )
+    try:
+        yield f
+    finally:
+        os.unlink(f.name)
+
+
 class TestSerialization(unittest.TestCase):
     def test_serialization(self):
         for device, method in itertools.product(
@@ -250,6 +301,54 @@ class TestSerialization(unittest.TestCase):
                 finally:
                     os.unlink(serialized_model)
 
+    def test_large_unbuffered_tensor(self):
+        shape = (36000, 36000)  # 4.828 GiB
+        dtype = torch.float32
+        num_elements: int = 36000 * 36000
+        bytes_required: int = num_elements * 4
+        assert bytes_required > 1 << 32
+        gc.collect()
+        free_mem = utils.CPUMemoryUsage.now().free
+        working_space: int = 10 << 20
+        if free_mem < bytes_required + working_space:
+            self.skipTest(
+                reason="Insufficient RAM to test large tensor serialization"
+            )
+        low_mem: bool = free_mem < bytes_required * 2 + working_space
+        tensor = torch.empty(shape, device="cpu", dtype=dtype)
+        tensor[0, 0] = 1.0101
+        tensor[18000, 18000] = 1.2345
+        tensor[-1, -1] = 5.4331
+        with temporary_file("wb+", buffering=0) as tensorized_file:
+            with tensorized_file:
+                serializer = TensorSerializer(tensorized_file)
+                serializer.write_state_dict({"tensor": tensor})
+                serializer.close()
+            del serializer
+            if low_mem:
+                serialized_digest = TensorInfo.from_tensor(tensor)
+                tensor = None
+                gc.collect()
+            else:
+                serialized_digest = None
+            with open(
+                tensorized_file.name, "rb"
+            ) as in_file, TensorDeserializer(
+                in_file, device="cpu"
+            ) as deserializer:
+                deserialized_tensor = deserializer["tensor"]
+                if low_mem:
+                    deserialized_digest = TensorInfo.from_tensor(
+                        deserialized_tensor
+                    )
+                    self.assertTupleEqual(
+                        serialized_digest, deserialized_digest
+                    )
+                else:
+                    self.assertTrue(torch.equal(tensor, deserialized_tensor))
+        del deserializer, tensor, deserialized_tensor
+        gc.collect()
+
     def test_bfloat16(self):
         shape = (50, 50)
         tensor = torch.normal(0, 0.5, shape, dtype=torch.bfloat16)
@@ -270,6 +369,131 @@ class TestSerialization(unittest.TestCase):
             os.unlink(tensorized_file.name)
 
         self.assertTrue(torch.equal(tensor, deserialized_tensor))
+
+    def test_meta_tensors(self):
+        # This test is modeled after self.test_persistent_buffers
+        shape = (50, 50)
+        materialized_tensor = torch.normal(0, 0.5, shape)
+        meta_tensor = torch.empty_like(materialized_tensor, device="meta")
+        zero_tensor = torch.zeros_like(materialized_tensor)
+        nested_module = torch.nn.Module()
+        nested_module.register_parameter(
+            "materialized_tensor", torch.nn.Parameter(materialized_tensor)
+        )
+        nested_module.register_parameter(
+            "meta_tensor", torch.nn.Parameter(meta_tensor)
+        )
+        module = torch.nn.Module()
+        module.register_module("nested", nested_module)
+        model = torch.nn.Module()
+        model.register_module("module", module)
+
+        expected = {
+            "module.nested.materialized_tensor": materialized_tensor,
+            "module.nested.meta_tensor": zero_tensor,
+        }
+
+        def assert_deserialized(d: TensorDeserializer) -> None:
+            self.assertGreaterEqual(
+                d._file_header.version_number,
+                serialization.META_TENSOR_TENSORIZER_VERSION,
+            )
+            self.assertSetEqual(set(d.keys()), set(expected.keys()))
+            device = d._device
+            for name, value in expected.items():
+                self.assertTrue(
+                    torch.equal(d[name], expected[name].to(device=device)),
+                    msg=f"Tensor {name!r} is incorrect on deserialization",
+                )
+
+        def settings() -> Iterator[dict]:
+            devices = ("cpu", "cuda") if is_cuda_available else ("cpu",)
+            for device, lazy_load, plaid_mode in itertools.product(
+                devices, (True, False), (True, False)
+            ):
+                if device == "cpu" and plaid_mode:
+                    continue
+                yield dict(
+                    device=device, lazy_load=lazy_load, plaid_mode=plaid_mode
+                )
+
+        tensorized_file = tempfile.NamedTemporaryFile("wb+", delete=False)
+        try:
+            serializer = TensorSerializer(tensorized_file)
+            serializer.write_module(model)
+            serializer.close()
+
+            for setting in settings():
+                with self.subTest(encrypted=False, **setting), open(
+                    tensorized_file.name, "rb"
+                ) as in_file, TensorDeserializer(
+                    in_file, **setting
+                ) as deserializer:
+                    assert_deserialized(deserializer)
+                    self.assertNotIn(
+                        serialization._FileFeatureFlags.encrypted,
+                        deserializer._file_flags,
+                    )
+
+            with self.subTest("Meta tensors with encryption"):
+                if not encryption_available:
+                    self.skipTest(
+                        "libsodium must be installed to test encryption"
+                    )
+                encryption_params = serialization.EncryptionParams.random()
+                decryption_params = serialization.DecryptionParams.from_key(
+                    encryption_params.key
+                )
+                serializer = TensorSerializer(
+                    tensorized_file.name, encryption=encryption_params
+                )
+                serializer.write_module(model)
+                serializer.close()
+
+                for setting in settings():
+                    with self.subTest(encrypted=True, **setting), open(
+                        tensorized_file.name, "rb"
+                    ) as in_file, TensorDeserializer(
+                        in_file, encryption=decryption_params, **setting
+                    ) as deserializer:
+                        assert_deserialized(deserializer)
+                        self.assertIn(
+                            serialization._FileFeatureFlags.encrypted,
+                            deserializer._file_flags,
+                        )
+
+        finally:
+            os.unlink(tensorized_file.name)
+
+    def test_meta_tensor_module(self):
+        meta_model = AutoModelForCausalLM.from_pretrained(model_name).to(
+            device="meta"
+        )
+        sd = meta_model.state_dict()
+        sd.update(meta_model.named_buffers())
+        self.assertDictEqual(
+            {name: t.device.type for name, t in sd.items()},
+            dict.fromkeys(sd, "meta"),
+        )
+        serialized_file = tempfile.NamedTemporaryFile("wb+", delete=False)
+        try:
+            serializer = TensorSerializer(serialized_file)
+            serializer.write_module(meta_model)
+            serializer.close()
+            with TensorDeserializer(
+                serialized_file.name, device="cpu"
+            ) as deserializer, torch.no_grad():
+                self.assertSetEqual(set(sd.keys()), set(deserializer.keys()))
+                for k in deserializer.keys():
+                    zero = torch.zeros_like(sd[k], device="cpu")
+                    if torch.any(zero):
+                        # Some torch bug causes zeros_like to yield nonzero
+                        # results sometimes (TM) when converting from
+                        # a meta tensor
+                        zero.zero_()
+                    self.assertTrue(torch.equal(zero, deserializer[k]))
+        finally:
+            os.unlink(serialized_file.name)
 
     def test_persistent_buffers(self):
         def random_tensor(shape=(50, 50)):
@@ -473,7 +697,6 @@ class TestEncryption(unittest.TestCase):
         incorrect_decryption: DecryptionParams,
     ):
         device = default_device
-        plaid_mode = device != "cpu"
 
         with self._serialize(encryption, device) as encrypted_model:
             # Ensure that it works when given a key
@@ -481,12 +704,10 @@ class TestEncryption(unittest.TestCase):
                 msg="Deserializing with a correct key",
                 device=device,
                 lazy_load=False,
-                plaid_mode=plaid_mode,
             ), TensorDeserializer(
                 encrypted_model,
                 device=device,
                 lazy_load=False,
-                plaid_mode=plaid_mode,
                 verify_hash=True,
                 encryption=decryption,
             ) as deserialized:
@@ -538,6 +759,9 @@ class TestDeserialization(unittest.TestCase):
     def tearDownClass(cls):
         os.unlink(cls._serialized_model_path)
 
+    def open_serialized(self):
+        return open(self._serialized_model_path, "rb")
+
     def test_default_cpu(self):
         gc.collect()
         before_deserialization = utils.get_mem_usage()
@@ -558,27 +782,26 @@ class TestDeserialization(unittest.TestCase):
         deserialized.close()
         print(f"Before deserialization: {before_deserialization}")
         print(f"After deserialization:  {after_deserialization}")
+        del deserialized
         gc.collect()
         after_del = utils.get_mem_usage()
         print(f"After del: {after_del}")
 
     def test_lazy_load(self):
-        deserialized = TensorDeserializer(
-            self._serialized_model_path, device=default_device, lazy_load=True
-        )
+        supported_devices = ['cpu']
+        if default_device == 'cuda':
+            supported_devices.append('cuda')
 
-        check_deserialized(self, deserialized, model_name)
-        check_inference(self, deserialized, model_name, default_device)
-        deserialized.close()
-
-    def test_lazy_load_multiple_readers(self):
-        deserialized = TensorDeserializer(
-            self._serialized_model_path, device=default_device, lazy_load=True, num_readers=4
-        )
-
-        check_deserialized(self, deserialized, model_name)
-        check_inference(self, deserialized, model_name, default_device)
-        deserialized.close()
+        for device in supported_devices:
+            with self.subTest(
+                f"Testing lazy_load=True with device={device}"
+            ), self.open_serialized() as in_file, TensorDeserializer(
+                self._serialized_model_path,
+                device=device,
+                lazy_load=True,
+            ) as deserialized:
+                check_deserialized(self, deserialized, model_name)
+                check_inference(self, deserialized, model_name, device)
 
     @unittest.skipIf(not is_cuda_available, "requires CUDA")
     def test_cuda(self):
