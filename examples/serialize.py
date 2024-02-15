@@ -1,6 +1,5 @@
-import os
 import torch
-from tensorizer import TensorSerializer, EncryptionParams
+from tensorizer import TensorSerializer
 from transformers import AutoModelForCausalLM
 
 model_ref = "EleutherAI/gpt-j-6B"
@@ -11,10 +10,6 @@ model_name = model_ref.split("/")[-1]
 s3_bucket = "bucket"
 s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 
-source: str = os.getenv("SUPER_SECRET_STRONG_PASSWORD")
-encryption_params = EncryptionParams.from_string(source)
-
-
 model = AutoModelForCausalLM.from_pretrained(
     model_ref,
     revision="float16",
@@ -22,6 +17,6 @@ model = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
 )
 
-serializer = TensorSerializer(f"{model_name}.encrypted.tensors", encryption=encryption_params)
+serializer = TensorSerializer(s3_uri)
 serializer.write_module(model)
 serializer.close()

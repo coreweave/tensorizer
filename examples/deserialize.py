@@ -28,10 +28,7 @@ model_ref = args.model_ref
 model_name = model_ref.split("/")[-1]
 
 if args.source is None:
-    args.source = f"/scratch/{model_name}.tensors"
-# Change this to your S3 bucket.
-# s3_bucket = "bucket"
-# s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
+    args.source = f"s3://{s3_bucket}/{model_name}.tensors"
 
 tracer = None
 if args.viztracer:

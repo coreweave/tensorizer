@@ -14,11 +14,9 @@ import hashlib
 import io
 import itertools
 import logging
-import mmap
 import os
 import queue
 import struct
-import sys
 import threading
 import time
 import typing
@@ -58,12 +56,6 @@ from tensorizer._crypt._cgroup_cpu_count import (
 from tensorizer._internal_utils import Chunked as _Chunked
 from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor
-from tensorizer.stream_io import CURLStreamFile
-
-if torch.cuda.is_available():
-    cudart = torch.cuda.cudart()
-else:
-    cudart = None
 
 @dataclasses.dataclass
 class PerfStats:
@@ -1623,7 +1615,6 @@ class TensorDeserializer(
                     for name, entry in self._metadata.items()
                     if filter_func(name)
                 }
-            num_tensors: int = len(self._metadata)
 
             self._num_readers = num_readers
             self.total_tensor_bytes = sum(entry.deserialized_length for entry in self._metadata.values())
@@ -1720,7 +1711,7 @@ class TensorDeserializer(
     def _read_single_tensor(
         self, expected_name: str
     ) -> torch.nn.Parameter:
-        this_one_tensor_filter = (lambda name: name == expected_name)
+        this_one_tensor_filter = lambda name: name == expected_name
         tensors = tuple(self.read_tensors(filter_func=this_one_tensor_filter))
         num_tensors = len(tensors)
         if num_tensors == 0:
@@ -1943,7 +1934,7 @@ class TensorDeserializer(
     ):
         try:
             with cls._get_decryption_manager(
-                decryption_pool, 
+                decryption_pool,
                 encryption_method,
                 key,
                 buffer
@@ -2162,8 +2153,6 @@ class TensorDeserializer(
 
         assert not tensor.is_sparse
         assert not tensor.is_cuda
-
-        global perf_stats
 
         start = time.perf_counter()
         tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
@@ -2411,7 +2400,7 @@ class TensorDeserializer(
                 else:
                     key = None
                     encryption_method = None
-            
+
                 needed_buffer_size = tensor_sizes_by_name[header.name]
                 is_meta = needed_buffer_size > 0 and header.data_length == 0
                 assert is_meta or needed_buffer_size == header.data_length
@@ -2429,7 +2418,6 @@ class TensorDeserializer(
                 mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * tensor_sizes_by_name[header.name])).contents)
 
                 if not is_meta:
-                    global perf_stats
                     start = time.perf_counter()
 
                     if unsafe_self._encrypted and mv.nbytes > 0:
@@ -2449,8 +2437,7 @@ class TensorDeserializer(
                     perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
                     perf_stats.file_readinto_bytes.add(mv.nbytes)
 
-                # create a tensor around it and torch.to('cuda')
-                # buffer_tensor.view(numpy_dtype) ?
+                # create a tensor around it and maybe torch.to('cuda')
                 numpy_tensor = _NumpyTensor.from_buffer(
                     numpy_dtype,
                     torch_dtype,
@@ -2464,7 +2451,7 @@ class TensorDeserializer(
                     # buffer_tensor. Instead buffer_tensor memory lives on as
                     # the actual tensor. So build a view based of buffer_tensor
                     # to retain the reference
-                    tensor = buffer_tensor.view(tensor.dtype).view(header.shape) 
+                    tensor = buffer_tensor.view(tensor.dtype).view(header.shape)
 
                 stream_context = cuda_stream_context() if is_cuda else contextlib.nullcontext()
                 with stream_context:
@@ -3761,8 +3748,6 @@ class TensorSerializer:
 
 
 def get_perf_stats():
-    global perf_stats
-
     return dict(
         cuda_to_device_secs=float(perf_stats.cuda_to_device_millisecs.load()) / 1000.0,
         cuda_bytes=perf_stats.cuda_bytes.load(),
