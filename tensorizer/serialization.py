@@ -2163,7 +2163,7 @@ class TensorDeserializer(
         # there are probably algorithms to do this more optimally
         tensor_sizes = [(name, self._metadata[name].data_length) for name in keys]
         if self._num_readers == 1:
-            tensors_per_reader=[tensor_sizes]
+            tensors_per_reader = [tensor_sizes]
         else:
             if not isinstance(self._file_spec, (str, bytes, os.PathLike, int)):
                 raise Exception("File specifier must be a string to support concurrent readers ")
@@ -2185,6 +2185,9 @@ class TensorDeserializer(
 
             if running_total:
                 # The last one gets the leftovers
+                if not tensors_per_reader:
+                    tensors_per_reader.append([])
+
                 tensors_per_reader[-1].extend(tensor_sizes[chunk_start:])
 
         transfer_out_queue = queue.SimpleQueue()  # type: queue.SimpleQueue[Union[Exception, TensorDeserializer._CopiedData]]

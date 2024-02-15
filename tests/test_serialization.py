@@ -571,22 +571,40 @@ class TestDeserialization(unittest.TestCase):
         check_inference(self, deserialized, model_name, default_device)
         deserialized.close()
 
-    @unittest.skipIf(not is_cuda_available, "plaid_mode requires CUDA")
-    def test_plaid_mode(self):
+    def test_lazy_load_multiple_readers(self):
         deserialized = TensorDeserializer(
-            self._serialized_model_path, device="cuda", plaid_mode=True
+            self._serialized_model_path, device=default_device, lazy_load=True, num_readers=4
+        )
+
+        check_deserialized(self, deserialized, model_name)
+        check_inference(self, deserialized, model_name, default_device)
+        deserialized.close()
+
+    @unittest.skipIf(not is_cuda_available, "requires CUDA")
+    def test_cuda(self):
+        deserialized = TensorDeserializer(
+            self._serialized_model_path, device="cuda"
         )
 
         check_deserialized(self, deserialized, model_name)
         deserialized.close()
 
-    @unittest.skipIf(not is_cuda_available, "plaid_mode requires CUDA")
-    def test_plaid_mode_inference(self):
+    @unittest.skipIf(not is_cuda_available, "requires CUDA")
+    def test_cuda_inference(self):
         deserialized = TensorDeserializer(
-            self._serialized_model_path, device="cuda", plaid_mode=True
+            self._serialized_model_path, device="cuda"
         )
 
         check_inference(self, deserialized, model_name, "cuda")
+        deserialized.close()
+
+    @unittest.skipIf(not is_cuda_available, "requires CUDA")
+    def test_cuda_multiple_readers(self):
+        deserialized = TensorDeserializer(
+            self._serialized_model_path, device="cuda", num_readers=4
+        )
+
+        check_deserialized(self, deserialized, model_name)
         deserialized.close()
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
@@ -749,27 +767,29 @@ class TestVerification(unittest.TestCase):
         os.unlink(cls._serialized_model_path)
 
     def test_verification(self):
-        for device in "cuda", "cpu":
-            if device == "cuda" and not is_cuda_available:
-                continue
-            with self.subTest(msg=f"Verifying hashes with device {device}"):
-                deserialized = TensorDeserializer(
-                    self._serialized_model_path, device=device, verify_hash=True
-                )
-                check_deserialized(self, deserialized, model_name)
-                deserialized.close()
-                del deserialized
+        for num_readers in (1, 4):
+            for device in "cuda", "cpu":
+                if device == "cuda" and not is_cuda_available:
+                    continue
+                with self.subTest(msg=f"Verifying hashes with device {device}"):
+                    deserialized = TensorDeserializer(
+                        self._serialized_model_path, device=device, verify_hash=True, num_readers=num_readers
+                    )
+                    check_deserialized(self, deserialized, model_name)
+                    deserialized.close()
+                    del deserialized
 
     @patch.object(serialization, "TensorHash", mock_invalid_tensor_hash)
     def test_verification_fail(self):
-        for device in "cuda", "cpu":
-            if device == "cuda" and not is_cuda_available:
-                continue
-            with self.subTest(msg=f"Verifying hashes with device {device}"):
-                with self.assertRaises(serialization.HashMismatchError):
-                    TensorDeserializer(
-                        self._serialized_model_path, device=device, verify_hash=True
-                    ).close()
+        for num_readers in (1, 4):
+            for device in "cuda", "cpu":
+                if device == "cuda" and not is_cuda_available:
+                    continue
+                with self.subTest(msg=f"Verifying hashes with device {device}"):
+                    with self.assertRaises(serialization.HashMismatchError):
+                        TensorDeserializer(
+                            self._serialized_model_path, device=device, verify_hash=True, num_readers=num_readers
+                        ).close()
 
     def test_module_verification(self):
         model_to_verify = AutoModelForCausalLM.from_pretrained(model_name)
