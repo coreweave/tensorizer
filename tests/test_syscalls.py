@@ -50,3 +50,38 @@ class TestSyscalls(unittest.TestCase):
             finally:
                 os.close(r_fd)
                 os.close(w_fd)
+
+    @unittest.skipUnless(
+        hasattr(os, "pwrite"), "pwrite must be available to test pwrite"
+    )
+    def test_out_of_order_pwrite(self):
+        def _filler(length: int) -> bytes:
+            mul, rem = divmod(length, 10)
+            return (b"0123456789" * (mul + (rem != 0)))[:length]
+
+        with tempfile.TemporaryFile("wb+", buffering=0) as file:
+            fd: int = file.fileno()
+
+            def pwrite(buffer: bytes, offset: int) -> None:
+                self.assertEqual(os.pwrite(fd, buffer, offset), len(buffer))
+
+            discontiguous_offset: int = (10 << 10) + 5
+            end_contents: bytes = _filler(10)
+            expected_size: int = discontiguous_offset + len(end_contents)
+            # This should fill the file with zeroes up to discontiguous_offset
+            pwrite(end_contents, discontiguous_offset)
+            self.assertEqual(os.stat(fd).st_size, expected_size)
+            start_contents: bytes = _filler(5 << 10)
+            # This should overwrite the existing zeroes,
+            # and not change the length of the file
+            pwrite(start_contents, 0)
+            self.assertEqual(os.stat(fd).st_size, expected_size)
+            total_written: int = len(start_contents) + len(end_contents)
+            # The expected end result is start_contents,
+            # a gap of zeroes up to discontiguous_offset, and then end_contents
+            expected_contents: bytes = (
+                start_contents
+                + bytes(expected_size - total_written)
+                + end_contents
+            )
+            self.assertEqual(file.read(), expected_contents)
