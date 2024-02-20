@@ -124,9 +124,9 @@ def linear_partition(
                 best = best_prefix_partition[end, partitions_remaining]
                 if (
                     prefer_fewer
-                    and largest_partition <= best
-                    or not prefer_fewer
                     and largest_partition < best
+                    or not prefer_fewer
+                    and largest_partition <= best
                 ):
                     # If forming a partition here gave
                     # a record low outcome, record it.
