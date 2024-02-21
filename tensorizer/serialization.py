@@ -18,6 +18,7 @@ import mmap
 import os
 import queue
 import struct
+import sys
 import threading
 import time
 import typing
@@ -2158,7 +2159,8 @@ class TensorDeserializer(
         assert not tensor.is_cuda
 
         start = time.perf_counter()
-        tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
+        print('is_pinned', tensor.is_pinned())
+        tensor_on_device = tensor.to(device=self._device, dtype=target_dtype, non_blocking=False)
         duration = time.perf_counter() - start
         perf_stats.cuda_to_device_millisecs.add(int(1000.0 * duration))
 
@@ -2262,6 +2264,9 @@ class TensorDeserializer(
         transfer_out_queue = queue.SimpleQueue()  # type: queue.SimpleQueue[Union[Exception, TensorDeserializer._CopiedData]]
 
         copy_threads = []
+        import time
+        print('sleep 5', file=sys.stderr)
+        time.sleep(5)
         barrier = threading.Barrier(len(tensors_per_reader))
         halt = AtomicUint(width=4)
 
@@ -2324,24 +2329,28 @@ class TensorDeserializer(
             file_ = unsafe_self._file
             file_.seek(begin_offset)
 
+        ref_holder = []
         try:
             # create CPU-pinned memory buffer
             # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
 
             buffer_ptr = None
             if is_cuda:
-                total_tensor_bytes = max(size for _, size in tensor_items)
+                max_tensor_bytes = max(size for _, size in tensor_items)
                 mode = 'mmap'
                 if mode == 'torch': # torch mode
-                    buffer_tensor = torch.empty((total_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
+                    buffer_tensor = torch.empty((max_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
                     buffer_ptr = buffer_tensor.data_ptr()
                 elif mode == 'mmap':
-                    buffer_mmap = mmap.mmap(-1, total_tensor_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | 0x2000 )
-                    buffer_ptr = ctypes.addressof((ctypes.c_char * total_tensor_bytes).from_buffer(buffer_mmap))
+                    # buffer_mmap = mmap.mmap(-1, max_tensor_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | 0x2000 )
+                    buffer_mmap = mmap.mmap(-1, max_tensor_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+                    buffer_ptr = ctypes.addressof((ctypes.c_char * max_tensor_bytes).from_buffer(buffer_mmap))
+                    ref_holder.append(buffer_mmap)
+                    ref_holder.append(buffer_ptr)
                     with torch.cuda.stream(cuda_stream):
-                        result = cudart.cudaHostRegister(buffer_ptr, total_tensor_bytes, 0) # TODO: unregister
-                        print(thread_idx, 'result', int(result))
-                        # cuda_stream.synchronize()
+                        pass
+                        result = cudart.cudaHostRegister(buffer_ptr, max_tensor_bytes, 0) # TODO: unregister
+                        print(thread_idx, 'allocating', max_tensor_bytes, 'result', int(result))
 
             tensor_sizes_by_name = dict(tensor_items)
 
@@ -2465,7 +2474,7 @@ class TensorDeserializer(
                         except Exception as e:
                             print(thread_idx, 'param', tensor.shape, header.name)
                             raise e
-                        # cuda_stream.synchronize()
+                        cuda_stream.synchronize()
                 else:
                     parameter = unsafe_self._to_torch_parameter(tensor)
 
