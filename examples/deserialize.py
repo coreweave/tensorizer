@@ -51,20 +51,22 @@ before_mem = get_mem_usage()
 # Lazy load the tensors from S3 into the model.
 if tracer is not None:
     tracer.start()
-start = time.time()
-deserializer = TensorDeserializer(
-    args.source,
-    plaid_mode=not args.no_plaid,
-    lazy_load=args.lazy_load,
-    encryption=decryption_params,
-    num_readers=args.num_readers,
-    verify_hash=args.verify_hash
-)
-deserializer.load_into_module(model)
-end = time.time()
-if tracer is not None:
-    tracer.stop()
-    tracer.save()
+try:
+    start = time.time()
+    deserializer = TensorDeserializer(
+        args.source,
+        plaid_mode=not args.no_plaid,
+        lazy_load=args.lazy_load,
+        encryption=decryption_params,
+        num_readers=args.num_readers,
+        verify_hash=args.verify_hash
+    )
+    deserializer.load_into_module(model)
+    end = time.time()
+finally:
+    if tracer is not None:
+        tracer.stop()
+        tracer.save()
 
 # Brag about how fast we are.
 total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
