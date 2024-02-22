@@ -1444,6 +1444,7 @@ class TensorDeserializer(
     """
     @dataclasses.dataclass
     class _CopiedData:
+        __slots__ = ("header", "numpy_tensor", "parameter")
         header: _TensorHeaderDeserializer
         numpy_tensor: _NumpyTensor
         parameter: torch.nn.Parameter
@@ -1465,7 +1466,7 @@ class TensorDeserializer(
         *,
         lazy_load: bool = False,
         plaid_mode: bool = False,
-        num_readers: Optional[int] = 1,
+        num_readers: int = 1,
         verify_hash: bool = False,
         encryption: Optional[DecryptionParams] = None,
     ):
@@ -1510,7 +1511,7 @@ class TensorDeserializer(
 
             self._file_spec = file_obj
             if isinstance(self._file_spec, (str, bytes, os.PathLike, int)):
-                self._file = stream_io.open_stream(self._file_spec, "rb", force_http=True)
+                self._file = stream_io.open_stream(self._file_spec, "rb")
             else:
                 self._mode_check(self._file_spec)
                 self._file = self._file_spec
@@ -1616,6 +1617,19 @@ class TensorDeserializer(
                     if filter_func(name)
                 }
 
+            if not isinstance(num_readers, int):
+                raise TypeError(
+                    f"num_readers: expected int, got {num_readers.__class__.__name__}"
+                )
+            elif num_readers < 1:
+                raise ValueError("num_readers must be positive")
+            elif num_readers > 1 and self._file_spec is self._file:
+                # TODO: Many files may be re-openable by name or `/proc/self/fd/...`
+                raise ValueError(
+                    "num_readers > 1 is not supported for pre-opened file objects"
+                )
+            elif num_readers > len(self._metadata):
+                num_readers = len(self._metadata)
             self._num_readers = num_readers
             self.total_tensor_bytes = sum(entry.deserialized_length for entry in self._metadata.values())
 
@@ -1985,8 +1999,7 @@ class TensorDeserializer(
 
         bulk_loader = self._bulk_load(keys_to_read, verify_hash)
         with contextlib.closing(bulk_loader):
-            for copied_data in bulk_loader:
-                yield copied_data
+            yield from bulk_loader
 
     def read_tensors(
         self,
@@ -2151,8 +2164,6 @@ class TensorDeserializer(
 
         gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
-        assert not tensor.is_sparse
-        assert not tensor.is_cuda
 
         start = time.perf_counter()
         tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
@@ -2189,10 +2200,10 @@ class TensorDeserializer(
         self, keys: Iterable[str], verify_hash: Optional[bool] = None
     ) -> Generator[_CopiedData, None, None]:
 
-        keys: Tuple[str, ...] = tuple(keys)
+        keys: Sequence[str] = tuple(keys)
         # Ensure all keys are present and in sorted order with self.keys()
         self_keys_enumerated = {k: i for i, k in enumerate(self.keys())}
-        key_indices: Sequence[Tuple[int, str]] = list(map(self_keys_enumerated.get, keys))
+        key_indices: Sequence[int] = list(map(self_keys_enumerated.get, keys))
         try:
             missing_key = key_indices.index(None)
             raise Exception(f"Key {keys[missing_key]} not found")
@@ -2277,7 +2288,7 @@ class TensorDeserializer(
             thread.start()
 
         for _ in range(len(keys)):
-            copied_data = transfer_out_queue.get()
+            copied_data = transfer_out_queue.get(timeout=3600)
             if isinstance(copied_data, Exception):
                 halt.store(1)
                 # error occurred; halt
