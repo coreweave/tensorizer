@@ -75,6 +75,7 @@ class PerfStats:
     file_readinto_bytes: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
     cuda_to_device_millisecs: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
     cuda_bytes: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
+    alloc_millisecs: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
 
 perf_stats = PerfStats()
 
@@ -2343,27 +2344,26 @@ class TensorDeserializer(
             # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
 
             buffer_ptr = None
+            buffer = None
+            alloc_start = time.perf_counter()
             if is_cuda:
                 max_tensor_bytes = max(size for _, size in tensor_items)
                 mode = os.environ.get('TENSORIZER_ALLOC_MODE', 'torch')
                 if mode == 'torch': # torch mode
                     buffer_tensor = torch.empty((max_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
                     buffer_ptr = buffer_tensor.data_ptr()
-                    mv = (ctypes.c_char * max_tensor_bytes).from_buffer(buffer_tensor)
                 elif mode == 'mmap':
-                    buffer_mmap = mmap.mmap(-1, max_tensor_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | 0x2000 )
-                    mv_locked = memoryview(buffer_mmap)
-                    ref_holder.append(mv_locked)
-                    b = (ctypes.c_char * max_tensor_bytes).from_buffer(buffer_mmap)
+                    buffer = mmap.mmap(-1, max_tensor_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | 0x2000 )
+                    b = (ctypes.c_char * max_tensor_bytes).from_buffer(buffer)
                     buffer_ptr = ctypes.addressof(b)
-                    ref_holder.append(b)
-                    ref_holder.append(buffer_mmap)
-                    ref_holder.append(buffer_ptr)
+
                     memset(buffer_ptr, 0, max_tensor_bytes)
+
                     with torch.cuda.stream(cuda_stream):
                         result = cudart.cudaHostRegister(buffer_ptr, max_tensor_bytes, 0) # TODO: unregister
                         # cuda_stream.synchronize()
-                        print(thread_idx, 'allocating', buffer_ptr, max_tensor_bytes, 'bytes', 'result', int(result))
+                        assert result == 0
+                        # print(thread_idx, 'allocating', buffer_ptr, max_tensor_bytes, 'bytes', 'result', int(result))
                 elif mode == 'cudaHostAlloc':
                     libcudart = ctypes.CDLL("libcudart.so")
 
@@ -2386,7 +2386,10 @@ class TensorDeserializer(
                     memset(buffer_ptr, 0, max_tensor_bytes)
                     with torch.cuda.stream(cuda_stream):
                         result = cudart.cudaHostRegister(buffer_ptr, max_tensor_bytes, 0) # TODO: unregister
-                        print(thread_idx, 'allocating', buffer_ptr, max_tensor_bytes, 'bytes','result', int(result))
+                        assert result == 0
+                        # print(thread_idx, 'allocating', buffer_ptr, max_tensor_bytes, 'bytes','result', int(result))
+            alloc_duration = time.perf_counter() - alloc_start
+            perf_stats.alloc_millisecs.add(int(1000.0 * alloc_duration))
 
 
             tensor_sizes_by_name = dict(tensor_items)
@@ -2466,8 +2469,10 @@ class TensorDeserializer(
                     buffer_tensor.zero_()
 
                 assert buffer_ptr is not None
-                # mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * tensor_sizes_by_name[header.name])).contents)
-                mv = memoryview(buffer)[:tensor_sizes_by_name[header.name]]
+                if buffer is not None:
+                    mv = memoryview(buffer)[:tensor_sizes_by_name[header.name]]
+                else:
+                    mv = memoryview(ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_byte * tensor_sizes_by_name[header.name])).contents)
 
                 if not is_meta:
                     start = time.perf_counter()
@@ -3809,5 +3814,6 @@ def get_perf_stats():
         cuda_to_device_secs=float(perf_stats.cuda_to_device_millisecs.load()) / 1000.0,
         cuda_bytes=perf_stats.cuda_bytes.load(),
         file_readinto_secs=float(perf_stats.file_readinto_millisecs.load()) / 1000.0,
-        file_readinto_bytes=perf_stats.file_readinto_bytes.load()
+        file_readinto_bytes=perf_stats.file_readinto_bytes.load(),
+        alloc_secs=float(perf_stats.alloc_millisecs.load()) / 1000.0,
     )
