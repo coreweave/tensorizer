@@ -49,6 +49,7 @@ import torch
 
 import tensorizer._crypt as _crypt
 import tensorizer._crypt_info as _crypt_info
+import tensorizer._linear_partition as _linear_partition
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 from tensorizer._crypt._cgroup_cpu_count import (
@@ -2300,38 +2301,28 @@ class TensorDeserializer(
         # Main route for multiple keys
 
         # Each reader will sequentially read a segment of the file
-        # Chunk up the keys into approximately similiar amounts of bytes to read per reader
-        # there are probably algorithms to do this more optimally
-        tensor_sizes = [(name, self._metadata[name].deserialized_length) for name in keys]
+        # Segments are chosen to minimize the maximum length of any segment
+        tensor_info: Tuple[TensorEntry, ...] = tuple(
+            map(self._metadata.__getitem__, keys)
+        )
+        tensors_per_reader: List[Tuple[TensorEntry, ...]]
         if self._num_readers == 1:
-            tensors_per_reader = [tensor_sizes]
+            tensors_per_reader = [tensor_info]
         else:
-            total_tensor_bytes = sum(tensor_size for _, tensor_size in tensor_sizes)
-            ideal_tensor_bytes_per_reader = int(total_tensor_bytes / self._num_readers)
-
-            tensors_per_reader = []
-            running_total = 0
-            chunk_start = 0
-            for tensor_size_idx in range(len(tensor_sizes)):
-                # if this tensor would make this current reader more than ideal_tensor_bytes_per_reader, and there's at least one existing item in the reader
-                if running_total + tensor_sizes[tensor_size_idx][1] > ideal_tensor_bytes_per_reader and chunk_start != tensor_size_idx:
-                    # break it
-                    tensors_per_reader.append(tensor_sizes[chunk_start:tensor_size_idx])
-                    chunk_start = tensor_size_idx
-                    running_total = 0
-                running_total += tensor_sizes[tensor_size_idx][1]
-
-            if running_total:
-                # The last one gets the leftovers
-                if not tensors_per_reader:
-                    tensors_per_reader.append([])
-
-                tensors_per_reader[-1].extend(tensor_sizes[chunk_start:])
+            tensor_sizes: List[int] = [
+                t.deserialized_length for t in tensor_info
+            ]
+            reader_slices: Iterable[slice] = _linear_partition.partition(
+                tensor_sizes, self._num_readers
+            )
+            tensors_per_reader = [tensor_info[s] for s in reader_slices]
+            del tensor_sizes, reader_slices
+        effective_num_readers: int = len(tensors_per_reader)
 
         transfer_out_queue = queue.SimpleQueue()  # type: queue.SimpleQueue[Union[Exception, TensorDeserializer._CopiedData]]
 
         copy_threads = []
-        barrier = threading.Barrier(len(tensors_per_reader))
+        barrier = threading.Barrier(effective_num_readers)
         halt = AtomicUint(width=4)
 
         for thread_idx, tensor_items in enumerate(tensors_per_reader):
@@ -2366,7 +2357,7 @@ class TensorDeserializer(
             halt: AtomicUint,
             barrier: threading.Barrier,
             verify_hash: bool,
-            tensor_items: Sequence[Tuple[str, int]],  # (name, size)
+            tensor_items: Sequence[TensorEntry],
             transfer_out_queue  # type: queue.SimpleQueue[Union[Exception, TensorDeserializer._CopiedData]]
     ):
         # Need to get rid of self or more safely have thread-local storage
@@ -2380,8 +2371,8 @@ class TensorDeserializer(
         # ensure all threads are created before we go
         barrier.wait()
 
-        begin_offset = unsafe_self._metadata[tensor_items[0][0]].offset
-        end_offset = unsafe_self._metadata[tensor_items[-1][0]].data_offset + unsafe_self._metadata[tensor_items[-1][0]].data_length
+        begin_offset = tensor_items[0].offset
+        end_offset = tensor_items[-1].data_offset + tensor_items[-1].data_length
 
         if unsafe_self._num_readers > 1:
             assert isinstance(unsafe_self._file_spec, str)
@@ -2396,11 +2387,15 @@ class TensorDeserializer(
 
             buffer_ptr = None
             if is_cuda:
-                total_tensor_bytes = max(size for _, size in tensor_items)
+                total_tensor_bytes: int = max(
+                    t.deserialized_length for t in tensor_items
+                )
                 buffer_tensor = torch.empty((total_tensor_bytes,), dtype=torch.uint8, pin_memory=True)
                 buffer_ptr = buffer_tensor.data_ptr()
 
-            tensor_sizes_by_name = dict(tensor_items)
+            tensor_sizes_by_name: Dict[str, int] = {
+                t.name: t.deserialized_length for t in tensor_items
+            }
 
             # then for each tensor in tensor_items
             tensors_read = 0
