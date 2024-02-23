@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import zipfile
@@ -35,6 +36,23 @@ from tensorizer import TensorDeserializer, TensorSerializer, stream_io, utils
 s3_access_key_id = os.environ.get("S3_ACCESS_KEY_ID") or None
 s3_secret_access_key = os.environ.get("S3_SECRET_ACCESS_KEY") or None
 s3_endpoint = os.environ.get("S3_ENDPOINT_URL") or None
+
+if s3_endpoint is None and (
+    s3_access_key_id is None or s3_secret_access_key is None
+):
+    s3_endpoint = stream_io._infer_credentials(
+        s3_access_key_id, s3_secret_access_key, s3_endpoint
+    ).s3_endpoint
+    if s3_endpoint is None:
+        s3_endpoint = stream_io.default_s3_read_endpoint
+s3_endpoint = re.sub(
+    r"^accel-(object\.\w+\.coreweave\.com)",
+    r"\1",
+    s3_endpoint,
+    1,
+    re.IGNORECASE,
+)
+
 
 _read_stream, _write_stream = (
     partial(
