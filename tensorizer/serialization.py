@@ -2312,7 +2312,7 @@ class TensorDeserializer(
             tensors_per_reader = [tensor_info]
         else:
             tensor_sizes: List[int] = [
-                t.deserialized_length for t in tensor_info
+                t.data_length for t in tensor_info
             ]
             reader_slices: Iterable[slice] = _linear_partition.partition(
                 tensor_sizes, self._num_readers
