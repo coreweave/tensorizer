@@ -1104,9 +1104,9 @@ def open_stream(
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
+    *,
     begin: Optional[int] = None,
     end: Optional[int] = None,
-    *,
     certificate_handling: Optional[CAInfo] = None,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
@@ -1358,7 +1358,7 @@ def open_stream(
                 'Only binary modes ("rb", "wb", "wb+", etc.)'
                 " are valid when opening local file streams."
             )
-        if "w" in normalized_mode:
+        if any(map(normalized_mode.__contains__, "wax")):
             dirname = os.path.dirname(path_uri)
             if dirname:
                 os.makedirs(os.path.dirname(path_uri), exist_ok=True)

@@ -11,6 +11,7 @@ import dataclasses
 import enum
 import functools
 import hashlib
+import heapq
 import io
 import itertools
 import logging
@@ -59,13 +60,13 @@ from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor
 
 @dataclasses.dataclass
-class PerfStats:
+class _PerfStats:
     file_readinto_millisecs: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
     file_readinto_bytes: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
     cuda_to_device_millisecs: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
     cuda_bytes: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
 
-perf_stats = PerfStats()
+_perf_stats = _PerfStats()
 
 lz4 = None
 
@@ -1394,6 +1395,7 @@ class TensorDeserializer(
             accessed. If False, all tensors will be loaded into memory up
             front.
         plaid_mode: left for backwards compatibility; has no effect
+        plaid_mode_buffers: left for backwards compatibility; has no effect
         num_readers: Number of individual threads from which to read the file_obj.
             If num_readers > 1, file_obj must be a path or URI, not a file-like object
         verify_hash: If True, the hashes of each tensor will be verified
@@ -1445,6 +1447,7 @@ class TensorDeserializer(
     """
     @dataclasses.dataclass
     class _CopiedData:
+        __slots__ = ("header", "numpy_tensor", "parameter")
         header: _TensorHeaderDeserializer
         numpy_tensor: _NumpyTensor
         parameter: torch.nn.Parameter
@@ -1465,8 +1468,9 @@ class TensorDeserializer(
         dtype: Optional[torch.dtype] = None,
         *,
         lazy_load: bool = False,
-        plaid_mode: bool = False,
-        num_readers: Optional[int] = 1,
+        plaid_mode: bool = False,  # pylint: disable=unused-argument
+        plaid_mode_buffers: Optional[int] = None,  # pylint: disable=unused-argument
+        num_readers: int = 1,
         verify_hash: bool = False,
         encryption: Optional[DecryptionParams] = None,
     ):
@@ -1511,13 +1515,14 @@ class TensorDeserializer(
 
             self._file_spec = file_obj
             if isinstance(self._file_spec, (str, bytes, os.PathLike, int)):
-                self._file = stream_io.open_stream(self._file_spec, "rb", force_http=True)
+                self._file = stream_io.open_stream(self._file_spec, "rb")
             else:
                 self._mode_check(self._file_spec)
                 self._file = self._file_spec
             self._cleanup.callback(self._file.close)
             self.total_compressed_tensor_bytes = 0
             self.read_bytes = 0
+            self._last_yielded_key: Optiona[str] = None
 
             # If device is None, use the current device, otherwise use the given
             # device.
@@ -1617,8 +1622,38 @@ class TensorDeserializer(
                     if filter_func(name)
                 }
 
+            if not isinstance(num_readers, int):
+                raise TypeError(
+                    f"num_readers: expected int, got {num_readers.__class__.__name__}"
+                )
+            elif num_readers < 1:
+                raise ValueError("num_readers must be positive")
+            elif num_readers > 1 and self._file_spec is self._file:
+                # TODO: Many files may be re-openable by name or `/proc/self/fd/...`
+                raise ValueError(
+                    "num_readers > 1 is not supported for pre-opened file objects"
+                )
+            elif num_readers > len(self._metadata):
+                num_readers = len(self._metadata)
             self._num_readers = num_readers
             self.total_tensor_bytes = sum(entry.deserialized_length for entry in self._metadata.values())
+            num_tensors = len(self._metadata)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                # Skip creating this string unless debug logging is enabled
+                logger.debug(
+                    f"Deserializing {self.total_tensor_bytes} bytes"
+                    f" from {num_tensors}"
+                    f" tensor{'s' * (num_tensors != 1)} using"
+                    f" lazy_load={self._lazy_load},"
+                    f" verify_hash={self._verify_hash},"
+                    f" encrypted={bool(self._encrypted)},"
+                    f" device={self._device},"
+                    f" dtype={self._dtype},"
+                    f" data_version={self._file_header.version_number}"
+                )
+
+            self._keys_enumerated: Dict[str, int] = {k: i for i, k in enumerate(self.keys())}
 
             # The number of bytes we've allocated so far. Tensors may be read
             # from the file in any order, so we need to keep track of how much
@@ -1958,6 +1993,7 @@ class TensorDeserializer(
     def _read_numpytensors(
         self,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
         verify_hash: Optional[bool] = None,
     ) -> Iterator[_CopiedData]:
         """
@@ -1970,6 +2006,10 @@ class TensorDeserializer(
         Args:
             filter_func: A function that takes a tensor name and returns
                 True if the tensor should be returned, False otherwise.
+            num_tensors: The number of tensors to read. If -1, all tensors
+                will be read. If the zero-byte header is encountered before
+                `num_tensors` tensors are read, the generator will stop
+                yielding values.
             verify_hash: If True, the hashes of each tensor will be verified
                 against the hashes stored in the metadata.
                 A `HashMismatchError` will be raised if any of the hashes do
@@ -1984,16 +2024,22 @@ class TensorDeserializer(
         if filter_func is not None:
             keys_to_read = filter(filter_func, keys_to_read)
 
+        if self._last_yielded_key is not None and num_tensors > 0:
+            last_yielded_idx = self._keys_enumerated[self._last_yielded_key]
+            keys_to_read = itertools.islice(
+                itertools.dropwhile(lambda k: self._keys_enumerated[k] <= last_yielded_idx, keys_to_read),
+                num_tensors)
+
         bulk_loader = self._bulk_load(keys_to_read, verify_hash)
         with contextlib.closing(bulk_loader):
-            for copied_data in bulk_loader:
-                yield copied_data
+            yield from bulk_loader
 
     def read_tensors(
         self,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
         verify_hash: Optional[bool] = None,
-    ) -> Iterator[Tuple[int, int, str, torch.nn.Parameter]]:
+    ) -> Iterator[Tuple[int, int, str, torch.Tensor]]:
         """
         A generator that deserializes tensors and returns the `module_idx`,
         `tensor_type`, parameter/buffer `name`, and torch `tensor`.
@@ -2004,12 +2050,15 @@ class TensorDeserializer(
         Args:
             filter_func: A function that takes a tensor name and returns
                 True if the tensor should be returned, False otherwise.
+            num_tensors: The number of tensors to read. If -1, all tensors
+                will be read. If the zero-byte header is encountered before
+                `num_tensors` tensors are read, the generator will stop
+                yielding values.
             verify_hash: If True, the hashes of each tensor will be verified
                 against the hashes stored in the metadata.
                 A `HashMismatchError` will be raised if any of the hashes do
                 not match. If ``None``, the value of the `verify_hash` argument
                 passed to the `TensorDeserializer` constructor will be used.
-
         Yields:
             Tuples of the form (module_idx, tensor_type, name, tensor).
 
@@ -2017,9 +2066,9 @@ class TensorDeserializer(
             HashMismatchError: If ``verify_hash`` resolves to True and
                 a deserialized tensor does not match its stored hash.
         """
-
         copied_data = self._read_numpytensors(
             filter_func=filter_func,
+            num_tensors=num_tensors,
             verify_hash=verify_hash,
         )
         for data in copied_data:
@@ -2028,6 +2077,7 @@ class TensorDeserializer(
     def read_numpy_arrays(
         self,
         filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        num_tensors: int = -1,
         allow_raw_data: bool = False,
         verify_hash: Optional[bool] = None,
     ) -> Iterator[Tuple[int, int, str, numpy.ndarray, bool, Optional[str]]]:
@@ -2069,6 +2119,10 @@ class TensorDeserializer(
         Args:
             filter_func: A function that takes a tensor name and returns
                 True if the tensor should be returned, False otherwise.
+            num_tensors: The number of tensors to read. If -1, all tensors
+                will be read. If the zero-byte header is encountered before
+                `num_tensors` tensors are read, the generator will stop
+                yielding values.
             allow_raw_data: Whether to return numpy arrays containing
                 uninterpretable opaque datatypes. If False and opaque
                 datatypes are encountered, then a `ValueError` is raised.
@@ -2103,6 +2157,7 @@ class TensorDeserializer(
         """
         copied_data = self._read_numpytensors(
             filter_func=filter_func,
+            num_tensors=num_tensors,
             verify_hash=verify_hash,
         )
         for data in copied_data:
@@ -2152,19 +2207,17 @@ class TensorDeserializer(
 
         gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
-        assert not tensor.is_sparse
-        assert not tensor.is_cuda
 
         start = time.perf_counter()
         tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
         duration = time.perf_counter() - start
-        perf_stats.cuda_to_device_millisecs.add(int(1000.0 * duration))
+        _perf_stats.cuda_to_device_millisecs.add(int(1000.0 * duration))
 
         result = torch.nn.Parameter(
             tensor_on_device,
             requires_grad=gradient,
         )
-        perf_stats.cuda_bytes.add(result.nbytes)
+        _perf_stats.cuda_bytes.add(result.nbytes)
         return result
 
     def _generate_state_dict(self) -> None:
@@ -2189,30 +2242,55 @@ class TensorDeserializer(
     def _bulk_load(
         self, keys: Iterable[str], verify_hash: Optional[bool] = None
     ) -> Generator[_CopiedData, None, None]:
+        # For each key in keys, identify the ones that are not in self._cache and run those through _bulk_load_uncached
+        # Results are stored in self._cache
+        # Results are then yielded in order with the keys provided
 
-        keys: Tuple[str, ...] = tuple(keys)
+        keys = tuple(keys)
+        if len(set(keys)) != len(keys):
+            raise ValueError("Keys must not have any duplicates")
+
+        ordered_items_by_key: Dict[str, Tuple[int, Optional[TensorDeserializer._CopiedData]]] = {k: (i, self._cache.get(k)) for i, k in enumerate(keys)}
+
+        heap: List[Tuple[int, TensorDeserializer._CopiedData]] = [item for item in ordered_items_by_key.values() if item[1] is not None]
+        heapq.heapify(heap)
+
+        next_idx_to_yield = 0
+        uncached = [k for k, item in ordered_items_by_key.items() if item[1] is None]
+        if uncached:
+            loader = self._bulk_load_uncached(uncached, verify_hash)
+            with contextlib.closing(loader):
+                for item in loader:
+                    self._cache[item.header.name] = item
+
+                    heapq.heappush(heap, (ordered_items_by_key[item.header.name][0], item))
+                    while heap and heap[0][0] == next_idx_to_yield:
+                        # self._last_yielded_key is used by self._read_numpytensors() when num_tensors > 0
+                        self._last_yielded_key = heap[0][1].header.name
+                        yield heapq.heappop(heap)[1]
+                        next_idx_to_yield += 1
+
+        while heap and heap[0][0] == next_idx_to_yield:
+            self._last_yielded_key = heap[0][1].header.name
+            yield heapq.heappop(heap)[1]
+            next_idx_to_yield += 1
+
+    def _bulk_load_uncached(
+        self, keys: Sequence[str], verify_hash: Optional[bool] = None
+    ) -> Generator[_CopiedData, None, None]:
+
         # Ensure all keys are present and in sorted order with self.keys()
-        self_keys_enumerated = {k: i for i, k in enumerate(self.keys())}
-        key_indices: Sequence[Tuple[int, str]] = list(map(self_keys_enumerated.get, keys))
+        key_indices: List[int] = list(map(self._keys_enumerated.get, keys))
         try:
             missing_key = key_indices.index(None)
-            raise Exception(f"Key {keys[missing_key]} not found")
+            raise KeyError(f"Key {keys[missing_key]} not found")
         except ValueError:
             pass
+        if len(set(key_indices)) != len(key_indices):
+            raise ValueError("Keys must not have any duplicates")
         if list(sorted(key_indices)) != key_indices:
             # we could just re-sort, I suppose
-            raise Exception("Keys must be specified in same order as TensorDeserializer.keys()")
-
-        # Splice cached values with freshly loaded values
-        # when some are cached and some are not by using a recursive call
-        uncached = []
-        for k in keys:
-            cached = self._cache.get(k)
-            if cached is not None:
-                yield cached
-            else:
-                uncached.append(k)
-        keys = uncached
+            raise ValueError("Keys must be specified in same order as TensorDeserializer.keys()")
 
         if not keys:
             return
@@ -2231,9 +2309,6 @@ class TensorDeserializer(
         if self._num_readers == 1:
             tensors_per_reader = [tensor_info]
         else:
-            if not isinstance(self._file_spec, (str, bytes, os.PathLike, int)):
-                raise Exception("File specifier must be a string to support concurrent readers ")
-
             tensor_sizes: List[int] = [
                 t.deserialized_length for t in tensor_info
             ]
@@ -2268,14 +2343,12 @@ class TensorDeserializer(
             thread.start()
 
         for _ in range(len(keys)):
-            copied_data = transfer_out_queue.get()
+            copied_data = transfer_out_queue.get(timeout=3600)
             if isinstance(copied_data, Exception):
                 halt.store(1)
                 # error occurred; halt
                 raise copied_data
 
-            name = copied_data.header.name
-            self._cache[name] = copied_data
             yield copied_data
 
     def _copy_thread(
@@ -2289,11 +2362,10 @@ class TensorDeserializer(
     ):
         # Need to get rid of self or more safely have thread-local storage
 
-        # cuda stream. First one is slow, spin it off? This is gross TOOD bchess
         is_cuda = unsafe_self._device.type == 'cuda'
         cuda_stream = None
         if is_cuda:
-            cuda_stream = torch.cuda.Stream()
+            cuda_stream = torch.cuda.Stream(unsafe_self._device)
 
         # Allocating pinned memory seems to block creating new threads, so
         # ensure all threads are created before we go
@@ -2337,8 +2409,8 @@ class TensorDeserializer(
                     check_crypt_info=unsafe_self._has_crypt_info,
                 )
 
-                if header is None: # bchess how would this happen?
-                    break
+                if header is None:
+                    raise ValueError('Unexpected empty header')
 
                 # Skip it if this tensor is not one we're supposed to load
                 if header.name not in tensor_sizes_by_name:
@@ -2360,9 +2432,8 @@ class TensorDeserializer(
 
                 unsafe_self._metadata[header.name].hashes = header.hashes
 
-                if verify_hash:
-                    header_hashes = header.compute_hashes()
-                    unsafe_self._metadata[header.name].header_hashes = header_hashes
+                header_hashes = header.compute_hashes()
+                unsafe_self._metadata[header.name].header_hashes = header_hashes
 
                 is_encrypted: bool = (
                     header.crypt_info is not None
@@ -2419,8 +2490,8 @@ class TensorDeserializer(
                         unsafe_self._verify_hashes(header.name, header.hashes, header_hashes, mv)
 
                     duration = time.perf_counter() - start
-                    perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
-                    perf_stats.file_readinto_bytes.add(mv.nbytes)
+                    _perf_stats.file_readinto_millisecs.add(int(1000.0 * duration))
+                    _perf_stats.file_readinto_bytes.add(mv.nbytes)
 
                 # create a tensor around it and maybe torch.to('cuda')
                 numpy_tensor = _NumpyTensor.from_buffer(
@@ -3733,10 +3804,10 @@ class TensorSerializer:
         )
 
 
-def get_perf_stats():
+def _get_perf_stats():
     return dict(
-        cuda_to_device_secs=float(perf_stats.cuda_to_device_millisecs.load()) / 1000.0,
-        cuda_bytes=perf_stats.cuda_bytes.load(),
-        file_readinto_secs=float(perf_stats.file_readinto_millisecs.load()) / 1000.0,
-        file_readinto_bytes=perf_stats.file_readinto_bytes.load()
+        cuda_to_device_secs=float(_perf_stats.cuda_to_device_millisecs.load()) / 1000.0,
+        cuda_bytes=_perf_stats.cuda_bytes.load(),
+        file_readinto_secs=float(_perf_stats.file_readinto_millisecs.load()) / 1000.0,
+        file_readinto_bytes=_perf_stats.file_readinto_bytes.load()
     )
