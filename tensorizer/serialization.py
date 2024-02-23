@@ -20,6 +20,7 @@ import queue
 import struct
 import threading
 import time
+import urllib.parse
 import typing
 import weakref
 import zlib
@@ -1636,6 +1637,7 @@ class TensorDeserializer(
             elif num_readers > len(self._metadata):
                 num_readers = len(self._metadata)
             self._num_readers = num_readers
+
             self.total_tensor_bytes = sum(entry.deserialized_length for entry in self._metadata.values())
             num_tensors = len(self._metadata)
 
@@ -2374,14 +2376,16 @@ class TensorDeserializer(
         begin_offset = tensor_items[0].offset
         end_offset = tensor_items[-1].data_offset + tensor_items[-1].data_length
 
-        if unsafe_self._num_readers > 1:
-            assert isinstance(unsafe_self._file_spec, str)
-            file_ = stream_io.open_stream(unsafe_self._file_spec, "rb", begin=begin_offset, end=end_offset)
-        else:
-            file_ = unsafe_self._file
-            file_.seek(begin_offset)
+        file_ = None
 
         try:
+            if unsafe_self._num_readers > 1:
+                assert isinstance(unsafe_self._file_spec, str)
+                file_ = stream_io.open_stream(unsafe_self._file_spec, "rb", begin=begin_offset, end=end_offset)
+            else:
+                file_ = unsafe_self._file
+                file_.seek(begin_offset)
+
             # create CPU-pinned memory buffer
             # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
 
@@ -2521,7 +2525,7 @@ class TensorDeserializer(
         except Exception as e:
             transfer_out_queue.put(e)
         finally:
-            if file_ is not unsafe_self._file:
+            if file_ is not None and file_ is not unsafe_self._file:
                 file_.close()
 
 

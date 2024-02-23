@@ -222,6 +222,13 @@ class CURLStreamFile(io.BufferedIOBase):
             buffer_size = 16 << 20  # 16mb
         self._uri = uri
         self._error_context = []
+        self._curl = None
+
+        # Avoid Coreweave accel-object footgun
+        if begin and 'accel-object.' in uri:
+            raise ValueError('Range requests are not supported for CoreWeave '
+                'Accelerated Object Storage. Set num_readers to 1 to avoid range '
+                'requests, or use a different endpoint')
 
         if curl_path is None:
             raise RuntimeError(
@@ -263,7 +270,6 @@ class CURLStreamFile(io.BufferedIOBase):
             for k, v in headers.items():
                 cmd.extend(["--header", f"{k}: {v}"])
 
-        self._curl = None
         with _wide_pipes.widen_new_pipes():  # Widen on Windows
             popen_start = time.monotonic()
             self._curl = subprocess.Popen(
