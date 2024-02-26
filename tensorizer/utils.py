@@ -282,7 +282,7 @@ Model = TypeVar("Model")
 
 def no_init_or_tensor(
     loading_code: Optional[Callable[..., Model]] = None,
-    suppression_method: Optional[str] = "meta_tensors"
+    suppression_method: Optional[str] = "meta_tensors",
 ) -> Union[Model, ContextManager]:
     """
     Suppress the initialization of weights while loading a model.
@@ -295,6 +295,9 @@ def no_init_or_tensor(
         loading_code: Either a callable to evaluate
             with model weight initialization suppressed,
             or None (the default) to use as a context manager.
+        suppression_method: The method to use for suppressing weight
+            initialization. Can be one of "meta_tensors" (default) or
+            "zero_length_tensors".
 
     Returns:
         The return value of `loading_code`, if `loading_code` is callable.
@@ -406,4 +409,3 @@ class _NoInitOrTensorImpl:
         return _NoInitOrTensorImpl._ORIGINAL_EMPTY(*args, **kwargs)
 
     __init__ = None
-
