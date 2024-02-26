@@ -281,7 +281,8 @@ Model = TypeVar("Model")
 
 
 def no_init_or_tensor(
-    loading_code: Optional[Callable[..., Model]] = None
+    loading_code: Optional[Callable[..., Model]] = None,
+    suppression_method: Optional[str] = "meta_tensors"
 ) -> Union[Model, ContextManager]:
     """
     Suppress the initialization of weights while loading a model.
@@ -316,9 +317,9 @@ def no_init_or_tensor(
             model = no_init_or_tensor(lambda: AutoModelForCausalLM.from_config(config))
     """
     if loading_code is None:
-        return _NoInitOrTensorImpl.context_manager()
+        return _NoInitOrTensorImpl.context_manager(suppression_method)
     elif callable(loading_code):
-        with _NoInitOrTensorImpl.context_manager():
+        with _NoInitOrTensorImpl.context_manager(suppression_method):
             return loading_code()
     else:
         raise TypeError(
@@ -342,12 +343,17 @@ class _NoInitOrTensorImpl:
     is_active = contextvars.ContextVar(
         "_NoInitOrTensorImpl.is_active", default=False
     )
+
     _count_active: int = 0
     _count_active_lock = threading.Lock()
 
     @classmethod
     @contextlib.contextmanager
-    def context_manager(cls):
+    def context_manager(cls, suppression_method: Optional[str] = "fill_meta"):
+        suppression_method_to_func = {
+            "meta_tensors": cls._meta_empty,
+            "zero_length_tensors": cls._zero_length,
+        }
         if cls.is_active.get():
             yield
             return
@@ -359,7 +365,7 @@ class _NoInitOrTensorImpl:
                     mod.reset_parameters = cls._disable(mod.reset_parameters)
                 # When torch.empty is called, make it map to meta device by replacing
                 # the device in kwargs.
-                torch.empty = cls._meta_empty
+                torch.empty = suppression_method_to_func[suppression_method]
         reset_token = cls.is_active.set(True)
 
         try:
@@ -389,4 +395,15 @@ class _NoInitOrTensorImpl:
             kwargs["device"] = "meta"
         return _NoInitOrTensorImpl._ORIGINAL_EMPTY(*args, **kwargs)
 
+    @staticmethod
+    def _zero_length(*args, **kwargs):
+        # Behaves as torch.empty except in an active context
+        if _NoInitOrTensorImpl.is_active.get():
+            if args:
+                args = ((0,),) + args[1:]
+            else:
+                kwargs["size"] = (0,)
+        return _NoInitOrTensorImpl._ORIGINAL_EMPTY(*args, **kwargs)
+
     __init__ = None
+
