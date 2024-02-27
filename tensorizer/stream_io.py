@@ -826,8 +826,8 @@ def _new_s3_client(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str,
-    region_name: str = None,
-    signature_version: str = None,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
 ):
     if s3_secret_access_key is None:
         raise TypeError("No secret key provided")
@@ -839,19 +839,18 @@ def _new_s3_client(
     config_args = dict(user_agent=_BOTO_USER_AGENT)
     auth_args = {}
 
+    if s3_region_name is not None:
+        config_args["region_name"] = s3_region_name
+
     if s3_access_key_id == s3_secret_access_key == "":
         config_args["signature_version"] = botocore.UNSIGNED
-        if region_name is not None:
-            config_args["region_name"] = region_name
     else:
         auth_args = dict(
             aws_access_key_id=s3_access_key_id,
             aws_secret_access_key=s3_secret_access_key,
         )
-        if signature_version is not None:
-            config_args["signature_version"] = signature_version
-        if region_name is not None:
-            config_args["region_name"] = region_name
+        if s3_signature_version is not None:
+            config_args["signature_version"] = s3_signature_version
 
     config = boto3.session.Config(**config_args)
 
@@ -889,8 +888,8 @@ def s3_upload(
         s3_access_key_id,
         s3_secret_access_key,
         s3_endpoint,
-        region_name=s3_region_name,
-        signature_version=s3_signature_version,
+        s3_region_name=s3_region_name,
+        s3_signature_version=s3_signature_version,
     )
     client.upload_file(path, bucket, key)
 
@@ -900,8 +899,8 @@ def _s3_download_url(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
-    s3_region_name: str = None,
-    s3_signature_version: str = None,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
 ) -> str:
     bucket, key = _parse_s3_uri(path_uri)
     # v2 signature is important to easily align the presigned URL expiry
@@ -920,11 +919,11 @@ def _s3_download_url(
         s3_access_key_id,
         s3_secret_access_key,
         s3_endpoint,
-        region_name=s3_region_name,
-        signature_version=s3_signature_version,
+        s3_region_name=s3_region_name,
+        s3_signature_version=s3_signature_version,
     )
 
-    # Explaination with SIG_GRANULARITY=1h
+    # Explanation with SIG_GRANULARITY=1h
     # compute an expiry that is aligned to the hour, at least 1 hour
     # away from present time
     # time=00:00:00 -> expiry=02:00:00
@@ -1115,12 +1114,12 @@ def open_stream(
     s3_access_key_id: Optional[str] = None,
     s3_secret_access_key: Optional[str] = None,
     s3_endpoint: Optional[str] = None,
-    s3_region_name: Optional[str] = None,
-    s3_signature_version: Optional[str] = None,
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
     *,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
     certificate_handling: Optional[CAInfo] = None,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
@@ -1156,12 +1155,6 @@ def open_stream(
             If not specified and a host_base was found
             alongside previously parsed credentials, that will be used.
             Otherwise, ``object.ord1.coreweave.com`` is the default.
-        s3_region_name: S3 region name, corresponding to
-            "region_name" in boto3 config.
-            The AWS Region used in instantiating the client.
-        s3_signature_version: S3 signature version, corresponding
-            to "signature_version" in boto3 config.
-            The signature version used when signing requests.
         s3_config_path: An explicit path to the `~/.s3cfg` config file
             to be parsed if full credentials are not provided.
             If None, platform-specific default paths are used.
@@ -1169,6 +1162,12 @@ def open_stream(
         force_http: If True, force the use of HTTP instead of HTTPS for
             S3 downloads. This will double the throughput, but at the cost
             of security.
+        s3_region_name: S3 region name, corresponding to
+            "region_name" in boto3 config.
+            The object storage region used in instantiating the client.
+        s3_signature_version: S3 signature version, corresponding
+            to "signature_version" in boto3 config.
+            The signature version used when signing requests.
         certificate_handling: Customize handling of SSL CA certificates for
             HTTPS and S3 downloads.
             Pass None to use default certificate verification, or an instance of
@@ -1312,6 +1311,8 @@ def open_stream(
                 s3_access_key_id,
                 s3_secret_access_key,
                 s3_endpoint,
+                s3_region_name,
+                s3_signature_version,
             )
 
             # Always run the close + upload procedure
