@@ -826,6 +826,7 @@ def _new_s3_client(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str,
+    region_name: str = None,
     signature_version: str = None,
 ):
     if s3_secret_access_key is None:
@@ -840,6 +841,8 @@ def _new_s3_client(
 
     if s3_access_key_id == s3_secret_access_key == "":
         config_args["signature_version"] = botocore.UNSIGNED
+        if region_name is not None:
+            config_args["region_name"] = region_name
     else:
         auth_args = dict(
             aws_access_key_id=s3_access_key_id,
@@ -847,6 +850,8 @@ def _new_s3_client(
         )
         if signature_version is not None:
             config_args["signature_version"] = signature_version
+        if region_name is not None:
+            config_args["region_name"] = region_name
 
     config = boto3.session.Config(**config_args)
 
@@ -876,9 +881,17 @@ def s3_upload(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_write_endpoint,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
 ):
     bucket, key = _parse_s3_uri(target_uri)
-    client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint)
+    client = _new_s3_client(
+        s3_access_key_id,
+        s3_secret_access_key,
+        s3_endpoint,
+        region_name=s3_region_name,
+        signature_version=s3_signature_version,
+    )
     client.upload_file(path, bucket, key)
 
 
@@ -887,6 +900,8 @@ def _s3_download_url(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
+    s3_region_name: str = None,
+    s3_signature_version: str = None,
 ) -> str:
     bucket, key = _parse_s3_uri(path_uri)
     # v2 signature is important to easily align the presigned URL expiry
@@ -899,11 +914,14 @@ def _s3_download_url(
     # boto3 does not permit easy modification of x-amz-date.
     # See upstream bug https://github.com/boto/botocore/issues/2230
     #
+    if not s3_signature_version:
+        s3_signature_version = "s3"
     client = _new_s3_client(
         s3_access_key_id,
         s3_secret_access_key,
         s3_endpoint,
-        signature_version="s3",
+        region_name=s3_region_name,
+        signature_version=s3_signature_version,
     )
 
     # Explaination with SIG_GRANULARITY=1h
@@ -940,6 +958,8 @@ def s3_download(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
     certificate_handling: Optional[CAInfo] = None,
@@ -949,6 +969,8 @@ def s3_download(
         s3_access_key_id=s3_access_key_id,
         s3_secret_access_key=s3_secret_access_key,
         s3_endpoint=s3_endpoint,
+        s3_region_name=s3_region_name,
+        s3_signature_version=s3_signature_version,
     )
     if force_http and url.lower().startswith("https://"):
         url = "http://" + url[8:]
@@ -1093,6 +1115,8 @@ def open_stream(
     s3_access_key_id: Optional[str] = None,
     s3_secret_access_key: Optional[str] = None,
     s3_endpoint: Optional[str] = None,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
@@ -1132,6 +1156,12 @@ def open_stream(
             If not specified and a host_base was found
             alongside previously parsed credentials, that will be used.
             Otherwise, ``object.ord1.coreweave.com`` is the default.
+        s3_region_name: S3 region name, corresponding to
+            "region_name" in boto3 config.
+            The AWS Region used in instantiating the client.
+        s3_signature_version: S3 signature version, corresponding
+            to "signature_version" in boto3 config.
+            The signature version used when signing requests.
         s3_config_path: An explicit path to the `~/.s3cfg` config file
             to be parsed if full credentials are not provided.
             If None, platform-specific default paths are used.
@@ -1320,6 +1350,8 @@ def open_stream(
                 s3_access_key_id,
                 s3_secret_access_key,
                 s3_endpoint,
+                s3_region_name=s3_region_name,
+                s3_signature_version=s3_signature_version,
                 buffer_size=buffer_size,
                 force_http=force_http,
                 certificate_handling=certificate_handling,
