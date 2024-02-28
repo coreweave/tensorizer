@@ -3834,6 +3834,11 @@ class TensorSerializer:
         else:
             transferred = queue.Queue(maxsize=max_read_ahead)
 
+        biggest_tensor_bytes = max(t.nbytes for t in tensors)
+        staging_tensor = torch.empty(
+            (biggest_tensor_bytes,), dtype=torch.uint8, device="cpu", pin_memory=True
+        )
+
         transfer_finished = False
 
         def _transfer():
@@ -3846,7 +3851,10 @@ class TensorSerializer:
                 for t in tensors:
                     if transfer_finished:
                         break
-                    transferred.put(t.cpu().detach(), timeout=_TIMEOUT)
+                    staging_tensor_view = staging_tensor.narrow(0, 0, t.nbytes).view(t.dtype).view(t.shape)
+                    staging_tensor_view.copy_(t)
+                    new_cpu_tensor = staging_tensor_view.clone()
+                    transferred.put(new_cpu_tensor.detach(), timeout=_TIMEOUT)
                 else:
                     # Sentinel
                     transferred.put(None)
