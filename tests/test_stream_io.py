@@ -39,11 +39,11 @@ class TestCurlStream(unittest.TestCase):
         self.assertEqual(b"GPT Neo", stream.read(7))
 
     def test_curl_stream_end(self):
-        stream = stream_io.CURLStreamFile(NEO_URL, end=2)
+        stream = stream_io.CURLStreamFile(NEO_URL, end=1)
         self.assertEqual(b"# ", stream.read(5))
 
     def test_curl_stream_buffer_end(self):
-        stream = stream_io.CURLStreamFile(NEO_URL, end=2)
+        stream = stream_io.CURLStreamFile(NEO_URL, end=1)
         ba = bytearray(5)
         self.assertEqual(2, stream.readinto(ba))
         self.assertEqual(b"# \x00\x00\x00", ba)
