@@ -2366,6 +2366,10 @@ class TensorDeserializer(
             HashMismatchError: If ``verify_hash`` resolves to True and
                 a deserialized tensor does not match its stored hash.
         """
+        if self._device.type != "cpu":
+            raise RuntimeError(
+                "read_numpy_arrays is only valid when deserializing to the CPU"
+            )
         data = self._read_numpytensors(
             filter_func=filter_func,
             num_tensors=num_tensors,
