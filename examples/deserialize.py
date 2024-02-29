@@ -1,4 +1,3 @@
-
 import argparse
 import os
 import time
@@ -10,15 +9,15 @@ from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 
-parser = argparse.ArgumentParser('deserialize')
-parser.add_argument('--source', default=None, help='local path or URL')
-parser.add_argument('--model-ref', default="EleutherAI/gpt-j-6B")
-parser.add_argument('--no-plaid', action='store_true')
-parser.add_argument('--lazy-load', action='store_true')
-parser.add_argument('--verify-hash', action='store_true')
-parser.add_argument('--encryption', action='store_true')
-parser.add_argument('--viztracer', action='store_true')
-parser.add_argument('--num-readers', type=int, default=1)
+parser = argparse.ArgumentParser("deserialize")
+parser.add_argument("--source", default=None, help="local path or URL")
+parser.add_argument("--model-ref", default="EleutherAI/gpt-j-6B")
+parser.add_argument("--no-plaid", action="store_true")
+parser.add_argument("--lazy-load", action="store_true")
+parser.add_argument("--verify-hash", action="store_true")
+parser.add_argument("--encryption", action="store_true")
+parser.add_argument("--viztracer", action="store_true")
+parser.add_argument("--num-readers", type=int, default=1)
 
 args = parser.parse_args()
 
@@ -33,11 +32,14 @@ if args.source is None:
 tracer = None
 if args.viztracer:
     import viztracer
+
     tracer = viztracer.VizTracer(pid_suffix=True)
 
 decryption_params = None
 if args.encryption:
-    decryption_params = DecryptionParams.from_string(os.getenv("SUPER_SECRET_STRONG_PASSWORD"))
+    decryption_params = DecryptionParams.from_string(
+        os.getenv("SUPER_SECRET_STRONG_PASSWORD")
+    )
 
 config = AutoConfig.from_pretrained(model_ref)
 
@@ -62,7 +64,7 @@ deserializer = TensorDeserializer(
     lazy_load=args.lazy_load,
     encryption=decryption_params,
     num_readers=args.num_readers,
-    verify_hash=args.verify_hash
+    verify_hash=args.verify_hash,
 )
 deserializer.load_into_module(model)
 end = time.perf_counter()
@@ -95,5 +97,13 @@ with torch.no_grad():
 
 print(f"Output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
 perf_stats = tensorizer.serialization._get_perf_stats()
-print(f"to CUDA stats: {perf_stats['cuda_bytes']} bytes in {perf_stats['cuda_to_device_secs']}s, {perf_stats['cuda_bytes']/perf_stats['cuda_to_device_secs']/1024/1024/1024:.3f} GiB/s")
-print(f"readinto stats: {perf_stats['file_readinto_bytes']} bytes in {perf_stats['file_readinto_secs']}s, {perf_stats['file_readinto_bytes']/perf_stats['file_readinto_secs']/1024/1024/1024:.3f} GiB/s")
+print(
+    f"to CUDA stats: {perf_stats['cuda_bytes']} bytes in"
+    f" {perf_stats['cuda_to_device_secs']}s,"
+    f" {perf_stats['cuda_bytes']/perf_stats['cuda_to_device_secs']/1024/1024/1024:.3f} GiB/s"
+)
+print(
+    f"readinto stats: {perf_stats['file_readinto_bytes']} bytes in"
+    f" {perf_stats['file_readinto_secs']}s,"
+    f" {perf_stats['file_readinto_bytes']/perf_stats['file_readinto_secs']/1024/1024/1024:.3f} GiB/s"
+)

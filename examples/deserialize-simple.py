@@ -1,9 +1,10 @@
 import time
-import torch
-from tensorizer import TensorDeserializer
-from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from tensorizer import TensorDeserializer
+from tensorizer.utils import convert_bytes, get_mem_usage, no_init_or_tensor
 
 model_ref = "EleutherAI/gpt-j-6B"
 # To run this at home, swap this with the line below for a smaller example:

@@ -287,7 +287,9 @@ class TestSerialization(unittest.TestCase):
                 print(f"After serialization:  {after_serialization}")
                 del orig_sd
                 try:
-                    deserialized = TensorDeserializer(serialized_model, device="cpu")
+                    deserialized = TensorDeserializer(
+                        serialized_model, device="cpu"
+                    )
                     check_deserialized(
                         self,
                         deserialized,
@@ -362,9 +364,9 @@ class TestSerialization(unittest.TestCase):
             deserializer = TensorDeserializer(
                 tensorized_file.name, device="cpu", lazy_load=True
             )
-            deserialized_tensor = [
-                t for t in deserializer.read_tensors()
-            ][0][-1]
+            deserialized_tensor = [t for t in deserializer.read_tensors()][0][
+                -1
+            ]
         finally:
             os.unlink(tensorized_file.name)
 
@@ -631,7 +633,9 @@ class TestEncryption(unittest.TestCase):
             # Ensure that it fails to load when not given a key
             with self.subTest(
                 msg="Deserializing with a missing key"
-            ), self.assertRaises(serialization.CryptographyError), TensorDeserializer(
+            ), self.assertRaises(
+                serialization.CryptographyError
+            ), TensorDeserializer(
                 encrypted_model,
                 device=device,
                 lazy_load=True,
@@ -644,7 +648,9 @@ class TestEncryption(unittest.TestCase):
             # Ensure that it fails to load when given the wrong key
             with self.subTest(
                 msg="Deserializing with an incorrect key"
-            ), self.assertRaises(serialization.CryptographyError), TensorDeserializer(
+            ), self.assertRaises(
+                serialization.CryptographyError
+            ), TensorDeserializer(
                 encrypted_model,
                 device=device,
                 lazy_load=True,
@@ -659,7 +665,9 @@ class TestEncryption(unittest.TestCase):
             # when expecting encryption
             with self.subTest(
                 msg="Deserializing an unencrypted model with a key"
-            ), self.assertRaises(serialization.CryptographyError), TensorDeserializer(
+            ), self.assertRaises(
+                serialization.CryptographyError
+            ), TensorDeserializer(
                 unencrypted_model,
                 device=device,
                 lazy_load=True,
@@ -722,7 +730,9 @@ class TestEncryption(unittest.TestCase):
             # Ensure that it fails to load when not given a key
             with self.subTest(
                 msg="Deserializing with a missing key"
-            ), self.assertRaises(serialization.CryptographyError), TensorDeserializer(
+            ), self.assertRaises(
+                serialization.CryptographyError
+            ), TensorDeserializer(
                 encrypted_model,
                 device=device,
                 lazy_load=True,
@@ -735,7 +745,9 @@ class TestEncryption(unittest.TestCase):
             # Ensure that it fails to load when given the wrong key
             with self.subTest(
                 msg="Deserializing with an incorrect key"
-            ), self.assertRaises(serialization.CryptographyError), TensorDeserializer(
+            ), self.assertRaises(
+                serialization.CryptographyError
+            ), TensorDeserializer(
                 encrypted_model,
                 device=device,
                 lazy_load=True,
@@ -765,7 +777,9 @@ class TestDeserialization(unittest.TestCase):
     def test_default_cpu(self):
         gc.collect()
         before_deserialization = utils.get_mem_usage()
-        deserialized = TensorDeserializer(self._serialized_model_path, device="cpu")
+        deserialized = TensorDeserializer(
+            self._serialized_model_path, device="cpu"
+        )
         after_deserialization = utils.get_mem_usage()
         check_deserialized(self, deserialized, model_name)
         deserialized.close()
@@ -776,7 +790,9 @@ class TestDeserialization(unittest.TestCase):
     def test_default_gpu(self):
         gc.collect()
         before_deserialization = utils.get_mem_usage()
-        deserialized = TensorDeserializer(self._serialized_model_path, device="cuda")
+        deserialized = TensorDeserializer(
+            self._serialized_model_path, device="cuda"
+        )
         check_deserialized(self, deserialized, model_name)
         after_deserialization = utils.get_mem_usage()
         deserialized.close()
@@ -788,9 +804,9 @@ class TestDeserialization(unittest.TestCase):
         print(f"After del: {after_del}")
 
     def test_lazy_load(self):
-        supported_devices = ['cpu']
-        if default_device == 'cuda':
-            supported_devices.append('cuda')
+        supported_devices = ["cpu"]
+        if default_device == "cuda":
+            supported_devices.append("cuda")
 
         for device in supported_devices:
             with self.subTest(
@@ -853,9 +869,7 @@ class TestDeserialization(unittest.TestCase):
     def test_s3_multiple_readers(self):
         uri: str = f"s3://tensorized/{model_name}/model.tensors"
 
-        with self.subTest(
-            "Deserializing from an S3 URI"
-        ), TensorDeserializer(
+        with self.subTest("Deserializing from an S3 URI"), TensorDeserializer(
             uri, device=default_device, num_readers=4
         ) as deserialized:
             check_deserialized(self, deserialized, model_name)
@@ -982,7 +996,9 @@ class TestDeserialization(unittest.TestCase):
 
         with self.subTest(msg="Testing regex filter_func"):
             deserialized = TensorDeserializer(
-                self._serialized_model_path, device=default_device, filter_func=pattern.match
+                self._serialized_model_path,
+                device=default_device,
+                filter_func=pattern.match,
             )
             regex_keys = set(deserialized.keys())
             # Test that the deserialized tensors form a proper,
@@ -995,7 +1011,9 @@ class TestDeserialization(unittest.TestCase):
 
         with self.subTest(msg="Testing custom filter_func"):
             deserialized = TensorDeserializer(
-                self._serialized_model_path, device=default_device, filter_func=custom_check
+                self._serialized_model_path,
+                device=default_device,
+                filter_func=custom_check,
             )
             custom_keys = set(deserialized.keys())
             self.assertEqual(custom_keys, expected_custom_keys)
@@ -1031,7 +1049,10 @@ class TestVerification(unittest.TestCase):
                     continue
                 with self.subTest(msg=f"Verifying hashes with device {device}"):
                     deserialized = TensorDeserializer(
-                        self._serialized_model_path, device=device, verify_hash=True, num_readers=num_readers
+                        self._serialized_model_path,
+                        device=device,
+                        verify_hash=True,
+                        num_readers=num_readers,
                     )
                     check_deserialized(self, deserialized, model_name)
                     deserialized.close()
@@ -1046,7 +1067,10 @@ class TestVerification(unittest.TestCase):
                 with self.subTest(msg=f"Verifying hashes with device {device}"):
                     with self.assertRaises(serialization.HashMismatchError):
                         TensorDeserializer(
-                            self._serialized_model_path, device=device, verify_hash=True, num_readers=num_readers
+                            self._serialized_model_path,
+                            device=device,
+                            verify_hash=True,
+                            num_readers=num_readers,
                         ).close()
 
     def test_module_verification(self):
@@ -1055,7 +1079,9 @@ class TestVerification(unittest.TestCase):
             if device == "cuda" and not is_cuda_available:
                 continue
             with self.subTest(msg=f"Verifying hashes with device {device}"):
-                deserialized = TensorDeserializer(self._serialized_model_path, device=device, verify_hash=True)
+                deserialized = TensorDeserializer(
+                    self._serialized_model_path, device=device, verify_hash=True
+                )
                 model_to_verify = model_to_verify.to(device)
                 result, tensor_status = deserialized.verify_module(
                     model_to_verify
@@ -1072,7 +1098,9 @@ class TestVerification(unittest.TestCase):
             if device == "cuda" and not is_cuda_available:
                 continue
             with self.subTest(msg=f"Verifying hashes with device {device}"):
-                deserialized = TensorDeserializer(self._serialized_model_path, device=device, verify_hash=True)
+                deserialized = TensorDeserializer(
+                    self._serialized_model_path, device=device, verify_hash=True
+                )
                 model_to_verify = model_to_verify.to(device)
                 model_to_verify.transformer.h[0].ln_2 = torch.nn.LayerNorm(
                     768, 768

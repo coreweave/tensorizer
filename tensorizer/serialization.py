@@ -44,10 +44,10 @@ from typing import (
     Union,
 )
 
-from atomics.base import AtomicUint
 import numpy
 import redis
 import torch
+from atomics.base import AtomicUint
 
 import tensorizer._crypt as _crypt
 import tensorizer._crypt_info as _crypt_info
@@ -62,12 +62,22 @@ from tensorizer._internal_utils import Chunked as _Chunked
 from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor
 
+
 @dataclasses.dataclass
 class _PerfStats:
-    file_readinto_millisecs: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
-    file_readinto_bytes: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
-    cuda_to_device_millisecs: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
-    cuda_bytes: AtomicUint = dataclasses.field(default_factory=lambda: AtomicUint(width=8))
+    file_readinto_millisecs: AtomicUint = dataclasses.field(
+        default_factory=lambda: AtomicUint(width=8)
+    )
+    file_readinto_bytes: AtomicUint = dataclasses.field(
+        default_factory=lambda: AtomicUint(width=8)
+    )
+    cuda_to_device_millisecs: AtomicUint = dataclasses.field(
+        default_factory=lambda: AtomicUint(width=8)
+    )
+    cuda_bytes: AtomicUint = dataclasses.field(
+        default_factory=lambda: AtomicUint(width=8)
+    )
+
 
 _perf_stats = _PerfStats()
 
@@ -1447,6 +1457,7 @@ class TensorDeserializer(
 
         .. _pre-serialized: https://github.com/coreweave/tensorizer/tree/main#available-pre-tensorized-models-on-the-coreweave-cloud
     """
+
     @dataclasses.dataclass
     class _CopiedData:
         __slots__ = ("header", "numpy_tensor", "parameter")
@@ -1471,7 +1482,9 @@ class TensorDeserializer(
         *,
         lazy_load: bool = False,
         plaid_mode: Optional[bool] = None,  # pylint: disable=unused-argument
-        plaid_mode_buffers: Optional[int] = None,  # pylint: disable=unused-argument
+        plaid_mode_buffers: Optional[
+            int
+        ] = None,  # pylint: disable=unused-argument
         num_readers: int = 1,
         verify_hash: bool = False,
         encryption: Optional[DecryptionParams] = None,
@@ -1628,7 +1641,7 @@ class TensorDeserializer(
 
             if not isinstance(num_readers, int):
                 raise TypeError(
-                    f"num_readers: expected int,"
+                    "num_readers: expected int,"
                     f" got {num_readers.__class__.__name__}"
                 )
             elif num_readers < 1:
@@ -1657,7 +1670,9 @@ class TensorDeserializer(
             )
             self._cleanup.callback(self._reader_pool.shutdown, wait=False)
 
-            self.total_tensor_bytes = sum(entry.deserialized_length for entry in self._metadata.values())
+            self.total_tensor_bytes = sum(
+                entry.deserialized_length for entry in self._metadata.values()
+            )
             num_tensors = len(self._metadata)
 
             if logger.isEnabledFor(logging.DEBUG):
@@ -1674,7 +1689,9 @@ class TensorDeserializer(
                     f" data_version={self._file_header.version_number}"
                 )
 
-            self._keys_enumerated: Dict[str, int] = {k: i for i, k in enumerate(self.keys())}
+            self._keys_enumerated: Dict[str, int] = {
+                k: i for i, k in enumerate(self.keys())
+            }
 
             # The number of bytes we've allocated so far. Tensors may be read
             # from the file in any order, so we need to keep track of how much
@@ -1833,9 +1850,7 @@ class TensorDeserializer(
         else:
             return None
 
-    def _read_single_tensor(
-        self, expected_name: str
-    ) -> torch.nn.Parameter:
+    def _read_single_tensor(self, expected_name: str) -> torch.nn.Parameter:
         this_one_tensor_filter = partial(operator.eq, expected_name)
         tensors = tuple(self.read_tensors(filter_func=this_one_tensor_filter))
         num_tensors = len(tensors)
@@ -2011,7 +2026,7 @@ class TensorDeserializer(
         decryption_pool: Optional[concurrent.futures.ThreadPoolExecutor],
         encryption_method: _crypt_info.CryptInfoChunk,
         key: bytes,
-        buffer
+        buffer,
     ) -> Union["_crypt.ChunkedEncryption", "_crypt.SequentialEncryption"]:
         if isinstance(encryption_method, _crypt_info.XSalsa20ParallelChunk):
             if encryption_method.num_macs == 1:
@@ -2054,14 +2069,11 @@ class TensorDeserializer(
         decryption_pool: Optional[concurrent.futures.ThreadPoolExecutor],
         encryption_method: _crypt_info.CryptInfoChunk,
         key: bytes,
-        buffer
+        buffer,
     ):
         try:
             with cls._get_decryption_manager(
-                decryption_pool,
-                encryption_method,
-                key,
-                buffer
+                decryption_pool, encryption_method, key, buffer
             ) as crypto:
                 if isinstance(crypto, _crypt.ChunkedEncryption):
                     fs = []
@@ -2299,7 +2311,6 @@ class TensorDeserializer(
 
         gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
-
         start = time.perf_counter()
         tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
         duration = time.perf_counter() - start
@@ -2328,7 +2339,9 @@ class TensorDeserializer(
                 # Just run this for the caching side effect
                 pass
 
-        self.total_tensor_bytes = sum(self._metadata[name].data_length for name in keys)
+        self.total_tensor_bytes = sum(
+            self._metadata[name].data_length for name in keys
+        )
         self._file.close()
 
     def _bulk_load(
@@ -2396,9 +2409,7 @@ class TensorDeserializer(
         elif effective_num_readers == len(tensor_info):
             tensors_per_reader = [(t,) for t in tensor_info]
         else:
-            tensor_sizes: List[int] = [
-                t.data_length for t in tensor_info
-            ]
+            tensor_sizes: List[int] = [t.data_length for t in tensor_info]
             reader_slices: Iterable[slice] = _linear_partition.partition(
                 tensor_sizes, effective_num_readers
             )
@@ -2444,11 +2455,11 @@ class TensorDeserializer(
         barrier: threading.Barrier,
         verify_hash: bool,
         tensor_items: Sequence[TensorEntry],
-        transfer_out_queue: "queue.SimpleQueue[Union[Exception, _CopiedData]]"
+        transfer_out_queue: "queue.SimpleQueue[Union[Exception, _CopiedData]]",
     ):
         # Need to get rid of self or more safely have thread-local storage
 
-        is_cuda = unsafe_self._device.type == 'cuda'
+        is_cuda = unsafe_self._device.type == "cuda"
         cuda_stream = None
         if is_cuda:
             cuda_stream = torch.cuda.Stream(unsafe_self._device)
@@ -2527,7 +2538,7 @@ class TensorDeserializer(
                 )
 
                 if header is None:
-                    raise ValueError('Unexpected empty header')
+                    raise ValueError("Unexpected empty header")
 
                 # Skip it if this tensor is not one we're supposed to load
                 if header.name not in tensor_sizes_by_name:
@@ -2600,15 +2611,18 @@ class TensorDeserializer(
                     if unsafe_self._encrypted and mv.nbytes > 0:
                         TensorDeserializer._stream_decrypt(
                             file_,
-                            unsafe_self._decryption_pool, # decryption_pool safe to be shared
+                            unsafe_self._decryption_pool,  # decryption_pool safe to be shared
                             encryption_method,
                             key,
-                            mv)
+                            mv,
+                        )
                     else:
                         file_.readinto(mv)
 
                     if verify_hash:
-                        unsafe_self._verify_hashes(header.name, header.hashes, header_hashes, mv)
+                        unsafe_self._verify_hashes(
+                            header.name, header.hashes, header_hashes, mv
+                        )
 
                     duration = time.perf_counter_ns() - start
                     _perf_stats.file_readinto_millisecs.add(duration // 1000000)
@@ -2624,14 +2638,22 @@ class TensorDeserializer(
                 del mv
                 tensor = numpy_tensor.to_tensor()
 
-                stream_context = torch.cuda.stream(cuda_stream) if is_cuda else contextlib.nullcontext()
+                stream_context = (
+                    torch.cuda.stream(cuda_stream)
+                    if is_cuda
+                    else contextlib.nullcontext()
+                )
                 with stream_context:
                     parameter = unsafe_self._to_torch_parameter(tensor)
                     if cuda_stream is not None:
                         cuda_stream.synchronize()
 
                 # put it on transfer_out_queue
-                transfer_out_queue.put(TensorDeserializer._CopiedData(header, numpy_tensor, parameter))
+                transfer_out_queue.put(
+                    TensorDeserializer._CopiedData(
+                        header, numpy_tensor, parameter
+                    )
+                )
                 tensors_read += 1
         except Exception as e:
             del shared_buffer_tensor, shared_buffer_mv
@@ -3668,9 +3690,14 @@ class TensorSerializer:
         else:
             transferred = queue.Queue(maxsize=max_read_ahead)
 
-        biggest_tensor_bytes = max(t.element_size() * t.nelement() for t in tensors)
+        biggest_tensor_bytes = max(
+            t.element_size() * t.nelement() for t in tensors
+        )
         staging_tensor = torch.empty(
-            (biggest_tensor_bytes,), dtype=torch.uint8, device="cpu", pin_memory=True
+            (biggest_tensor_bytes,),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
         )
 
         transfer_finished = False
@@ -3685,7 +3712,11 @@ class TensorSerializer:
                 for t in tensors:
                     if transfer_finished:
                         break
-                    staging_tensor_view = staging_tensor.narrow(0, 0, t.nbytes).view(t.dtype).view(t.shape)
+                    staging_tensor_view = (
+                        staging_tensor.narrow(0, 0, t.nbytes)
+                        .view(t.dtype)
+                        .view(t.shape)
+                    )
                     staging_tensor_view.copy_(t)
                     new_cpu_tensor = staging_tensor_view.clone()
                     transferred.put(new_cpu_tensor.detach(), timeout=_TIMEOUT)
@@ -3694,7 +3725,9 @@ class TensorSerializer:
                     transferred.put(None)
             transfer_finished = True
 
-        transfer_thread = threading.Thread(target=_transfer, name='TensorizerTransfer', daemon=True)
+        transfer_thread = threading.Thread(
+            target=_transfer, name="TensorizerTransfer", daemon=True
+        )
         transfer_thread.start()
 
         def _interrupt_transfer():
@@ -3928,8 +3961,10 @@ class TensorSerializer:
 
 def _get_perf_stats():
     return dict(
-        cuda_to_device_secs=float(_perf_stats.cuda_to_device_millisecs.load()) / 1000.0,
+        cuda_to_device_secs=float(_perf_stats.cuda_to_device_millisecs.load())
+        / 1000.0,
         cuda_bytes=_perf_stats.cuda_bytes.load(),
-        file_readinto_secs=float(_perf_stats.file_readinto_millisecs.load()) / 1000.0,
-        file_readinto_bytes=_perf_stats.file_readinto_bytes.load()
+        file_readinto_secs=float(_perf_stats.file_readinto_millisecs.load())
+        / 1000.0,
+        file_readinto_bytes=_perf_stats.file_readinto_bytes.load(),
     )

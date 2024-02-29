@@ -1056,7 +1056,7 @@ def s3_download(
         buffer_size=buffer_size,
         certificate_handling=certificate_handling,
         begin=begin,
-        end=end
+        end=end,
     )
 
 
@@ -1340,10 +1340,7 @@ def open_stream(
                 'Only the mode "rb" is valid when opening redis:// streams.'
             )
         return RedisStreamFile(
-            path_uri,
-            buffer_size=buffer_size,
-            begin=begin,
-            end=end
+            path_uri, buffer_size=buffer_size, begin=begin, end=end
         )
 
     elif not local_only and scheme == "s3":

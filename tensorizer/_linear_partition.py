@@ -51,7 +51,8 @@ def partition(
     too_intensive: bool = (
         round(
             max(
-                (partitions * n) / 5000, n**1.6565 * partitions**0.617 * 1.75e-4
+                (partitions * n) / 5000,
+                n**1.6565 * partitions**0.617 * 1.75e-4,
             )
         )
         > performance_threshold
