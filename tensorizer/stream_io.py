@@ -2,6 +2,7 @@ import functools
 import http.client
 import io
 import logging
+import mmap
 import os
 import shutil
 import socket
@@ -186,7 +187,12 @@ class CAInfo:
         return hash(self._curl_flags)
 
 
-class CURLStreamFile(io.RawIOBase):
+def _is_accelerated_object_storage(uri: str) -> bool:
+    domain = urlparse(uri.lower()).hostname.split(".")
+    return (domain[0], *domain[1:]) == ("accel-object", "coreweave", "com")
+
+
+class CURLStreamFile(io.BufferedIOBase):
     """
     CURLStreamFile implements a file-like object around an HTTP download, the
     intention being to not buffer more than we have to. It is intended for
@@ -218,10 +224,42 @@ class CURLStreamFile(io.RawIOBase):
         buffer_size: Optional[int] = None,
         certificate_handling: Optional[CAInfo] = None,
     ) -> None:
-        if buffer_size is None:
-            buffer_size = 16 << 20  # 16mb
+        # Note that range requests consider both `begin` and `end` inclusive
         self._uri = uri
+        if begin is None:
+            begin = 0
+        elif begin < 0:
+            raise ValueError("Invalid begin")
+        self._begin = begin
+        self._end = end
+        self._headers = headers
+        max_buffer_size: Optional[int] = None
+        if buffer_size is None:
+            buffer_size = 16 << 20  # 16 MiB
+        if end:
+            if end < begin:
+                raise ValueError("End marker cannot come before begin marker")
+            # Don't use a buffer significantly larger than a requested range
+            max_buffer_size: int = self._end - begin + 1
+            # Round up to a multiple of the system page size
+            max_buffer_size -= max_buffer_size % -mmap.PAGESIZE
+            buffer_size = min(buffer_size, max_buffer_size)
+        self._buffer_size = buffer_size
+        self._certificate_handling = certificate_handling
+
         self._error_context = []
+        self._curl = None
+        uses_range_request: bool = begin != 0 or end is not None
+
+        # Avoid Coreweave accel-object footgun
+        if uses_range_request and _is_accelerated_object_storage(uri):
+            raise ValueError(
+                "Cannot request a byte range from the"
+                " accel-object.<region>.coreweave.com object storage endpoint."
+                " Request a complete file, or use the"
+                " object.<region>.coreweave.com endpoint instead"
+                " via open_stream(uri, ..., s3_endpoint=...)."
+            )
 
         if curl_path is None:
             raise RuntimeError(
@@ -256,15 +294,14 @@ class CURLStreamFile(io.RawIOBase):
             uri,
         ]
 
-        if begin is not None or end is not None:
-            cmd.extend(["--range", f"{begin or 0}-{end or ''}"])
+        if uses_range_request:
+            cmd.extend(["--range", f"{begin}-{end or ''}"])
 
         if headers is not None:
             for k, v in headers.items():
                 cmd.extend(["--header", f"{k}: {v}"])
 
-        self._curl = None
-        with _wide_pipes.widen_new_pipes():  # Widen on Windows
+        with _wide_pipes.widen_new_pipes(max_buffer_size):  # Widen on Windows
             popen_start = time.monotonic()
             self._curl = subprocess.Popen(
                 cmd,
@@ -273,7 +310,8 @@ class CURLStreamFile(io.RawIOBase):
             )
         popen_end = time.monotonic()
 
-        _wide_pipes.widen_pipe(self._curl.stdout.fileno())  # Widen on Linux
+        # Widen the pipe on Linux
+        _wide_pipes.widen_pipe(self._curl.stdout.fileno(), max_buffer_size)
         resp = self._curl.stdout.readline()  # Block on the http response header
         resp_begin = time.monotonic()
 
@@ -306,7 +344,6 @@ class CURLStreamFile(io.RawIOBase):
         self.response_headers = http.client.parse_headers(self._curl.stdout)
 
         self._curr = 0 if begin is None else begin
-        self._end = end
         self._closed = False
 
     def _init_vars(self):
@@ -424,7 +461,7 @@ class CURLStreamFile(io.RawIOBase):
             if ba is None:
                 rq_sz = goal_position - self._curr
                 if self._end is not None and self._curr + rq_sz > self._end:
-                    rq_sz = self._end - self._curr
+                    rq_sz = self._end - self._curr + 1
                     if rq_sz <= 0:
                         return bytes()
                 ret_buff = self._curl.stdout.read(rq_sz)
@@ -432,7 +469,7 @@ class CURLStreamFile(io.RawIOBase):
             else:
                 rq_sz = len(ba)
                 if self._end is not None and self._curr + rq_sz > self._end:
-                    rq_sz = self._end - self._curr
+                    rq_sz = self._end - self._curr + 1
                     if rq_sz <= 0:
                         return 0
                     tmp_ba = bytearray(rq_sz)
@@ -525,7 +562,42 @@ class CURLStreamFile(io.RawIOBase):
             self.close()
 
             # And we reinitialize ourself.
-            self.__init__(self._uri, position, None)
+            self.__init__(
+                uri=self._uri,
+                begin=position,
+                end=self._end,
+                headers=self._headers,
+                buffer_size=self._buffer_size,
+                certificate_handling=self._certificate_handling,
+            )
+
+    def _fork(
+        self, begin: Optional[int] = None, end: Optional[int] = None
+    ) -> "CURLStreamFile":
+        """
+        Reopen a file at a new byte range. Meant only for internal use
+        by `TensorDeserializer` when creating multiple readers.
+
+        Args:
+            begin: Starting byte of the new byte range, inclusive,
+                or None to start at the beginning of the file.
+            end: Ending byte of the new byte range, inclusive,
+                or None to include up to the end of the file.
+
+        Returns:
+            A new `CURLStreamFile` identical to this one,
+            but with a different byte range.
+        """
+        clone = self.__class__(
+            uri=self._uri,
+            begin=begin,
+            end=end,
+            headers=self._headers,
+            buffer_size=self._buffer_size,
+            certificate_handling=self._certificate_handling,
+        )
+        clone._error_context.extend(self._error_context)
+        return clone
 
 
 def _parse_redis_uri(uri):
@@ -550,7 +622,7 @@ else:
     _MAX_TCP_BUFFER_SIZE = 16 << 20  # 16 MiB
 
 
-class RedisStreamFile:
+class RedisStreamFile(io.BufferedIOBase):
     """
     RedisStreamFile implements a file-like object around a Redis key namespace. Each
     'file' is broken up into multiple keys, each of which is a slice of the file. Each
@@ -588,6 +660,8 @@ class RedisStreamFile:
         self,
         uri: str,
         *,
+        begin: Optional[int] = None,
+        end: Optional[int] = None,
         buffer_size: Optional[int] = None,
     ) -> None:
         if buffer_size is None:
@@ -625,7 +699,6 @@ class RedisStreamFile:
         self._curr_buffer = bytearray(largest)
         self._curr_buffer_idx = -1
         self._curr_buffer_view = memoryview(self._curr_buffer)[0:0]
-        self.closed = False
 
         init_end = time.monotonic()
 
@@ -634,6 +707,9 @@ class RedisStreamFile:
         self.bytes_read = 0
         self.bytes_skipped = 0
         self.read_operations = 0
+
+        if begin:
+            self.seek(begin)
 
     def _find_key_index(self, position):
         for i, index in enumerate(self._indexes):
@@ -799,13 +875,13 @@ class RedisStreamFile:
         self._curr = position
 
     def close(self):
-        self.closed = True
         if self._redis is not None:
             self._redis.close()
             self._redis = None
         if self._redis_tcp is not None:
             self._redis_tcp.close()
             self._redis_tcp = None
+        super(RedisStreamFile, self).close()  # will set self.closed to True
 
     def readline(self):
         raise io.UnsupportedOperation("readline")
@@ -961,6 +1037,8 @@ def s3_download(
     s3_signature_version: Optional[str] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
+    begin: Optional[int] = None,
+    end: Optional[int] = None,
     certificate_handling: Optional[CAInfo] = None,
 ) -> CURLStreamFile:
     url = _s3_download_url(
@@ -977,6 +1055,8 @@ def s3_download(
         url,
         buffer_size=buffer_size,
         certificate_handling=certificate_handling,
+        begin=begin,
+        end=end,
     )
 
 
@@ -1118,6 +1198,8 @@ def open_stream(
     buffer_size: Optional[int] = None,
     force_http: bool = False,
     *,
+    begin: Optional[int] = None,
+    end: Optional[int] = None,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
     certificate_handling: Optional[CAInfo] = None,
@@ -1162,6 +1244,11 @@ def open_stream(
         force_http: If True, force the use of HTTP instead of HTTPS for
             S3 downloads. This will double the throughput, but at the cost
             of security.
+        begin: if specified, the file or request will begin at this byte offset.
+            Uses seek() for files and Range for HTTP and S3. This has no effect
+            on writes.
+        end: if specified, HTTP and S3 requests will use this as the end of the
+            Range header. This has no effect on files or on writes.
         s3_region_name: S3 region name, corresponding to
             "region_name" in boto3 config.
             The object storage region used in instantiating the client.
@@ -1224,14 +1311,17 @@ def open_stream(
                 print(stream.read(128))
     """
     if isinstance(path_uri, os.PathLike):
+        local_only: bool = True
         path_uri = os.fspath(path_uri)
+    else:
+        local_only: bool = False
 
     scheme, *location = path_uri.split("://", maxsplit=1)
     scheme = scheme.lower() if location else None
 
     normalized_mode = "".join(sorted(mode))
 
-    if scheme in ("http", "https"):
+    if not local_only and scheme in ("http", "https"):
         if normalized_mode != "br":
             raise ValueError(
                 'Only the mode "rb" is valid when opening http(s):// streams.'
@@ -1239,16 +1329,21 @@ def open_stream(
         return CURLStreamFile(
             path_uri,
             buffer_size=buffer_size,
+            begin=begin,
+            end=end,
             certificate_handling=certificate_handling,
         )
-    elif scheme == "redis":
+
+    elif not local_only and scheme == "redis":
         if normalized_mode != "br":
             raise ValueError(
                 'Only the mode "rb" is valid when opening redis:// streams.'
             )
-        return RedisStreamFile(path_uri, buffer_size=buffer_size)
+        return RedisStreamFile(
+            path_uri, buffer_size=buffer_size, begin=begin, end=end
+        )
 
-    elif scheme == "s3":
+    elif not local_only and scheme == "s3":
         if normalized_mode not in ("br", "bw", "ab", "+bw", "+ab"):
             raise ValueError(
                 'Only the modes "rb", "wb[+]", and "ab[+]" are valid'
@@ -1355,6 +1450,8 @@ def open_stream(
                 s3_signature_version=s3_signature_version,
                 buffer_size=buffer_size,
                 force_http=force_http,
+                begin=begin,
+                end=end,
                 certificate_handling=certificate_handling,
             )
             if error_context:
@@ -1367,11 +1464,12 @@ def open_stream(
                 'Only binary modes ("rb", "wb", "wb+", etc.)'
                 " are valid when opening local file streams."
             )
-        dirname = os.path.dirname(path_uri)
-        if dirname:
-            os.makedirs(os.path.dirname(path_uri), exist_ok=True)
+        if any(map(normalized_mode.__contains__, "wax")):
+            dirname = os.path.dirname(path_uri)
+            if dirname:
+                os.makedirs(os.path.dirname(path_uri), exist_ok=True)
         if buffer_size is None:
             buffer_size = io.DEFAULT_BUFFER_SIZE
         handle: typing.BinaryIO = open(path_uri, mode, buffering=buffer_size)
-        handle.seek(0)
+        handle.seek(begin or 0)
         return handle

@@ -139,7 +139,7 @@ endpoint into the `torch.nn.Module`.
 The below example loads the `EleutherAI/gpt-j-6B` model from an S3
 endpoint.
 
-[deserialize.py](examples/deserialize.py)
+[deserialize-simple.py](examples/deserialize-simple.py)
 ```python
 import time
 import torch
@@ -445,16 +445,23 @@ of a model if you use the `accel-object.ord1.coreweave.com` endpoint.
 `tensorizer` has a few additional features that make it more useful than
 just a serialization/deserialization tool.
 
-### Plaid Mode
+### Concurrent Reads
 
-`tensorizer` has a `plaid_mode` argument that can be passed to the
-`TensorDeserializer` class when deserializing tensors to the GPU.
-When `plaid_mode` is `True`, `tensorizer` will load tensors extremely fast
-by reusing a single small CPU buffer as a staging area to load tensors before
-transferring them to the GPU through DMA.
-This can also greatly decrease CPU RAM usage during deserialization.
+The `TensorDeserializer` class has a `num_readers` argument that controls
+how many threads are allowed to read concurrently from the source file.
+This can greatly improve performance, since in many cases the network or the
+file is the bottleneck. A few caveats to running with `num_readers > 1`:
 
-`plaid_mode` is enabled by default when available.
+* The specified file must be able to be reopened, so that the
+  `TensorDeserializer` can open more streams against the source.
+  * Local files, paths, and HTTP(S) and S3 URIs / open streams
+    are all able to be reopened
+  * Special files like pipes and sockets, or synthetic file-like objects such as
+    `BytesIO` are not currently able to be reopened
+* For HTTP(S) and S3 streams and URIs, the host must support the `Range` header.
+  Each reader will read a stream from a different Range offset in the source.
+
+The default is `num_readers=1`, which has no special requirements.
 
 ### `state_dict` Support
 
@@ -525,6 +532,12 @@ For all other datatypes that require no special handling, these are returned as
 `False` and `None`, respectively.
 The exact numpy datatypes used by the returned opaque `numpy.ndarray` objects
 is not guaranteed, and should not be relied upon.
+
+### Plaid mode
+Older versions of Tensorizer had an argument called `plaid_mode` that reused
+buffers when copying to CUDA devices. This now happens automatically.
+`plaid_mode` and `plaid_mode_buffers` are left as arguments for backwards
+compatibility but are deprecated and have no effect.
 
 ## Running Tests
 `tensorizer` uses `unittest` for testing.

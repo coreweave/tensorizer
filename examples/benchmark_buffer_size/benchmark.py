@@ -339,7 +339,11 @@ def io_test(
     buffer = bytearray(read_size)
     total_sz = 0
     start = time.monotonic()
-    io = CURLStreamFile(source, buffer_size=buffer_size)
+    if ":" not in source:
+        # presume local file path
+        io = open(source, mode="rb", buffering=buffer_size)
+    else:
+        io = CURLStreamFile(source, buffer_size=buffer_size)
     while True:
         try:
             sz = io.readinto(buffer)
