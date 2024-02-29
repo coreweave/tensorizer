@@ -3834,7 +3834,7 @@ class TensorSerializer:
         else:
             transferred = queue.Queue(maxsize=max_read_ahead)
 
-        biggest_tensor_bytes = max(t.nbytes for t in tensors)
+        biggest_tensor_bytes = max(t.element_size() * t.nelement() for t in tensors)
         staging_tensor = torch.empty(
             (biggest_tensor_bytes,), dtype=torch.uint8, device="cpu", pin_memory=True
         )
