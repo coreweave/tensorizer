@@ -823,12 +823,20 @@ class TestDeserialization(unittest.TestCase):
 
     @unittest.skipIf(not is_cuda_available, "requires CUDA")
     def test_cuda_multiple_readers(self):
-        deserialized = TensorDeserializer(
-            self._serialized_model_path, device="cuda", num_readers=4
-        )
+        with open(
+            self._serialized_model_path, "rb"
+        ) as in_file, TensorDeserializer(
+            in_file, device="cuda", num_readers=4
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
 
-        check_deserialized(self, deserialized, model_name)
-        deserialized.close()
+    def test_cpu_multiple_readers(self):
+        with open(
+            self._serialized_model_path, "rb"
+        ) as in_file, TensorDeserializer(
+            in_file, device="cpu", num_readers=4
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
     @patch.object(stream_io, "default_s3_read_endpoint", default_read_endpoint)
@@ -839,6 +847,33 @@ class TestDeserialization(unittest.TestCase):
         check_deserialized(self, deserialized, model_name)
         check_inference(self, deserialized, model_name, default_device)
         deserialized.close()
+
+    @patch.object(stream_io, "_s3_default_config_paths", ())
+    @patch.object(stream_io, "default_s3_read_endpoint", default_read_endpoint)
+    def test_s3_multiple_readers(self):
+        uri: str = f"s3://tensorized/{model_name}/model.tensors"
+
+        with self.subTest(
+            "Deserializing from an S3 URI"
+        ), TensorDeserializer(
+            uri, device=default_device, num_readers=4
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            check_inference(self, deserialized, model_name, default_device)
+
+        with self.subTest(
+            "Deserializing from a CURLStreamFile"
+        ), stream_io.open_stream(
+            uri,
+            "rb",
+            s3_access_key_id="",
+            s3_secret_access_key="",
+            s3_endpoint="object.ord1.coreweave.com",
+        ) as stream, TensorDeserializer(
+            stream, device=default_device, num_readers=4
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            check_inference(self, deserialized, model_name, default_device)
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
     @patch.object(stream_io, "default_s3_read_endpoint", default_read_endpoint)

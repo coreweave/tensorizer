@@ -1,7 +1,6 @@
-from typing import Iterable, List, Sequence
-
-import numpy as np
-
+import itertools
+import sys
+from typing import Iterable, List, Sequence, Tuple
 
 __all__ = ("partition",)
 
@@ -9,8 +8,7 @@ __all__ = ("partition",)
 def partition(
     weights: Sequence[int],
     partitions: int,
-    prefer_fewer: bool = True,
-    performance_threshold: int = 250000,
+    performance_threshold: int = 100,
 ) -> Iterable[slice]:
     """
     Partitions a sequence of weights into slices with balanced sums,
@@ -20,16 +18,12 @@ def partition(
         weights: Element weights to balance.
         partitions: The maximum number of slices to return.
             May return fewer if there are too few weights.
-        prefer_fewer: Enables returning fewer slices than requested
-            if the optimal partitioning scheme with at most `partitions`
-            partitions does not need exactly `partitions` slices.
-            For example, asking for 3 slices of ``[5, 2, 2]``
-            could return ``[[5], [2, 2]]``, since splitting again
-            to ``[[5], [2], [2]]`` doesn't improve the largest slice's sum.
-        performance_threshold: Limit for the number of comparisons that would
-            be used to calculate an optimal partitioning scheme. If more than
-            this many comparisons would be needed, an asymptotically faster
-            greedy approximation is used instead.
+        performance_threshold: Limit on the estimated time that would
+            be required to calculate an optimal partitioning scheme.
+            Not an exact measurement, but similar to milliseconds,
+            with an additional fuzzy bound on memory usage thrown in.
+            If this threshold is passed, an asymptotically faster,
+            low-memory greedy approximation is used instead.
 
     Returns:
         An iterable of ``slice`` objects denoting ranges of the original
@@ -51,108 +45,177 @@ def partition(
     """
     n: int = len(weights)
     partitions = min(n, partitions)
-    if (
-        partitions <= 2
-        or partitions * (n * (n + 1) // 2) > performance_threshold
-    ):
+    # The strange formula came from a least-squares fit over testing data;
+    # it is likely an overestimate, but approximates the time in milliseconds
+    # to run linear_partition
+    too_intensive: bool = (
+        round(
+            max(
+                (partitions * n) / 5000, n**1.6565 * partitions**0.617 * 1.75e-4
+            )
+        )
+        > performance_threshold
+    )
+    if partitions <= 2 or too_intensive:
         return greedy_linear_partition(weights, partitions)
     else:
-        return linear_partition(weights, partitions, prefer_fewer)
+        return linear_partition(weights, partitions)
 
 
 def linear_partition(
-    weights: Sequence[int], partitions: int, prefer_fewer: bool = True
+    weights: Sequence[int], partitions: int
 ) -> Iterable[slice]:
-    # Dynamic programming solution to the linear partitioning problem
-    # based on Dr. Steven Skiena's algorithm & lecture notes.
-    # This finds an exact, optimal solution that has the smallest maximum sum
-    # in any partition. It provides no guarantees that the other partitions
-    # are perfect balanced, as long as they each have smaller sums than
-    # the largest partition.
-    # Time complexity: O(partitions * (len(weights) ** 2))
-    # Space complexity: O(partitions * len(weights))
     n: int = len(weights)
     partitions = min(partitions, n)
     if partitions <= 1:
         return (slice(0, n),)
-    prefix_sums: np.ndarray = np.cumsum(weights, dtype=np.uint64)
-    inf: np.ndarray = np.array(-1).astype(np.uint64)
-    # Entries in best_prefix_partition represent the lowest cost for a prefix,
-    # given two parameters:
-    # - Row: end position of the prefix
-    # - Column: number of allowed new partitions
-    # The lowest cost is the size of the largest partition in that prefix
-    # assuming the partitions are balanced optimally
-    best_prefix_partition: np.ndarray = np.full(
-        (n, partitions), inf, dtype=np.uint64
+    for w in weights:
+        if w < 0:
+            raise ValueError("All weights must be non-negative")
+    prefix_sums: Tuple[int, ...] = tuple(
+        itertools.accumulate(weights, initial=0)
     )
 
-    # Each row represents a different prefix
-    # No new partitions means no splitting; the total weight is the whole prefix
-    best_prefix_partition[:, 0] = prefix_sums
+    inf: int = prefix_sums[-1] + 1
+    sentinel = (inf, inf)
+    memo = [sentinel] * ((n + 1) * partitions)
+    # Key function: end * partitions + preceding_parts
+    null = (0, 0)
+    for i in range(partitions):
+        # When end = 0
+        memo[i] = null
+    del null
+    for i in range(n + 1):
+        # When preceding_parts = 0
+        memo[i * partitions] = (0, prefix_sums[i])
 
-    # Each column represents splitting into a different number of partitions
-    # Since the first row is a prefix with only one item,
-    # regardless of the number of partitions, it will have the same maximum
-    # weight (that single weight)
-    best_prefix_partition[0, :] = weights[0]
+    def find_start(end: int, preceding_parts: int) -> Tuple[int, int]:
+        key = end * partitions + preceding_parts
+        cache_hit = memo[key]
+        if cache_hit is not sentinel:
+            return cache_hit
 
-    partition_starts: np.ndarray = np.empty(
-        (n - 1, partitions - 1), dtype=np.uint64
-    )
-    # The columns in partition_starts mean the same as the columns in
-    # best_prefix_partition, except row & column 0 would be meaningless,
-    # so we remove them, since there's nothing to end if there are no new
-    # partitions allowed, and nothing precedes position 0.
-    # The rows in partition_starts are a lookup table
-    # An entry at partition_starts[end, k] being `start` means the optimal
-    # partition ending immediately before `end` starts at `start`,
-    # with k other partitions behind it.
-    # The final partition indices come from iterated application of
-    # looking up `end` in partition_starts, and replacing it with the result
-    for end in range(1, n):
-        for partitions_remaining in range(1, partitions):
-            for start in range(end):
-                # If you form a new partition between `start` and `end`,
-                # then the largest sum overall is either the new one,
-                # or the previous largest sum in everything preceding `start`
-                # (with fewer allowed partitions)
-                largest_partition = max(
-                    best_prefix_partition[start, partitions_remaining - 1],
-                    prefix_sums[end] - prefix_sums[start],
-                )
-                best = best_prefix_partition[end, partitions_remaining]
-                if (
-                    prefer_fewer
-                    and largest_partition < best
-                    or not prefer_fewer
-                    and largest_partition <= best
-                ):
-                    # If forming a partition here gave
-                    # a record low outcome, record it.
-                    # If prefer_fewer is true, this may result in fewer
-                    # partitions than originally requested, if adding more
-                    # wouldn't reduce the maximum partition size either way
-                    best_prefix_partition[end, partitions_remaining] = (
-                        largest_partition
+        best_weight = inf
+        best_start = -1
+        end_sum = prefix_sums[end]
+
+        # Optimization: In general, iterating in reverse will find the best one
+        # faster for "uniformly shuffled" datasets, since the best segment split
+        # will likely be closer to (end / preceding_parts) in length.
+        # There are two more important observations:
+        # 1. current_weight is monotonically increasing while moving
+        #    right-to-left, because the current segment is expanding
+        # 2. earlier_weight is monotonically decreasing while moving
+        #    right-to-left, because the preceding segment is shrinking
+        #
+        # This means there are two regions that can be completely skipped:
+        # 1. current_weight is too big (> best_weight)
+        #   - This means the start is too far left
+        # 2. earlier_weight is too big (> best_weight)
+        #   - This means the start is too far right
+        # Since best_weight is monotonically decreasing, regions skipped like
+        # this never need to be revisited. On the other hand, each time
+        # best_weight updates, more may be eligible to be skipped.
+        # The sooner good candidates are found for best_weight,
+        # the sooner the search space will be narrowed.
+        # This leads to the following strategy:
+        # 1. Keep track of the left and right boundaries of the search space
+        # 2. While the rightmost element is a new best, shrink the right by 1
+        # 3. When the rightmost element is not a new best:
+        #   a) Shrink the right by 1, then
+        #   b) Jump half of the remaining search space towards the left
+        #   c) If current_weight is now too big, update the left,
+        #      then jump half of the new search space back towards the right
+        #   d) If earlier_weight is still too big, update the right to the
+        #      jumped-to position, and then go back to step 3
+        #   e) If earlier_weight is not too big, update best_weight,
+        #      jump back to the right, and go back to step 2
+        # This attempts to find the valid region for current_weight
+        # and earlier_weight as quickly as possible via a dynamic variant of
+        # binary search, and then linearly scans through the possibilities.
+
+        left = 0  # first impossible element due to current_weight
+        # Note: start = 0 is reserved for when preceding_parts = 0 anyway,
+        # which is always handled by the cache, so setting left = 0 is safe.
+        right = end - 1  # last possible element due to earlier_weight
+        start = right
+        while True:
+            current_weight = end_sum - prefix_sums[start]
+            if current_weight < best_weight:
+                earlier_weight = find_start(start, preceding_parts - 1)[1]
+                if earlier_weight < best_weight:
+                    best_weight = (
+                        current_weight
+                        if current_weight > earlier_weight
+                        else earlier_weight
                     )
-                    partition_starts[end - 1, partitions_remaining - 1] = start
-    del best_prefix_partition
-    slices = []
-    end = n - 1
-    for partitions_remaining in range(partitions - 1, 0, -1):
-        start = int(partition_starts[end - 1, partitions_remaining - 1])
-        # The algorithm calculates an inclusive endpoint,
-        # so end at end + 1 to include it, and start at start + 1
-        # to not overlap with the next slice
-        slices.append(slice(start + 1, end + 1))
-        end = start
-        if end == 0:
-            break
-    slices.append(slice(0, end + 1))
-    slices.reverse()
+                    best_start = start
+                    # If this was already the rightmost one, narrow the search
+                    right -= start == right
+                    if right <= left:
+                        break
+                    # Reset to the right end, in case the best was skipped
+                    start = right
+                else:
+                    # Nothing right of this matters
+                    # Try skipping forward a bit
+                    right = start - 1
+                    dist = right - left
+                    if dist <= 0:
+                        break
+                    else:
+                        start = right - (dist >> 1)
+            else:
+                # Overshot, nothing left of this matters
+                left = start
+                dist = right - left
+                if dist <= 0:
+                    break
+                elif dist == 1:
+                    start = right
+                else:
+                    start = left + (dist >> 1)
 
-    return slices
+        result = (best_start, best_weight)
+        memo[key] = result
+        return result
+
+    if partitions > 900:
+        old_recursion_limit = sys.getrecursionlimit()
+        # Loosen the recursion limit by up to about 6500 if needed.
+        # Since too-high limits can cause the interpreter to crash,
+        # anything beyond this point is handled on a purely algorithmic level.
+        sys.setrecursionlimit(old_recursion_limit + min(partitions, 6500) + 10)
+    else:
+        old_recursion_limit = None
+    try:
+        for parts_before in range(6500, partitions - 1, 6500):
+            # Limit the stack depth by pre-populating the cache
+            # for extremely high numbers of partitions (> 6500).
+            # Despite caching, this can easily take more time than
+            # the main call, because it computes several extra values
+            # that would have normally been skipped.
+            parts_after: int = partitions - parts_before - 1
+            # n - parts_after is the closest point to the end that could
+            # feasibly have parts_after parts after it, skipping impossible
+            # scenarios like end=n, parts_before=0
+            for i in range(0, n - parts_after + 1):
+                find_start(i, parts_before)
+
+        i = n
+        seq = [n]
+        for k in range(1, partitions):
+            i = find_start(i, partitions - k)[0]
+            if i == 0:
+                break
+            seq.append(i)
+        seq.append(0)
+        seq.reverse()
+    finally:
+        if old_recursion_limit is not None:
+            sys.setrecursionlimit(old_recursion_limit)
+    memo.clear()
+    return tuple(slice(a, b) for a, b in zip(seq, seq[1:]))
 
 
 def greedy_linear_partition(
