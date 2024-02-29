@@ -48,6 +48,7 @@ import torch
 
 import tensorizer._crypt as _crypt
 import tensorizer._crypt_info as _crypt_info
+import tensorizer._syscalls as _syscalls
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 from tensorizer._crypt._cgroup_cpu_count import (
@@ -117,11 +118,22 @@ class TensorType(Enum):
     STATE_DICT = 2
 
 
+# Current version
+TENSORIZER_VERSION = 4
+
+# To serialize meta tensors into metadata-only tensors
+# that deserialize back into zeroed-out buffers, data version 4 is required.
+META_TENSOR_TENSORIZER_VERSION = 4
+
+# To (de)serialize tensors with encryption, data version 3 is required.
+ENCRYPTION_TENSORIZER_VERSION = 3
+
 # If tensors with "opaque" dtypes (those that are not supported by numpy) are
 # saved, then a tensorizer data version of 2 is required to (de)serialize the
-# file. Otherwise, the file is compatible with tensorizer data version 1
-TENSORIZER_VERSION = 3
+# file.
 OPAQUE_TENSORIZER_VERSION = 2
+
+# Otherwise, the file is compatible with tensorizer data version 1.
 NON_OPAQUE_TENSORIZER_VERSION = 1
 
 TENSORIZER_MAGIC = b"|TZR|"
@@ -166,21 +178,39 @@ class TensorEntry:
     hashes: Optional[List[TensorHash]]
     header_hashes: Optional[Dict[HashType, Any]]
 
+    @property
+    def deserialized_length(self):
+        if self.data_length > 0:
+            return self.data_length
+        element_size: int = numpy.dtype(self.dtype).itemsize
+        num_elements: int = numpy.product(self.shape)
+        return element_size * num_elements
+
+
+class _FileFeatureFlags(enum.IntFlag):
+    encrypted = enum.auto()
+
 
 @dataclasses.dataclass
 class _FileHeader:
-    __slots__ = ("version_number", "tensor_size", "tensor_count")
+    __slots__ = (
+        "version_number",
+        "feature_flags",
+        "tensor_size",
+        "tensor_count",
+    )
     version_number_format: ClassVar[struct.Struct] = struct.Struct(
         "<I"  # Little-endian version number
     )
     format: ClassVar[struct.Struct] = struct.Struct(
         "<"
-        "32x"  # File hash (unused)
+        "32s"  # File feature flags, in data version 4+, otherwise empty
         "Q"  # Total size of tensor data (nominally, total file size)
         "8x"  # Nominally, total size of tensor data (actually unused)
         "Q"  # Total number of tensors
     )
     version_number: int
+    feature_flags: _FileFeatureFlags
     tensor_size: int
     tensor_count: int
 
@@ -192,9 +222,15 @@ class _FileHeader:
             self.version = version
 
     def to_bytes(self) -> bytes:
+        if self.version_number >= META_TENSOR_TENSORIZER_VERSION:
+            feature_flags: bytes = self.feature_flags.to_bytes(
+                32, "little", signed=False
+            )
+        else:
+            feature_flags: bytes = bytes(32)
         return self.version_number_format.pack(
             self.version_number
-        ) + self.format.pack(self.tensor_size, self.tensor_count)
+        ) + self.format.pack(feature_flags, self.tensor_size, self.tensor_count)
 
     @classmethod
     def from_io(
@@ -204,12 +240,15 @@ class _FileHeader:
             reader.read(cls.version_number_format.size)
         )[0]
         if version_number not in accepted_versions:
+            accepted_versions_str: str = ", ".join(
+                map(str, sorted(set(accepted_versions)))
+            )
             message = (
                 "Unsupported version: this data stream uses tensorizer"
                 f" data version {version_number}, which is not supported"
                 " in this release of tensorizer, or"
                 " for the serialization/deserialization features selected."
-                f"\nSupported data versions: {tuple(accepted_versions)}"
+                f"\nSupported data versions: {accepted_versions_str}"
             )
             raise cls.InvalidVersionError(message, version=version_number)
         data = reader.read(cls.format.size)
@@ -217,7 +256,16 @@ class _FileHeader:
             raise ValueError(
                 "File too small: ran out of data before reading a full header"
             )
-        return cls(version_number, *cls.format.unpack(data))
+        feature_flag_bytes, tensor_size, tensor_count = cls.format.unpack(data)
+        feature_flag_int = int.from_bytes(
+            feature_flag_bytes, "little", signed=False
+        )
+        feature_flags = _FileFeatureFlags(feature_flag_int)
+        if not (0 <= feature_flags <= max(_FileFeatureFlags)):
+            raise ValueError(
+                f"Unsupported feature flags: {_FileFeatureFlags!r}"
+            )
+        return cls(version_number, feature_flags, tensor_size, tensor_count)
 
 
 @dataclasses.dataclass(init=False)
@@ -302,10 +350,6 @@ class _TensorHeaderSerializer:
         "Q"  # Tensor length
     )
     metadata_entry: bytes
-
-    @classmethod
-    def decode(cls):
-        pass
 
     def __init__(
         self,
@@ -1347,10 +1391,8 @@ class TensorDeserializer(
             accessed. If False, all tensors will be loaded into memory up
             front.
         plaid_mode: If True, tensors will be loaded extremely fast into the
-            target device. This is only supported on CUDA devices, and the
-            buffers are going to be inconsistent due to the extreme
-            naughtiness of reusing a backing buffer. This is only recommended
-            for use with inference, and not training.
+            target device. This is only supported on CUDA devices.
+            Defaults to True on CUDA devices and False for CPU loading.
         plaid_mode_buffers: The number of buffers to use in plaid mode. This
             is only used if ``plaid_mode=True``. These buffers are used to
             pipeline the loading and processing of tensors.
@@ -1381,7 +1423,7 @@ class TensorDeserializer(
             # Public `tensorized` bucket hosted by CoreWeave; see the docs
             s3_uri = f"s3://tensorized/{model_ref}/fp16/model.tensors"
 
-            deserializer = TensorDeserializer(s3_uri, plaid_mode=True)
+            deserializer = TensorDeserializer(s3_uri)
             deserializer.load_into_module(model)
 
         ## From a private S3 bucket::
@@ -1396,7 +1438,7 @@ class TensorDeserializer(
             )
             # Set up `model` as an empty torch.nn.Module in the shape of
             # my-model.tensors, then:
-            deserializer = TensorDeserializer(s3, plaid_mode=True)
+            deserializer = TensorDeserializer(s3)
             deserializer.load_into_module(model)
 
         .. _pre-serialized: https://github.com/coreweave/tensorizer/tree/main#available-pre-tensorized-models-on-the-coreweave-cloud
@@ -1418,7 +1460,7 @@ class TensorDeserializer(
         dtype: Optional[torch.dtype] = None,
         *,
         lazy_load: bool = False,
-        plaid_mode: bool = False,
+        plaid_mode: Optional[bool] = None,
         plaid_mode_buffers: Optional[int] = None,
         verify_hash: bool = False,
         encryption: Optional[DecryptionParams] = None,
@@ -1477,7 +1519,7 @@ class TensorDeserializer(
                 utils.get_device() if device is None else torch.device(device)
             )
             self._device: torch.device = device
-            is_cuda = self._device.type == "cuda"
+            is_cuda: bool = self._device.type == "cuda"
             if is_cuda and not torch.cuda.is_available():
                 raise RuntimeError(
                     "Cannot deserialize to CUDA device"
@@ -1486,7 +1528,9 @@ class TensorDeserializer(
 
             self._dtype: Optional[torch.dtype] = dtype
 
-            self._plaid_mode: bool = plaid_mode
+            self._plaid_mode: bool = (
+                is_cuda if plaid_mode is None else plaid_mode
+            )
 
             self._lazy_load: bool = lazy_load
 
@@ -1500,14 +1544,18 @@ class TensorDeserializer(
             if magic != TENSORIZER_MAGIC:
                 raise ValueError("Not a tensorizer file")
 
-            # Read the file header
+            # Read the file header and check for a compatible data version
+            accepted_versions = (
+                NON_OPAQUE_TENSORIZER_VERSION,
+                OPAQUE_TENSORIZER_VERSION,
+                ENCRYPTION_TENSORIZER_VERSION,
+                META_TENSOR_TENSORIZER_VERSION,
+                TENSORIZER_VERSION,
+            )
+            encryption_ver: int = ENCRYPTION_TENSORIZER_VERSION
             if self._encrypted:
-                accepted_versions = (TENSORIZER_VERSION,)
-            else:
-                accepted_versions = (
-                    NON_OPAQUE_TENSORIZER_VERSION,
-                    OPAQUE_TENSORIZER_VERSION,
-                    TENSORIZER_VERSION,
+                accepted_versions = tuple(
+                    filter(lambda v: v >= encryption_ver, accepted_versions)
                 )
             try:
                 self._file_header = _FileHeader.from_io(
@@ -1528,9 +1576,23 @@ class TensorDeserializer(
                 else:
                     raise
 
+            version_number: int = self._file_header.version_number
             self._has_crypt_info: bool = (
-                self._file_header.version_number >= TENSORIZER_VERSION
+                version_number == encryption_ver
+                or version_number >= META_TENSOR_TENSORIZER_VERSION
+                and _FileFeatureFlags.encrypted in self._file_flags
             )
+            if self._encrypted and not self._has_crypt_info:
+                raise CryptographyError(
+                    "Tensor decryption was requested,"
+                    " but the file provided is not flagged as encrypted."
+                    " Either set encryption=None on the TensorDeserializer,"
+                    " or ensure that the correct file was provided."
+                )
+            elif self._has_crypt_info and not self._encrypted:
+                raise CryptographyError(
+                    "Tensor is encrypted, but decryption was not requested"
+                )
 
             # The total size of the file.
             # WARNING: this is not accurate. This field isn't used in the
@@ -1555,12 +1617,13 @@ class TensorDeserializer(
                     for name, entry in self._metadata.items()
                     if filter_func(name)
                 }
+            num_tensors: int = len(self._metadata)
 
             # We calculate the total tensor bytes here so that we can use mmap,
             # based on the total size of the tensors that we're going to read,
             # filtered by the filter_func.
             tensor_sizes = {
-                name: entry.data_length
+                name: entry.deserialized_length
                 for name, entry in self._metadata.items()
             }
             self.total_tensor_bytes = sum(tensor_sizes.values())
@@ -1576,6 +1639,9 @@ class TensorDeserializer(
                 self._plaid_mode_buffer_count = 1
             else:
                 self._plaid_mode_buffer_count = 2
+            self._plaid_mode_buffer_count = (
+                min(num_tensors, self._plaid_mode_buffer_count) or 1
+            )
             single_largest_tensor = max(tensor_sizes.values(), default=0)
             # Round up to the nearest multiple of the page size
             # Just so that more reads happen on page boundaries
@@ -1587,6 +1653,23 @@ class TensorDeserializer(
             ) * self._plaid_mode_buffer_count
 
             self._buffers = {}
+
+            if logger.isEnabledFor(logging.DEBUG):
+                # Skip creating this string unless debug logging is enabled
+                logger.debug(
+                    f"Deserializing {self.total_tensor_bytes} bytes"
+                    f" from {num_tensors}"
+                    f" tensor{'s' * (num_tensors != 1)} using"
+                    f" plaid_mode={self._plaid_mode},"
+                    " plaid_mode_buffers="
+                    f"{self._plaid_mode_buffer_count * self._plaid_mode},"
+                    f" lazy_load={self._lazy_load},"
+                    f" verify_hash={self._verify_hash},"
+                    f" encrypted={bool(self._encrypted)},"
+                    f" device={self._device},"
+                    f" dtype={self._dtype},"
+                    f" data_version={self._file_header.version_number}"
+                )
 
             # Allocate the buffer for the tensors.
             # Check if our platform supports mmap.MAP_ANONYMOUS and
@@ -1677,11 +1760,6 @@ class TensorDeserializer(
                 f"in {end_allocate - start_allocate:0.4f}"
             )
 
-            # The number of bytes we've allocated so far. Tensors may be read
-            # from the file in any order, so we need to keep track of how much
-            # we've used so far so that we can index into the buffer correctly.
-            self._allocated = 0
-
             # Our cache of tensors. This is a dict of name -> tensor.
             # If lazy_load is True, then the tensors are not loaded until they
             # are accessed.
@@ -1709,6 +1787,14 @@ class TensorDeserializer(
             # around the CPU buffers anymore, and we can clean up early.
             if self._lazy_load or not is_cuda:
                 self._cleanup = self._cleanup.pop_all()
+
+    @property
+    def _file_flags(self) -> _FileFeatureFlags:
+        return self._file_header.feature_flags
+
+    @_file_flags.setter
+    def _file_flags(self, val: _FileFeatureFlags):
+        self._file_header.feature_flags = val
 
     @staticmethod
     def _mode_check(file_obj: io.IOBase) -> None:
@@ -1844,8 +1930,8 @@ class TensorDeserializer(
         # it as not implemented.
         return self._metadata.keys()
 
-    @staticmethod
     def _verify_hashes(
+        self,
         name: str,
         hashes: Iterable[TensorHash],
         header_hashes: Dict[HashType, Any],
@@ -1856,9 +1942,13 @@ class TensorDeserializer(
 
         Args:
             hashes: The list of hashes to verify.
-            headers: The headers of the tensor.
+            header_hashes: The pre-computed hashes for the tensor's headers.
             mv: The memoryview of the tensor data.
         """
+        metadata_entry = self._metadata.get(name)
+        if metadata_entry and metadata_entry.data_length == 0:
+            # The tensor was zero-filled, so there is nothing to compare against
+            mv = b""
         for tensor_hash in hashes:
             hash_type = tensor_hash.type
             hash_body = tensor_hash.hash
@@ -2083,7 +2173,8 @@ class TensorDeserializer(
                     header.crypt_info is not None
                     and header.crypt_info.num_chunks != 0
                 )
-                if self._encrypted and not is_encrypted:
+                has_data: bool = header.data_length > 0
+                if self._encrypted and not is_encrypted and has_data:
                     raise CryptographyError(
                         "Tensor is not encrypted, but decryption was requested"
                     )
@@ -2091,8 +2182,7 @@ class TensorDeserializer(
                     raise CryptographyError(
                         "Tensor is encrypted, but decryption was not requested"
                     )
-                elif self._encrypted or is_encrypted:
-                    assert self._encrypted and is_encrypted
+                elif self._encrypted and is_encrypted:
                     encryption_method = self._get_encryption_method(
                         header.crypt_info
                     )
@@ -2102,36 +2192,18 @@ class TensorDeserializer(
                     encryption_method = None
 
                 # We use memoryview to avoid copying the data.
-                mv: memoryview
-                if not self._plaid_mode and not self._lazy_load:
-                    # In default mode, we've already allocated all the
-                    # memory we need in a single buffer that contains
-                    # all the tensors. We just need to slice out the
-                    # memoryview for the current tensor.
-                    mv = self._buffers[header.name]
-                    self._allocated += header.data_length
-                elif self._plaid_mode:
-                    # In plaid_mode, we don't allocate a buffer, we just
-                    # reuse the same one. This is a filthy hack, as we're
-                    # overwriting the buffer contents that is used to back
-                    # the prior tensor. This works because we don't use
-                    # the buffer contents after we yield the tensor, which
-                    # is loaded straight into the GPU memory.
-                    mv = self._buffers[header.name]
-                else:
-                    # In lazy_load mode, we allocate a new buffer for each
-                    # tensor. This is a bit slower, but it's the only way
-                    # to support lazy loading.
-                    buffer = self._buffers[header.name]
-                    if len(buffer) != header.data_length:
-                        raise RuntimeError("Header data length mismatch")
-                    mv = memoryview(buffer)
+                mv: memoryview = self._buffers[header.name]
+                if self._lazy_load and not self._plaid_mode:
+                    mv = memoryview(mv)
+                if has_data and len(mv) != header.data_length:
+                    raise RuntimeError("Header data length mismatch")
 
-                if not self._encrypted or mv.nbytes == 0:
-                    self._file.readinto(mv)
-                elif self._encrypted and mv.nbytes > 0:
-                    with self._release_on_exc(mv):
-                        self._stream_decrypt(encryption_method, key, mv)
+                if has_data:
+                    if not self._encrypted or mv.nbytes == 0:
+                        self._file.readinto(mv)
+                    elif self._encrypted and mv.nbytes > 0:
+                        with self._release_on_exc(mv):
+                            self._stream_decrypt(encryption_method, key, mv)
 
                 if verify_hash:
                     with self._release_on_exc(mv):
@@ -2294,6 +2366,10 @@ class TensorDeserializer(
             HashMismatchError: If ``verify_hash`` resolves to True and
                 a deserialized tensor does not match its stored hash.
         """
+        if self._device.type != "cpu":
+            raise RuntimeError(
+                "read_numpy_arrays is only valid when deserializing to the CPU"
+            )
         data = self._read_numpytensors(
             filter_func=filter_func,
             num_tensors=num_tensors,
@@ -2388,7 +2464,7 @@ class TensorDeserializer(
             return
         with contextlib.ExitStack() as exit_stack:
             tensor_sizes = [
-                (key, self._metadata[key].data_length) for key in keys
+                (key, self._metadata[key].deserialized_length) for key in keys
             ]
             optimized_buffers = self._buffers.copy()
             with memoryview(self._buffer) as mv:
@@ -3113,30 +3189,36 @@ class TensorSerializer:
             self.lz4_frame = None
 
         # Write our magic bytes.
-        self._file.write(TENSORIZER_MAGIC)
+        self._write(TENSORIZER_MAGIC)
 
         # Write file header metadata
         if not self._encrypted:
-            # Can't tell if OPAQUE_TENSORIZER_VERSION is needed
-            # until a tensor is written later with an opaque dtype,
-            # so assume it is non-opaque until then.
+            # Can't tell if OPAQUE_TENSORIZER_VERSION
+            # or META_TENSOR_TENSORIZER_VERSION are needed
+            # until a tensor is written later with an opaque dtype
+            # or from the meta device,
+            # so assume it is compatible with version 1 until then.
             version_number = NON_OPAQUE_TENSORIZER_VERSION
         else:
             # File encryption requires a newer tensorizer version
-            version_number = TENSORIZER_VERSION
+            version_number = ENCRYPTION_TENSORIZER_VERSION
+        feature_flags = _FileFeatureFlags(0)
+        if self._encrypted:
+            feature_flags |= _FileFeatureFlags.encrypted
         self._file_header_loc = self._file.tell()
         self._file_header = _FileHeader(
             version_number=version_number,
+            feature_flags=feature_flags,
             tensor_size=0,
             tensor_count=0,
         )
-        self._file.write(self._file_header.to_bytes())
+        self._write(self._file_header.to_bytes())
 
         # Reserve 256 KiB for metadata.
         metadata_size = 256 * 1024
-        self._file.write(struct.pack("<Q", metadata_size))
+        self._write(struct.pack("<Q", metadata_size))
         self._metadata_loc = self._file.tell()
-        self._file.write(bytes(metadata_size))
+        self._write(bytes(metadata_size))
         self._flush()
         self._metadata_cur = self._metadata_loc
         self._metadata_end = self._metadata_loc + metadata_size
@@ -3167,11 +3249,11 @@ class TensorSerializer:
 
         # Write our zero-length field, that indicates that this is the last
         # tensor. This will be overwritten if another tensor is written.
-        self._file.write(struct.pack("<Q", 0))
+        self._write(struct.pack("<Q", 0))
 
         # Write our new file header.
         self._file.seek(self._file_header_loc)
-        self._file.write(self._file_header.to_bytes())
+        self._write(self._file_header.to_bytes())
 
         # Reset our file pointer to the end of the file,
         # minus the zero-length field.
@@ -3200,16 +3282,55 @@ class TensorSerializer:
         # based on the capabilities of the platform and the file object used
         raise RuntimeError("pwrite was called before being initialized")
 
+    @staticmethod
+    def _mv_suffix(data, start: int):
+        if not isinstance(data, memoryview):
+            data = memoryview(data)
+        try:
+            if data.ndim != 1:
+                data = data.cast("B")
+            return data[start:]
+        finally:
+            del data
+
     def _pwrite_syscall(
         self, data, offset: int, verify: Union[bool, int] = True
     ) -> int:
         # This implementation of pwrite uses a Unix syscall, and is safe to
         # run even between normal file writes.
-        bytes_written = os.pwrite(self._fd, data, offset)
-        if isinstance(verify, int):
-            self._verify_bytes_written(bytes_written, verify)
-        elif verify:
-            self._verify_bytes_written(bytes_written, self._buffer_size(data))
+        bytes_written: int = 0
+        expected_bytes_written: int = (
+            verify if isinstance(verify, int) else self._buffer_size(data)
+        )
+        bytes_just_written: int = os.pwrite(self._fd, data, offset)
+        bytes_written += bytes_just_written
+        while bytes_written < expected_bytes_written and bytes_just_written > 0:
+            # Writes larger than ~2 GiB may not complete in a single pwrite call
+            offset += bytes_just_written
+            with self._mv_suffix(data, bytes_written) as mv:
+                bytes_just_written = os.pwrite(self._fd, mv, offset)
+            bytes_written += bytes_just_written
+        if isinstance(verify, int) or verify:
+            self._verify_bytes_written(bytes_written, expected_bytes_written)
+        return bytes_written
+
+    def _write(self, data, expected_bytes_written: Optional[int] = None) -> int:
+        # Thread-unsafe non-parallel write at the current file position
+        # Calls `.write()` on `self._file` one or more times,
+        # until all data is written or no more is being written,
+        # as unbuffered I/O objects are not guaranteed to write
+        # all data in a single call to `.write()`.
+        if expected_bytes_written is None:
+            expected_bytes_written = self._buffer_size(data)
+        bytes_written: int = 0
+        bytes_just_written: int = self._file.write(data)
+        bytes_written += bytes_just_written
+        if bytes_just_written > expected_bytes_written:
+            raise ValueError("Wrote more data than expected")
+        while bytes_written < expected_bytes_written and bytes_just_written > 0:
+            with self._mv_suffix(data, bytes_written) as mv:
+                bytes_just_written = self._file.write(mv)
+            bytes_written += bytes_just_written
         return bytes_written
 
     def _pwrite_fallback(
@@ -3219,16 +3340,17 @@ class TensorSerializer:
         # for the entire file object. It is not safe to run this
         # concurrently with any other code that could modify the file offset
         # except other calls to _pwrite_fallback.
+        expected_bytes_written: int = (
+            verify if isinstance(verify, int) else self._buffer_size(data)
+        )
         with self._write_lock:
             old_pos = self._file.tell()
             if old_pos != offset:
                 self._file.seek(offset)
-            bytes_written = self._file.write(data)
+            bytes_written = self._write(data, expected_bytes_written)
             self._file.seek(old_pos)
-        if isinstance(verify, int):
-            self._verify_bytes_written(bytes_written, verify)
-        elif verify:
-            self._verify_bytes_written(bytes_written, self._buffer_size(data))
+        if isinstance(verify, int) or verify:
+            self._verify_bytes_written(bytes_written, expected_bytes_written)
         return bytes_written
 
     @staticmethod
@@ -3392,10 +3514,25 @@ class TensorSerializer:
                 writes starting at the current file offset.
         """
         if isinstance(tensor, torch.Tensor):
-            if not tensor.is_contiguous():
+            shape: Sequence[int] = tensor.size()
+            has_data: bool = not tensor.is_meta
+            if has_data:
+                if not tensor.is_contiguous():
+                    _temporary_buffer = True
+                numpy_tensor = _NumpyTensor.from_tensor(tensor.contiguous())
+            else:
+                self._file_header.version_number = max(
+                    META_TENSOR_TENSORIZER_VERSION,
+                    self._file_header.version_number,
+                )
                 _temporary_buffer = True
-            numpy_tensor = _NumpyTensor.from_tensor(tensor.contiguous())
+                hollow_tensor = torch.empty(
+                    (0,) * tensor.ndim, device="cpu", dtype=tensor.dtype
+                )
+                numpy_tensor = _NumpyTensor.from_tensor(hollow_tensor)
         else:
+            shape: Sequence[int] = tensor.shape
+            has_data: bool = True
             if (
                 isinstance(tensor, numpy.ndarray)
                 and not tensor.flags.c_contiguous
@@ -3431,10 +3568,10 @@ class TensorSerializer:
         dtype_bytes = dtype_name.encode("utf-8")
         if len(dtype_bytes) >= 256:
             raise ValueError("dtype name length should be less than 256")
-        shape = tensor.shape
         header_pos = self._file.tell() if _start_pos is None else _start_pos
 
-        if self._encrypted:
+        encrypted: bool = self._encrypted and has_data
+        if encrypted:
             chunks = _Chunked(
                 total_size=tensor_memory.nbytes,
                 chunk_size=self._crypt_chunk_size,
@@ -3461,12 +3598,14 @@ class TensorSerializer:
             crypt_info = _crypt_info.CryptInfo(chunks)
         else:
             encryptor = None
-            if self._file_header.version_number == TENSORIZER_VERSION:
+            if _FileFeatureFlags.encrypted in self._file_header.feature_flags:
+                # If the `encrypted` flag is present, all headers are expected
+                # to have crypt_info segments, so add an empty one
                 crypt_info = _crypt_info.CryptInfo()
             else:
                 crypt_info = None
 
-        include_crc32: bool = not self._encrypted
+        include_crc32: bool = not encrypted
 
         header = _TensorHeaderSerializer(
             idx,
@@ -3543,7 +3682,7 @@ class TensorSerializer:
             self._pwrite(header.buffer, header_pos, verify=header.data_offset)
 
         hash_tasks = []
-        if self._encrypted and not _temporary_buffer:
+        if encrypted and not _temporary_buffer:
             # If multiple tensors share memory, and were encrypted in-place,
             # then this must not start hashing until any previous decryption
             # tasks have restored this memory to its original state
@@ -3587,7 +3726,12 @@ class TensorSerializer:
         ):
             if prerequisite is not None:
                 prerequisite.result(_TIMEOUT)
-            bytes_written = self._pwrite(tensor_memory, tensor_pos, verify=size)
+            if has_data:
+                bytes_written = self._pwrite(
+                    tensor_memory, tensor_pos, verify=size
+                )
+            else:
+                bytes_written = 0
             with self._tensor_count_update_lock:
                 self._file_header.tensor_count += 1
                 self._file_header.tensor_size += bytes_written
@@ -3618,7 +3762,7 @@ class TensorSerializer:
                     ) from (original_exc if original_exc is not None else e)
 
         # Encrypt the tensor memory in-place before writing
-        if self._encrypted:
+        if encrypted:
             encrypt_task = self._encryption_pool.submit(encrypt, hash_tasks)
             self._jobs.append(encrypt_task)
         else:
@@ -3635,7 +3779,7 @@ class TensorSerializer:
         )
         self._jobs.append(write_task)
         # Decrypt the memory after writing is finished, if it was encrypted
-        if self._encrypted and not _temporary_buffer:
+        if encrypted and not _temporary_buffer:
             decrypt_task = self._decryption_pool.submit(decrypt, write_task)
             self._jobs.append(decrypt_task)
             assert mem_pointer is not None
@@ -3694,6 +3838,11 @@ class TensorSerializer:
         else:
             transferred = queue.Queue(maxsize=max_read_ahead)
 
+        biggest_tensor_bytes = max(t.element_size() * t.nelement() for t in tensors)
+        staging_tensor = torch.empty(
+            (biggest_tensor_bytes,), dtype=torch.uint8, device="cpu", pin_memory=True
+        )
+
         transfer_finished = False
 
         def _transfer():
@@ -3706,7 +3855,10 @@ class TensorSerializer:
                 for t in tensors:
                     if transfer_finished:
                         break
-                    transferred.put(t.cpu().detach(), timeout=_TIMEOUT)
+                    staging_tensor_view = staging_tensor.narrow(0, 0, t.nbytes).view(t.dtype).view(t.shape)
+                    staging_tensor_view.copy_(t)
+                    new_cpu_tensor = staging_tensor_view.clone()
+                    transferred.put(new_cpu_tensor.detach(), timeout=_TIMEOUT)
                 else:
                     # Sentinel
                     transferred.put(None)
@@ -3743,20 +3895,20 @@ class TensorSerializer:
     def _bulk_write(self, tensors: Iterable[_WriteSpec]):
         tensors = collections.deque(tensors)
         next_pos = self._file.tell()
-
-        fallocate = getattr(os, "posix_fallocate", None)
-        if fallocate and self._fd:
+        if _syscalls.has_fallocate() and self._fd:
             size = sum(len(t.name) for t in tensors)
             size += sum(
-                t.tensor.element_size() * t.tensor.nelement() for t in tensors
+                t.tensor.element_size()
+                * t.tensor.nelement()
+                * (not t.tensor.is_meta)
+                for t in tensors
             )
             # Rough underestimate of header size
             header_min_size = 24
             size += header_min_size * len(tensors)
-            try:
-                fallocate(self._fd, next_pos, size)
-            except OSError:
-                pass
+            _syscalls.try_fallocate(
+                self._fd, next_pos, size, suppress_all_errors=True
+            )
 
         cuda_tensors = [
             t.tensor for t in tensors if t.tensor.device.type == "cuda"
@@ -3774,7 +3926,7 @@ class TensorSerializer:
             shared = []
             seen_addresses = set()
             for t in reversed(tensors):
-                if t.tensor.device.type == "cuda":
+                if t.tensor.device.type in ("cuda", "meta"):
                     shared.append(False)
                 else:
                     address = t.tensor.data_ptr()
@@ -3914,7 +4066,10 @@ class TensorSerializer:
         if not include_non_persistent_buffers:
             persistent = persistent_buffers()
             all_tensors = (
-                spec for spec in all_tensors if spec.name in persistent
+                spec
+                for spec in all_tensors
+                if spec.tensor_type != TensorType.BUFFER
+                or spec.name in persistent
             )
 
         self._bulk_write(all_tensors)
