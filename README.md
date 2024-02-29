@@ -441,12 +441,23 @@ of a model if you use the `accel-object.ord1.coreweave.com` endpoint.
 `tensorizer` has a few additional features that make it more useful than
 just a serialization/deserialization tool.
 
-### Concurrent reads
+### Concurrent Reads
 
-The `TensorDeserializer` class has an argument called `num_readers` that affects how many concurrent reading threads can read from the source at the same time.
-This can greatly improve performance, since in many cases the network or the file is the bottleneck. A few caveats to running with `num_readers > 1`:
-* The specified file must be a string; either a URI or file path, so that the Deserializer can open more streams against the source.
-* For HTTP and S3 URIs, the host must support the `Range` header. Each reader will read a stream from a different Range offset in the source.
+The `TensorDeserializer` class has a `num_readers` argument that controls
+how many threads are allowed to read concurrently from the source file.
+This can greatly improve performance, since in many cases the network or the
+file is the bottleneck. A few caveats to running with `num_readers > 1`:
+
+* The specified file must be able to be reopened, so that the
+  `TensorDeserializer` can open more streams against the source.
+  * Local files, paths, and HTTP(S) and S3 URIs / open streams
+    are all able to be reopened
+  * Special files like pipes and sockets, or synthetic file-like objects such as
+    `BytesIO` are not currently able to be reopened
+* For HTTP(S) and S3 streams and URIs, the host must support the `Range` header.
+  Each reader will read a stream from a different Range offset in the source.
+
+The default is `num_readers=1`, which has no special requirements.
 
 ### `state_dict` Support
 
