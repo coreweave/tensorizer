@@ -2243,6 +2243,10 @@ class TensorDeserializer(
             HashMismatchError: If `verify_hash` resolves to True and
                 a deserialized tensor does not match its stored hash.
         """
+        if self._device.type != "cpu":
+            raise RuntimeError(
+                "read_numpy_arrays is only valid when deserializing to the CPU"
+            )
         copied_data = self._read_numpytensors(
             filter_func=filter_func,
             num_tensors=num_tensors,
@@ -3664,6 +3668,11 @@ class TensorSerializer:
         else:
             transferred = queue.Queue(maxsize=max_read_ahead)
 
+        biggest_tensor_bytes = max(t.element_size() * t.nelement() for t in tensors)
+        staging_tensor = torch.empty(
+            (biggest_tensor_bytes,), dtype=torch.uint8, device="cpu", pin_memory=True
+        )
+
         transfer_finished = False
 
         def _transfer():
@@ -3676,7 +3685,10 @@ class TensorSerializer:
                 for t in tensors:
                     if transfer_finished:
                         break
-                    transferred.put(t.cpu().detach(), timeout=_TIMEOUT)
+                    staging_tensor_view = staging_tensor.narrow(0, 0, t.nbytes).view(t.dtype).view(t.shape)
+                    staging_tensor_view.copy_(t)
+                    new_cpu_tensor = staging_tensor_view.clone()
+                    transferred.put(new_cpu_tensor.detach(), timeout=_TIMEOUT)
                 else:
                     # Sentinel
                     transferred.put(None)

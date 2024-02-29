@@ -41,10 +41,13 @@ if args.encryption:
 
 config = AutoConfig.from_pretrained(model_ref)
 
-# This ensures that the model is not initialized.
-with no_init_or_tensor():
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# This ensures that the pretrained model weights are not initialized,
+# and non-persistent buffers (generated at runtime) are on the correct device.
+with torch.device(device), no_init_or_tensor():
     model = AutoModelForCausalLM.from_config(config)
 
+print(f"Deserializing to {device}:")
 before_mem = get_mem_usage()
 
 
@@ -54,6 +57,7 @@ if tracer is not None:
 start = time.time()
 deserializer = TensorDeserializer(
     args.source,
+    device=device,
     plaid_mode=not args.no_plaid,
     lazy_load=args.lazy_load,
     encryption=decryption_params,
@@ -61,16 +65,16 @@ deserializer = TensorDeserializer(
     verify_hash=args.verify_hash
 )
 deserializer.load_into_module(model)
-end = time.time()
+end = time.perf_counter()
 if tracer is not None:
     tracer.stop()
     tracer.save()
+after_mem = get_mem_usage()
 
 # Brag about how fast we are.
 total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
 duration = end - start
 per_second = convert_bytes(deserializer.total_tensor_bytes / duration)
-after_mem = get_mem_usage()
 deserializer.close()
 print(f"Deserialized {total_bytes_str} in {end - start:0.2f}s, {per_second}/s")
 print(f"Memory usage before: {before_mem}")
@@ -82,7 +86,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_ref)
 eos = tokenizer.eos_token_id
 input_ids = tokenizer.encode(
     "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
-).to("cuda")
+).to(device)
 
 with torch.no_grad():
     output = model.generate(

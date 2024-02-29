@@ -1,4 +1,5 @@
-transformers~=4.34.0 # Needed to serialize Mistral-7B
+transformers~=4.37.2
 diffusers==0.14.0
 scipy~=1.10.0
 accelerate==0.20.3 # Needed to serialize Mistral-7B
+pillow>=10.2.0 # not directly required, pinned to avoid a vulnerability

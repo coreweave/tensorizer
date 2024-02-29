@@ -50,7 +50,7 @@ manifests in [examples/benchmark_buffer_size](examples/benchmark_buffer_size)
 comparing the various deserialization modes available in `tensorizer` release
 2.5.0—along with the raw network speed, and the speed of `torch.load()`.
 
-![A letter-value plot comparing 7 deserialization modes and their respective deserialization speeds with a granularity of 0.125 GiB/sec. For local files, "torch.load()" has a median speed between 1.875 and 2.000 GiB/sec; "tensorizer file" has a median of 2.250; "tensorizer file, plaid_mode" has a median of about 3.750; "tensorizer file, lazy_load" has a median between 1.750 and 1.875. The raw network speed is also listed on the chart with a median between 1.250 and 1.375. For HTTP streaming, "tensorizer http" has a median between 0.875 and 1.000; "tensorizer http, plaid_mode" has a median between 1.000 and 1.125; and "tensorizer http, lazy_load" has a median between 0.875 and 1.000.](https://github.com/coreweave/tensorizer/assets/24918963/2bc1ba95-e62e-4ef1-9b3e-324759fcd22d)
+![A letter-value plot comparing 7 deserialization modes and their respective deserialization speeds with a granularity of 0.125 GiB/sec. For local files, "torch.load()" has a median speed between 1.875 and 2.000 GiB/sec; "tensorizer file" has a median of 2.250; "tensorizer file, plaid_mode" has a median of about 4.625; "tensorizer file, lazy_load" has a median between 1.750 and 1.875. The raw network speed is also listed on the chart with a median between 1.250 and 1.375. For HTTP streaming, "tensorizer http" has a median between 0.875 and 1.000; "tensorizer http, plaid_mode" has a median between 1.000 and 1.125; and "tensorizer http, lazy_load" has a median between 0.875 and 1.000.](https://github.com/coreweave/tensorizer/assets/24918963/28786a79-0bfe-4f09-b7c9-f45766f6259c)
 
 ## Installation
 
@@ -158,23 +158,27 @@ s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 
 config = AutoConfig.from_pretrained(model_ref)
 
-# This ensures that the model is not initialized.
-with no_init_or_tensor():
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# This ensures that the pretrained model weights are not initialized,
+# and non-persistent buffers (generated at runtime) are on the correct device.
+with torch.device(device), no_init_or_tensor():
     model = AutoModelForCausalLM.from_config(config)
 
+print(f"Deserializing to {device}:")
 before_mem = get_mem_usage()
 
 # Lazy load the tensors from S3 into the model.
-start = time.time()
-deserializer = TensorDeserializer(s3_uri)
+start = time.perf_counter()
+deserializer = TensorDeserializer(s3_uri, device=device)
 deserializer.load_into_module(model)
-end = time.time()
+end = time.perf_counter()
+
+after_mem = get_mem_usage()
 
 # Brag about how fast we are.
 total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
 duration = end - start
 per_second = convert_bytes(deserializer.total_tensor_bytes / duration)
-after_mem = get_mem_usage()
 deserializer.close()
 print(f"Deserialized {total_bytes_str} in {end - start:0.2f}s, {per_second}/s")
 print(f"Memory usage before: {before_mem}")
@@ -186,7 +190,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_ref)
 eos = tokenizer.eos_token_id
 input_ids = tokenizer.encode(
     "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
-).to("cuda")
+).to(device)
 
 with torch.no_grad():
     output = model.generate(

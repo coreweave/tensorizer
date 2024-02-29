@@ -16,7 +16,7 @@ dependencies = [
     "protobuf>=3.19.5",
     "psutil>=5.9.4",
     "boto3>=1.26.0",
-    "redis>=5.0.0",
+    "redis>=4.5.5",
     "hiredis>=2.2.0",
     "libnacl>=2.1.0"
 ]
