@@ -53,9 +53,7 @@ try:
     model = empty_model(model_ref)
     deserialization_start = time.monotonic()
 
-    deserializer = TensorDeserializer(
-        path, encryption=decryption_params, plaid_mode=True
-    )
+    deserializer = TensorDeserializer(path, encryption=decryption_params)
     deserializer.load_into_module(model)
     deserializer.close()
 
