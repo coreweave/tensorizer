@@ -23,7 +23,7 @@ import redis
 import tensorizer._version as _version
 import tensorizer._wide_pipes as _wide_pipes
 
-__all__ = ["open_stream", "CURLStreamFile", "RedisStreamFile"]
+__all__ = ["open_stream", "CURLStreamFile", "RedisStreamFile", "CAInfo"]
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,76 @@ def _get_s3cfg_values(
     )
 
 
-class CURLStreamFile:
+class CAInfo:
+    """
+    Configuration class for cURL's SSL certificate verification behaviour.
+
+    See Also:
+        https://curl.se/docs/sslcerts.html
+    """
+
+    __slots__ = ("_curl_flags",)
+
+    def __init__(
+        self,
+        *,
+        cacert: Optional[str] = None,
+        capath: Optional[str] = None,
+        allow_untrusted: bool = False,
+    ):
+        """
+        Creates a configuration defining custom paths to use for SSL certificate
+        verification, or disables SSL certificate verification.
+
+        Exactly one of `cacert`, `capath`, or `allow_untrusted` must be
+        specified.
+        Use None instead of an instance of this class for cURL's default
+        certificate verification behaviour.
+
+        Args:
+            cacert: Path to a PEM file to use for certificates.
+                Corresponds to ``--cacert`` or ``CURLOPT_CAINFO`` in cURL.
+            capath: Path to a directory to scan for certificates.
+                Corresponds to ``--capath`` or ``CURLOPT_CAPATH`` in cURL.
+            allow_untrusted: Skip verification of SSL certificates entirely.
+                Corresponds to ``-k``/``--insecure``
+                or setting ``CURLOPT_SSL_VERIFYPEER`` to ``FALSE`` in cURL.
+        """
+        if (cacert, capath).count(None) + (not allow_untrusted) != 2:
+            raise ValueError(
+                "Exactly one of cacert, capath, or allow_untrusted=True"
+                " must be specified. For default certificate verification"
+                " behaviour, use certificate_handling=None instead of"
+                " an explicit CAInfo instance"
+            )
+        if cacert is not None:
+            if not os.path.isfile(cacert):
+                raise ValueError(
+                    "Invalid cacert file path, see"
+                    " https://curl.se/docs/manpage.html#--cacert"
+                )
+            self._curl_flags = ("--cacert", str(cacert))
+        elif capath is not None:
+            if not os.path.isdir(capath):
+                raise ValueError(
+                    "Invalid capath directory path, see"
+                    " https://curl.se/docs/manpage.html#--capath"
+                )
+            self._curl_flags = ("--capath", str(capath))
+        elif allow_untrusted:
+            self._curl_flags = ("--insecure",)
+        else:
+            raise RuntimeError()
+
+    @property
+    def curl_flags(self):
+        return self._curl_flags
+
+    def __hash__(self):
+        return hash(self._curl_flags)
+
+
+class CURLStreamFile(io.RawIOBase):
     """
     CURLStreamFile implements a file-like object around an HTTP download, the
     intention being to not buffer more than we have to. It is intended for
@@ -147,6 +216,7 @@ class CURLStreamFile:
         headers: Dict[str, Any] = None,
         *,
         buffer_size: Optional[int] = None,
+        certificate_handling: Optional[CAInfo] = None,
     ) -> None:
         if buffer_size is None:
             buffer_size = 16 << 20  # 16mb
@@ -159,8 +229,23 @@ class CURLStreamFile:
                 " and could not be found."
             )
 
+        self._optional_curl_flags = []
+        if certificate_handling is not None:
+            if isinstance(certificate_handling, CAInfo):
+                self._optional_curl_flags.extend(
+                    certificate_handling.curl_flags
+                )
+            else:
+                raise TypeError(
+                    "certificate_handling must either be None"
+                    " (for cURL's default SSL certificate verification),"
+                    " or a CAInfo object,"
+                    f" not {certificate_handling.__class__.__name__}"
+                )
+
         cmd = [
             curl_path,
+            *self._optional_curl_flags,
             "--header",
             "Accept-Encoding: identity",
             "--include",
@@ -202,15 +287,27 @@ class CURLStreamFile:
         self.http_response_latencies.append(resp_begin - popen_end)
 
         if not resp.startswith((b"HTTP/1.1 2", b"HTTP/2 2")):
+            # If the error was caused by an invalid response, display that
+            explanation = f": {resp.decode('utf-8')}" if resp.strip() else ""
+            if not explanation:
+                # Otherwise, check if cURL gave a meaningful exit code
+                return_code: Optional[int] = self._curl.poll()
+                if isinstance(return_code, int) and return_code != 0:
+                    explanation = (
+                        f": cURL exit code {return_code:d};"
+                        f" see https://curl.se/docs/manpage.html#{return_code}"
+                    )
+
             self.close()
-            raise IOError(f"Failed to open stream: {resp.decode('utf-8')}")
+            raise IOError("Failed to open stream" + explanation)
+
         # Read the rest of the header response and parse it.
         # noinspection PyTypeChecker
         self.response_headers = http.client.parse_headers(self._curl.stdout)
 
         self._curr = 0 if begin is None else begin
         self._end = end
-        self.closed = False
+        self._closed = False
 
     def _init_vars(self):
         self.popen_latencies: List[float] = getattr(self, "popen_latencies", [])
@@ -267,6 +364,7 @@ class CURLStreamFile:
         """
         args = [
             curl_path,
+            *self._optional_curl_flags,
             "-I",  # Only read headers
             "-XGET",  # Use a GET request (in case HEAD is not supported)
             "-A",  # Set a custom user agent
@@ -346,7 +444,7 @@ class CURLStreamFile:
                     ret_buff = ba
             self.bytes_read += ret_buff_sz
             if ret_buff_sz != rq_sz:
-                self.closed = True
+                self._closed = True
                 self._curl.terminate()
                 raise IOError(f"Requested {rq_sz} != {ret_buff_sz}")
             self._curr += ret_buff_sz
@@ -366,23 +464,27 @@ class CURLStreamFile:
         return self._read_until(goal_position, ba)
 
     def read(self, size=None) -> bytes:
-        if self.closed:
+        if self._closed:
             raise IOError("CURLStreamFile closed.")
         if size is None:
             return self._curl.stdout.read()
         goal_position = self._curr + size
         return self._read_until(goal_position)
 
-    @staticmethod
-    def writable() -> bool:
+    def writable(self) -> bool:
         return False
 
-    @staticmethod
-    def fileno() -> int:
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
         return -1
 
     def close(self):
-        self.closed = True
+        self._closed = True
         if self._curl is not None:
             if self._curl.poll() is None:
                 self._curl.stdout.close()
@@ -394,8 +496,12 @@ class CURLStreamFile:
                 self._curl.stdout.close()
             self._curl = None
 
-    def readline(self):
-        raise NotImplementedError("Unimplemented")
+    @property
+    def closed(self):
+        return self._closed
+
+    def readline(self, size=-1) -> bytes:
+        raise io.UnsupportedOperation("readline")
 
     """
     This seek() implementation should be avoided if you're seeking backwards,
@@ -441,7 +547,7 @@ def _parse_redis_uri(uri):
 if sys.platform == "darwin":
     _MAX_TCP_BUFFER_SIZE = 1 << 20  # 1 MiB if OSX
 else:
-    _MAX_TCP_BUFFER_SIZE = 8 << 20  # 8 MiB
+    _MAX_TCP_BUFFER_SIZE = 16 << 20  # 16 MiB
 
 
 class RedisStreamFile:
@@ -702,7 +808,7 @@ class RedisStreamFile:
             self._redis_tcp = None
 
     def readline(self):
-        raise NotImplementedError("Unimplemented")
+        raise io.UnsupportedOperation("readline")
 
 
 def _ensure_https_endpoint(endpoint: str):
@@ -720,7 +826,8 @@ def _new_s3_client(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str,
-    signature_version: str = None,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
 ):
     if s3_secret_access_key is None:
         raise TypeError("No secret key provided")
@@ -732,6 +839,9 @@ def _new_s3_client(
     config_args = dict(user_agent=_BOTO_USER_AGENT)
     auth_args = {}
 
+    if s3_region_name is not None:
+        config_args["region_name"] = s3_region_name
+
     if s3_access_key_id == s3_secret_access_key == "":
         config_args["signature_version"] = botocore.UNSIGNED
     else:
@@ -739,8 +849,8 @@ def _new_s3_client(
             aws_access_key_id=s3_access_key_id,
             aws_secret_access_key=s3_secret_access_key,
         )
-        if signature_version is not None:
-            config_args["signature_version"] = signature_version
+        if s3_signature_version is not None:
+            config_args["signature_version"] = s3_signature_version
 
     config = boto3.session.Config(**config_args)
 
@@ -770,9 +880,17 @@ def s3_upload(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_write_endpoint,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
 ):
     bucket, key = _parse_s3_uri(target_uri)
-    client = _new_s3_client(s3_access_key_id, s3_secret_access_key, s3_endpoint)
+    client = _new_s3_client(
+        s3_access_key_id,
+        s3_secret_access_key,
+        s3_endpoint,
+        s3_region_name=s3_region_name,
+        s3_signature_version=s3_signature_version,
+    )
     client.upload_file(path, bucket, key)
 
 
@@ -781,6 +899,8 @@ def _s3_download_url(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
 ) -> str:
     bucket, key = _parse_s3_uri(path_uri)
     # v2 signature is important to easily align the presigned URL expiry
@@ -793,14 +913,17 @@ def _s3_download_url(
     # boto3 does not permit easy modification of x-amz-date.
     # See upstream bug https://github.com/boto/botocore/issues/2230
     #
+    if not s3_signature_version:
+        s3_signature_version = "s3"
     client = _new_s3_client(
         s3_access_key_id,
         s3_secret_access_key,
         s3_endpoint,
-        signature_version="s3",
+        s3_region_name=s3_region_name,
+        s3_signature_version=s3_signature_version,
     )
 
-    # Explaination with SIG_GRANULARITY=1h
+    # Explanation with SIG_GRANULARITY=1h
     # compute an expiry that is aligned to the hour, at least 1 hour
     # away from present time
     # time=00:00:00 -> expiry=02:00:00
@@ -834,18 +957,27 @@ def s3_download(
     s3_access_key_id: str,
     s3_secret_access_key: str,
     s3_endpoint: str = default_s3_read_endpoint,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
+    certificate_handling: Optional[CAInfo] = None,
 ) -> CURLStreamFile:
     url = _s3_download_url(
         path_uri=path_uri,
         s3_access_key_id=s3_access_key_id,
         s3_secret_access_key=s3_secret_access_key,
         s3_endpoint=s3_endpoint,
+        s3_region_name=s3_region_name,
+        s3_signature_version=s3_signature_version,
     )
     if force_http and url.lower().startswith("https://"):
         url = "http://" + url[8:]
-    return CURLStreamFile(url, buffer_size=buffer_size)
+    return CURLStreamFile(
+        url,
+        buffer_size=buffer_size,
+        certificate_handling=certificate_handling,
+    )
 
 
 def _infer_credentials(
@@ -942,9 +1074,9 @@ def _infer_credentials(
 def _temp_file_closer(file: io.IOBase, file_name: str, *upload_args):
     """
     Close, upload by name, and then delete the file.
-    Meant to replace .close() on a particular instance
-    of a temporary file-like wrapper object, as an unbound
-    callback to a weakref.finalize() registration on the wrapper.
+    Meant to be placed as a hook before both .close() and .__exit__()
+    on a particular instance of a temporary file-like wrapper object,
+    as a callback to a weakref.finalize() registration on the wrapper.
 
     The reason this implementation is necessary is really complicated.
 
@@ -966,17 +1098,6 @@ def _temp_file_closer(file: io.IOBase, file_name: str, *upload_args):
     so they have to buffer it all in memory.
     """
 
-    if file.closed:
-        # Makes closure idempotent.
-
-        # If the file object is used as a context
-        # manager, close() is called twice (once in the
-        # serializer code, once after, when leaving the
-        # context).
-
-        # Without this check, this would trigger two
-        # separate uploads.
-        return
     try:
         file.close()
         s3_upload(file_name, *upload_args)
@@ -996,6 +1117,10 @@ def open_stream(
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
     force_http: bool = False,
+    *,
+    s3_region_name: Optional[str] = None,
+    s3_signature_version: Optional[str] = None,
+    certificate_handling: Optional[CAInfo] = None,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
     Open a file path, http(s):// URL, or s3:// URI.
@@ -1037,6 +1162,18 @@ def open_stream(
         force_http: If True, force the use of HTTP instead of HTTPS for
             S3 downloads. This will double the throughput, but at the cost
             of security.
+        s3_region_name: S3 region name, corresponding to
+            "region_name" in boto3 config.
+            The object storage region used in instantiating the client.
+        s3_signature_version: S3 signature version, corresponding
+            to "signature_version" in boto3 config.
+            The signature version used when signing requests.
+        certificate_handling: Customize handling of SSL CA certificates for
+            HTTPS and S3 downloads.
+            Pass None to use default certificate verification, or an instance of
+            `tensorizer.stream_io.CAInfo` to use a different CA bundle
+            or to disable certificate verification entirely.
+            This option is useful when working with self-signed certificates.
 
     Returns:
         An opened file-like object representing the target resource.
@@ -1076,6 +1213,15 @@ def open_stream(
                 "https://raw.githubusercontent.com/EleutherAI/gpt-neo/master/README.md"
             ) as stream:
                 print(stream.read(128))
+
+        Opening an https:// URI for reading,
+        while skipping SSL certificate verification::
+
+            with open_stream(
+                "https://127.0.0.1/my-model.tensors",
+                certificate_handling=CAInfo(allow_untrusted=True),
+            ) as stream:
+                print(stream.read(128))
     """
     if isinstance(path_uri, os.PathLike):
         path_uri = os.fspath(path_uri)
@@ -1090,7 +1236,11 @@ def open_stream(
             raise ValueError(
                 'Only the mode "rb" is valid when opening http(s):// streams.'
             )
-        return CURLStreamFile(path_uri, buffer_size=buffer_size)
+        return CURLStreamFile(
+            path_uri,
+            buffer_size=buffer_size,
+            certificate_handling=certificate_handling,
+        )
     elif scheme == "redis":
         if normalized_mode != "br":
             raise ValueError(
@@ -1149,6 +1299,9 @@ def open_stream(
             # with primitive temporary file support (e.g. Windows)
             temp_file = tempfile.NamedTemporaryFile(mode="wb+", delete=False)
 
+            # Attach a callback to upload the temporary file when it closes.
+            # weakref finalizers are idempotent, so this upload callback
+            # is guaranteed to run at most once.
             guaranteed_closer = weakref.finalize(
                 temp_file,
                 _temp_file_closer,
@@ -1158,8 +1311,38 @@ def open_stream(
                 s3_access_key_id,
                 s3_secret_access_key,
                 s3_endpoint,
+                s3_region_name,
+                s3_signature_version,
             )
-            temp_file.close = guaranteed_closer
+
+            # Always run the close + upload procedure
+            # before any code from Python's NamedTemporaryFile wrapper.
+            # It isn't safe to call a bound method from a weakref finalizer,
+            # but calling a weakref finalizer alongside a bound method
+            # creates no problems, other than that the code outside the
+            # finalizer is not guaranteed to be run at any point.
+            # In this case, the weakref finalizer performs all necessary
+            # cleanup itself, but the original NamedTemporaryFile methods
+            # are invoked as well, just in case.
+            wrapped_close = temp_file.close
+
+            def close_wrapper():
+                guaranteed_closer()
+                return wrapped_close()
+
+            # Python 3.12+ doesn't call NamedTemporaryFile.close() during
+            # .__exit__(), so it must be wrapped separately.
+            # Since guaranteed_closer is idempotent, it's fine to call it in
+            # both methods, even if both are called back-to-back.
+            wrapped_exit = temp_file.__exit__
+
+            def exit_wrapper(exc, value, tb):
+                guaranteed_closer()
+                return wrapped_exit(exc, value, tb)
+
+            temp_file.close = close_wrapper
+            temp_file.__exit__ = exit_wrapper
+
             return temp_file
         else:
             s3_endpoint = s3_endpoint or default_s3_read_endpoint
@@ -1168,8 +1351,11 @@ def open_stream(
                 s3_access_key_id,
                 s3_secret_access_key,
                 s3_endpoint,
+                s3_region_name=s3_region_name,
+                s3_signature_version=s3_signature_version,
                 buffer_size=buffer_size,
                 force_http=force_http,
+                certificate_handling=certificate_handling,
             )
             if error_context:
                 curl_stream_file.register_error_context(error_context)
@@ -1181,7 +1367,11 @@ def open_stream(
                 'Only binary modes ("rb", "wb", "wb+", etc.)'
                 " are valid when opening local file streams."
             )
-        os.makedirs(os.path.dirname(path_uri), exist_ok=True)
-        handle: typing.BinaryIO = open(path_uri, mode)
+        dirname = os.path.dirname(path_uri)
+        if dirname:
+            os.makedirs(os.path.dirname(path_uri), exist_ok=True)
+        if buffer_size is None:
+            buffer_size = io.DEFAULT_BUFFER_SIZE
+        handle: typing.BinaryIO = open(path_uri, mode, buffering=buffer_size)
         handle.seek(0)
         return handle

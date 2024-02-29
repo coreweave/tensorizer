@@ -41,6 +41,17 @@ for model deployment due to the lack of distributed caching. It is intended
 for sharing state between inference pods, or for loading data on a per-request
 basis from a Redis cache.
 
+## Speed
+
+`tensorizer`'s deserialization speed is primarily network-bound.
+
+The following graph presents data collected from the scripts and Kubernetes
+manifests in [examples/benchmark_buffer_size](examples/benchmark_buffer_size)
+comparing the various deserialization modes available in `tensorizer` release
+2.5.0—along with the raw network speed, and the speed of `torch.load()`.
+
+![A letter-value plot comparing 7 deserialization modes and their respective deserialization speeds with a granularity of 0.125 GiB/sec. For local files, "torch.load()" has a median speed between 1.875 and 2.000 GiB/sec; "tensorizer file" has a median of 2.250; "tensorizer file, plaid_mode" has a median of about 4.625; "tensorizer file, lazy_load" has a median between 1.750 and 1.875. The raw network speed is also listed on the chart with a median between 1.250 and 1.375. For HTTP streaming, "tensorizer http" has a median between 0.875 and 1.000; "tensorizer http, plaid_mode" has a median between 1.000 and 1.125; and "tensorizer http, lazy_load" has a median between 0.875 and 1.000.](https://github.com/coreweave/tensorizer/assets/24918963/28786a79-0bfe-4f09-b7c9-f45766f6259c)
+
 ## Installation
 
 ### From PyPI
@@ -147,23 +158,27 @@ s3_uri = f"s3://{s3_bucket}/{model_name}.tensors"
 
 config = AutoConfig.from_pretrained(model_ref)
 
-# This ensures that the model is not initialized.
-with no_init_or_tensor():
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# This ensures that the pretrained model weights are not initialized,
+# and non-persistent buffers (generated at runtime) are on the correct device.
+with torch.device(device), no_init_or_tensor():
     model = AutoModelForCausalLM.from_config(config)
 
+print(f"Deserializing to {device}:")
 before_mem = get_mem_usage()
 
 # Lazy load the tensors from S3 into the model.
-start = time.time()
-deserializer = TensorDeserializer(s3_uri, plaid_mode=True)
+start = time.perf_counter()
+deserializer = TensorDeserializer(s3_uri, device=device)
 deserializer.load_into_module(model)
-end = time.time()
+end = time.perf_counter()
+
+after_mem = get_mem_usage()
 
 # Brag about how fast we are.
 total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
 duration = end - start
 per_second = convert_bytes(deserializer.total_tensor_bytes / duration)
-after_mem = get_mem_usage()
 deserializer.close()
 print(f"Deserialized {total_bytes_str} in {end - start:0.2f}s, {per_second}/s")
 print(f"Memory usage before: {before_mem}")
@@ -175,7 +190,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_ref)
 eos = tokenizer.eos_token_id
 input_ids = tokenizer.encode(
     "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
-).to("cuda")
+).to(device)
 
 with torch.no_grad():
     output = model.generate(
@@ -200,6 +215,71 @@ where `df_main()` serializes models from
 [HuggingFace Diffusers](https://github.com/huggingface/diffusers)
 and `hf_main()` serializes
 [HuggingFace Transformers](https://github.com/huggingface/transformers) models.
+
+## Tensor Weight Encryption
+
+`tensorizer` supports fast tensor weight encryption and decryption during
+serialization and deserialization, respectively.
+
+Be aware that metadata (tensor names, dtypes, shapes, etc.) are not encrypted,
+only the weights themselves.
+
+> [!NOTE]
+> 
+> Refer to [docs/encryption.md](/docs/encryption.md) for details, instructions,
+> and warnings on using `tensorizer` encryption correctly and safely.
+
+To use `tensorizer` encryption, a recent version of `libsodium` must be
+installed. Install `libsodium` with `apt-get install libsodium23`
+on Ubuntu or Debian, or follow
+[the instructions in `libsodium`'s documentation](https://doc.libsodium.org/installation)
+for other platforms.
+
+### Quick Encryption Example
+
+The following outline demonstrates how to encrypt and decrypt a tensorized model
+with a randomly-generated encryption key:
+
+```py
+from tensorizer import (
+    EncryptionParams, DecryptionParams, TensorDeserializer, TensorSerializer
+)
+
+# Serialize and encrypt a model:
+
+encryption_params = EncryptionParams.random()
+
+serializer = TensorSerializer("model.tensors", encryption=encryption_params)
+serializer.write_module(...)  # or write_state_dict(), etc.
+serializer.close()
+
+# Save the randomly-generated encryption key somewhere
+with open("tensor.key", "wb") as key_file:
+    key_file.write(encryption_params.key)
+
+
+# Then decrypt it again:
+
+# Load the randomly-generated key from where it was saved
+with open("tensor.key", "rb") as key_file:
+    key: bytes = key_file.read()
+ 
+decryption_params = DecryptionParams.from_key(key)
+
+deserializer = TensorDeserializer("model.tensors", encryption=decryption_params)
+deserializer.load_into_module(...)
+deserializer.close()
+```
+
+For more detail, refer to [docs/encryption.md](/docs/encryption.md).
+A complete example is also available as
+[examples/encryption.py](examples/encryption.py).
+The `EncryptionParams` and `DecryptionParams` class docstrings additionally
+contain some usage information for quick reference from an IDE.
+
+An example command line tool to add or remove encryption from existing
+serialized models is also available as
+[examples/encryption.py](examples/encrypt_existing.py).
 
 ## Benchmarks
 
@@ -366,17 +446,18 @@ of a model if you use the `accel-object.ord1.coreweave.com` endpoint.
 just a serialization/deserialization tool.
 
 ### Plaid Mode
-`tensorizer` has a `plaid_mode` argument that can be passed to the
-`TensorDeserializer` class. When `plaid_mode` is `True`, `tensorizer`
-will load the tensors extremely fast. This is done by loading the tensors
-into a `torch.nn.Module` that is not initialized, by overriding the
-`__init__` method of the `torch.nn.Module` to do nothing.
 
-The tensors are them loaded into a buffer, and the buffer is zero-copied
-into the uninitialized `torch.nn.Module`. This is unsafe, and should only
-be used in inference cases where the model is not being trained.
+`tensorizer` has a `plaid_mode` argument that can be passed to the
+`TensorDeserializer` class when deserializing tensors to the GPU.
+When `plaid_mode` is `True`, `tensorizer` will load tensors extremely fast
+by reusing a single small CPU buffer as a staging area to load tensors before
+transferring them to the GPU through DMA.
+This can also greatly decrease CPU RAM usage during deserialization.
+
+`plaid_mode` is enabled by default when available.
 
 ### `state_dict` Support
+
 The `TensorDeserializer` object can be used as-is as a `state_dict` for
 `torch.nn.Module.load_state_dict`. This is useful for loading the tensors
 into a `torch.nn.Module` that is already initialized, or for inspection.
