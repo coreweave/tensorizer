@@ -64,10 +64,10 @@ _logger = logging.getLogger(__name__)
 __all__ = ["get_max_pipe_size", "widen_pipe", "widen_new_pipes"]
 
 # No-op default implementations
-widen_new_pipes = contextlib.ExitStack
+widen_new_pipes = contextlib.nullcontext
 
 
-def widen_pipe(_fileno):
+def widen_pipe(_fileno, _max_size=None):
     pass
 
 
@@ -95,8 +95,10 @@ if sys.platform != "win32" and sys.platform != "darwin":
     # Linux uses fcntl to resize an existing pipe.
     import fcntl
 
-    def widen_pipe(fileno):
+    def widen_pipe(fileno, max_size=None):
         pipe_buf_sz = get_max_pipe_size()
+        if max_size is not None and max_size < pipe_buf_sz:
+            pipe_buf_sz = max_size
         try:
             fcntl.fcntl(fileno, F_SETPIPE_SZ, pipe_buf_sz)
         except OSError as e:
@@ -136,7 +138,7 @@ elif sys.platform == "win32":
             )
 
         @contextlib.contextmanager
-        def widen_new_pipes():
+        def widen_new_pipes(max_size=None):
             global _pipe_widening_threads
             # Thread-safe but not re-entrant.
             # Thread safety in this function only matters if multiple threads
@@ -145,6 +147,8 @@ elif sys.platform == "win32":
             # opened in the same process at the same time. It is less important
             # than _create_wide_pipe being thread-safe.
             _local.pipe_size = get_max_pipe_size()
+            if max_size is not None and max_size < _local.pipe_size:
+                _local.pipe_size = max_size
             with _pipe_routine_swap_mutex:
                 _winapi.CreatePipe = _create_wide_pipe
                 _pipe_widening_threads += 1
