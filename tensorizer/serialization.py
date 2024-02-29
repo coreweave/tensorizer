@@ -2397,9 +2397,9 @@ class TensorDeserializer(
             del tensor_sizes, reader_slices
         effective_num_readers = len(tensors_per_reader)
 
-        transfer_out_queue: queue.SimpleQueue[
-            Union[Exception, TensorDeserializer._CopiedData]
-        ] = queue.SimpleQueue()
+        copy_result = Union[Exception, TensorDeserializer._CopiedData]
+        transfer_out_queue: "queue.SimpleQueue[copy_result]"
+        transfer_out_queue = queue.SimpleQueue()
 
         futures: List[concurrent.futures.Future] = []
         barrier = threading.Barrier(effective_num_readers)
@@ -2419,7 +2419,7 @@ class TensorDeserializer(
 
         try:
             for _ in range(len(keys)):
-                copied_data = transfer_out_queue.get(timeout=3600)
+                copied_data: copy_result = transfer_out_queue.get(timeout=3600)
                 if isinstance(copied_data, Exception):
                     raise copied_data
                 yield copied_data
@@ -2429,13 +2429,13 @@ class TensorDeserializer(
             raise
 
     def _copy_thread(
-            unsafe_self,
-            thread_idx: int,
-            halt: AtomicUint,
-            barrier: threading.Barrier,
-            verify_hash: bool,
-            tensor_items: Sequence[TensorEntry],
-            transfer_out_queue: queue.SimpleQueue[Union[Exception, _CopiedData]]
+        unsafe_self,
+        thread_idx: int,
+        halt: AtomicUint,
+        barrier: threading.Barrier,
+        verify_hash: bool,
+        tensor_items: Sequence[TensorEntry],
+        transfer_out_queue: "queue.SimpleQueue[Union[Exception, _CopiedData]]"
     ):
         # Need to get rid of self or more safely have thread-local storage
 
