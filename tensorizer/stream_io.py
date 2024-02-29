@@ -594,6 +594,7 @@ class CURLStreamFile(io.BufferedIOBase):
             end=end,
             headers=self._headers,
             buffer_size=self._buffer_size,
+            certificate_handling=self._certificate_handling,
         )
         clone._error_context.extend(self._error_context)
         return clone
