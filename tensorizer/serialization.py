@@ -1524,6 +1524,7 @@ class TensorDeserializer(
             self._cleanup.callback(self._file.close)
             self.total_compressed_tensor_bytes = 0
             self.read_bytes = 0
+            self._ephemeral_bytes_read = AtomicUint(width=8)
             self._last_yielded_key: Optional[str] = None
 
             # If device is None, use the current device, otherwise use the given
@@ -1610,6 +1611,7 @@ class TensorDeserializer(
             # Read the metadata index of tensors.
             # This is a list of offsets into the file where the per-tensor data
             # is stored.
+            self._metadata: Dict[str, TensorEntry]
             self._metadata, self._metadata_raw = _MetadataDeserializer.from_io(
                 self._file, self._file_header.tensor_count
             )
@@ -1618,7 +1620,7 @@ class TensorDeserializer(
             # filter_func is a test that determines the tensor names to read.
             # If filter_func is None, all tensors are read.
             if filter_func is not None:
-                self._metadata = {
+                self._metadata: Dict[str, TensorEntry] = {
                     name: entry
                     for name, entry in self._metadata.items()
                     if filter_func(name)
@@ -1811,11 +1813,14 @@ class TensorDeserializer(
     @property
     def total_bytes_read(self) -> int:
         if hasattr(self._file, "bytes_read"):
-            return self._file.bytes_read
+            return self._file.bytes_read + self._ephemeral_bytes_read.load()
         if self._file.closed:
             # Caution: This case is an underestimate because it doesn't include
-            # any metadata read, unlike the other two cases.
+            # any metadata read, unlike the other cases.
             return self.total_tensor_bytes
+        elif self._num_readers > 1 and self._last_yielded_key is not None:
+            last_yielded = self._metadata[self._last_yielded_key]
+            return last_yielded.data_offset + last_yielded.data_length
         else:
             return self._file.tell()
 
@@ -2629,7 +2634,10 @@ class TensorDeserializer(
             transfer_out_queue.put(e)
         finally:
             if file_ is not None and file_ is not unsafe_self._file:
+                bytes_read = getattr(file_, "bytes_read", 0)
                 file_.close()
+                if bytes_read:
+                    unsafe_self._ephemeral_bytes_read.add(bytes_read)
 
     def load_into_module(
         self,
