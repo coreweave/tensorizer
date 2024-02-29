@@ -66,6 +66,25 @@ else:
 
 lz4 = None
 
+libpthread = ctypes.CDLL(ctypes.util.find_library("pthread"))
+pthread_setname_np = libpthread.pthread_setname_np
+pthread_setname_np.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+pthread_setname_np.restype = ctypes.c_int
+
+import _thread
+
+orig_start = threading.Thread.start
+def new_thread_start(self):
+    orig_start(self)
+    name = self.name
+    if name.startswith('Thread-'):
+        name = name[len('Thread-'):]
+    name = name[-15:].encode()
+    ident = self.ident
+    pthread_setname_np(ident, name)
+
+threading.Thread.start = new_thread_start
+
 __all__ = [
     "TensorSerializer",
     "TensorDeserializer",
@@ -3096,6 +3115,10 @@ class TensorSerializer:
             self._pwrite = self._pwrite_syscall
             self._write_lock = None
             concurrent_writes_possible = True
+        elif isinstance(self._file, mmap.mmap):
+            print('mmap pwrite')
+            self._pwrite = self._mmap_pwrite
+            concurrent_writes_possible = True
         else:
             # The fallback implementation requires a lock, as a single
             # file offset must be shared between threads.
@@ -3219,6 +3242,24 @@ class TensorSerializer:
         self._metadata_cur = self._metadata_loc
         self._metadata_end = self._metadata_loc + metadata_size
 
+    def _mmap_pwrite(
+        self, data, offset: int, verify: Union[bool, int] = True
+    ) -> int:
+        if type(data) is bytes:
+            len_src = len(data)
+            src = ctypes.cast(data, ctypes.c_void_p)
+        else:
+            # bytearray or memoryview
+            if type(data) is memoryview:
+                len_src = data.nbytes
+            else:
+                len_src = len(data)
+            src = ctypes.addressof((ctypes.c_char * len_src).from_buffer(data))
+
+        dst = ctypes.addressof((ctypes.c_char * len(self._file)).from_buffer(self._file))
+        _syscalls.memcpy(dst, src, len_src)
+        return len_src
+
     @property
     def total_tensor_bytes(self):
         return self._file_header.tensor_size
@@ -3318,6 +3359,12 @@ class TensorSerializer:
         # all data in a single call to `.write()`.
         if expected_bytes_written is None:
             expected_bytes_written = self._buffer_size(data)
+
+        # HACK
+        res = self._mmap_pwrite(data, self._file.tell(), False)
+        self._file.seek(res, io.SEEK_CUR)
+        return res
+
         bytes_written: int = 0
         bytes_just_written: int = self._file.write(data)
         bytes_written += bytes_just_written
@@ -3852,7 +3899,7 @@ class TensorSerializer:
                     if transfer_finished:
                         break
                     staging_tensor_view = staging_tensor.narrow(0, 0, t.nbytes).view(t.dtype).view(t.shape)
-                    staging_tensor_view.copy_(t)
+                    staging_tensor_view.copy_(t, non_blocking=True)
                     new_cpu_tensor = staging_tensor_view.clone()
                     transferred.put(new_cpu_tensor.detach(), timeout=_TIMEOUT)
                 else:
