@@ -3256,7 +3256,7 @@ class TensorSerializer:
                 len_src = len(data)
             src = ctypes.addressof((ctypes.c_char * len_src).from_buffer(data))
 
-        dst = ctypes.addressof((ctypes.c_char * len(self._file)).from_buffer(self._file))
+        dst = ctypes.addressof((ctypes.c_char * len(self._file)).from_buffer(self._file)) + offset
         _syscalls.memcpy(dst, src, len_src)
         return len_src
 
