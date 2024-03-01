@@ -3670,29 +3670,35 @@ class TensorSerializer:
         )
         return tensor_endpos
 
+    class _WriteSpec(typing.NamedTuple):
+        idx: int
+        name: str
+        tensor_type: TensorType
+        tensor: torch.Tensor
+        callback: Optional[Callable]
+        temporary_buffer: bool
+
     @staticmethod
     def _async_bulk_device_to_host_transfer(
-        tensors, max_read_ahead: Optional[int] = 32
-    ) -> Tuple[Iterator[torch.Tensor], Callable]:
+        write_specs: List[_WriteSpec], max_read_ahead: Optional[int] = 32
+    ) -> Tuple[Iterator[_WriteSpec], Callable]:
         """
         Transfers CUDA tensors to host memory asynchronously in bulk.
 
         Args:
-            tensors: The list of tensors to transfer.
+            write_specs: The list of tensors to transfer.
             max_read_ahead: The maximum number of tensors to queue.
 
         Returns:
             A tuple containing an iterator over CPU tensors,
             and a callback to cancel the transfer early.
         """
-        if len(tensors) < max_read_ahead:
+        if len(write_specs) < max_read_ahead:
             transferred = queue.SimpleQueue()
         else:
             transferred = queue.Queue(maxsize=max_read_ahead)
 
-        biggest_tensor_bytes = max(
-            t.element_size() * t.nelement() for t in tensors
-        )
+        biggest_tensor_bytes = max(w.tensor.nbytes for w in write_specs)
         staging_tensor = torch.empty(
             (biggest_tensor_bytes,),
             dtype=torch.uint8,
@@ -3709,7 +3715,8 @@ class TensorSerializer:
                 # This is in a separate CUDA stream because it shouldn't
                 # affect any other GPU operations, even though each
                 # of these transfers are synchronous
-                for t in tensors:
+                for w in write_specs:
+                    t = w.tensor
                     if transfer_finished:
                         break
                     staging_tensor_view = (
@@ -3717,9 +3724,17 @@ class TensorSerializer:
                         .view(t.dtype)
                         .view(t.shape)
                     )
-                    staging_tensor_view.copy_(t)
-                    new_cpu_tensor = staging_tensor_view.clone()
-                    transferred.put(new_cpu_tensor.detach(), timeout=_TIMEOUT)
+                    staging_tensor_view.copy_(t, non_blocking=True)
+                    new_cpu_tensor = staging_tensor_view.clone().detach()
+                    new_write_spec = TensorSerializer._WriteSpec(
+                        w.idx,
+                        w.name,
+                        w.tensor_type,
+                        new_cpu_tensor,
+                        w.callback,
+                        True,
+                    )
+                    transferred.put(new_write_spec, timeout=_TIMEOUT)
                 else:
                     # Sentinel
                     transferred.put(None)
@@ -3748,90 +3763,127 @@ class TensorSerializer:
             _interrupt_transfer,
         )
 
-    class _WriteSpec(typing.NamedTuple):
-        idx: int
-        name: str
-        tensor_type: TensorType
-        tensor: torch.Tensor
-        callback: Optional[Callable]
+    @staticmethod
+    def _make_contiguous(tensor: _WriteSpec) -> _WriteSpec:
+        return TensorSerializer._WriteSpec(
+            tensor.idx,
+            tensor.name,
+            tensor.tensor_type,
+            tensor.tensor.contiguous(),
+            tensor.callback,
+            True,
+        )
 
-    def _bulk_write(self, tensors: Iterable[_WriteSpec]):
-        tensors = collections.deque(tensors)
+    @staticmethod
+    def _clone_detach(tensor: _WriteSpec) -> _WriteSpec:
+        return TensorSerializer._WriteSpec(
+            tensor.idx,
+            tensor.name,
+            tensor.tensor_type,
+            tensor.tensor.clone().detach(),
+            tensor.callback,
+            True,
+        )
+
+    def _prepare_tensors_for_write(
+        self, write_specs: Iterable[_WriteSpec]
+    ) -> Tuple[Iterator[_WriteSpec], Optional[Callable]]:
+        # Returns an iterator of the prepared tensors, and a callback to cancel the transfer early
+        class IterHolder:
+            iter: Optional[Iterator[TensorSerializer._WriteSpec]] = None
+
+        seen_addresses = set()
+
+        noop_write_specs = []
+        cuda_write_specs = []
+        non_contiguous_write_specs = []
+        to_clone_write_specs = []
+
+        noop_iter_holder = IterHolder()
+        cuda_result_iter_holder = IterHolder()
+        non_contiguous_result_iter_holder = IterHolder()
+        clone_iter_holder = IterHolder()
+
+        result: List[IterHolder] = []
+        for w in write_specs:
+            if w.tensor.device.type == "cuda":
+                cuda_write_specs.append(w)
+                result.append(cuda_result_iter_holder)
+            elif not w.tensor.is_contiguous():
+                non_contiguous_write_specs.append(w)
+                result.append(non_contiguous_result_iter_holder)
+            elif self._encrypted and w.tensor.device.type == "cpu":
+                address = w.tensor.data_ptr()
+                if address in seen_addresses:
+                    to_clone_write_specs.append(w)
+                    result.append(clone_iter_holder)
+                else:
+                    seen_addresses.add(address)
+                    noop_write_specs.append(w)
+                    result.append(noop_iter_holder)
+            else:
+                noop_write_specs.append(w)
+                result.append(noop_iter_holder)
+
+        if cuda_write_specs:
+            (
+                cuda_iter,
+                interrupt_transfer,
+            ) = self._async_bulk_device_to_host_transfer(cuda_write_specs)
+            cuda_result_iter_holder.iter = cuda_iter
+        else:
+            interrupt_transfer = None
+
+        noop_iter_holder.iter = iter(noop_write_specs)
+        non_contiguous_result_iter_holder.iter = self._computation_pool.map(
+            self._make_contiguous, non_contiguous_write_specs
+        )
+        clone_iter_holder.iter = self._computation_pool.map(
+            self._clone_detach, to_clone_write_specs
+        )
+
+        def result_iter():
+            for r in result:
+                yield next(r.iter)
+
+        return result_iter(), interrupt_transfer
+
+    def _bulk_write(self, write_specs: Iterable[_WriteSpec]):
+        write_specs = collections.deque(write_specs)
         next_pos = self._file.tell()
         if _syscalls.has_fallocate() and self._fd:
             size = sum(len(t.name) for t in tensors)
             size += sum(
                 t.tensor.element_size()
                 * t.tensor.nelement()
-                * (not t.tensor.is_meta)
-                for t in tensors
+                * (not w.tensor.is_meta)
+                for w in write_specs
             )
             # Rough underestimate of header size
             header_min_size = 24
-            size += header_min_size * len(tensors)
+            size += header_min_size * len(write_specs)
             _syscalls.try_fallocate(
                 self._fd, next_pos, size, suppress_all_errors=True
             )
 
-        cuda_tensors = [
-            t.tensor for t in tensors if t.tensor.device.type == "cuda"
-        ]
-        if cuda_tensors:
-            (
-                transferred,
-                interrupt_transfer,
-            ) = self._async_bulk_device_to_host_transfer(cuda_tensors)
-        else:
-            transferred = interrupt_transfer = None
-        del cuda_tensors
-
-        if self._encrypted:
-            shared = []
-            seen_addresses = set()
-            for t in reversed(tensors):
-                if t.tensor.device.type in ("cuda", "meta"):
-                    shared.append(False)
-                else:
-                    address = t.tensor.data_ptr()
-                    shared.append(address in seen_addresses)
-                    seen_addresses.add(address)
-            del seen_addresses
-        else:
-            shared = [False] * len(tensors)
+        write_specs, interrupt_transfer = self._prepare_tensors_for_write(
+            write_specs
+        )
 
         try:
-            while tensors:
-                idx, name, tensor_type, tensor, callback = tensors.popleft()
-                is_shared = shared.pop()
-                self._idx = idx
-                if tensor.device.type == "cuda":
-                    tensor = next(transferred)
-                    temp_tensor = True
-                elif is_shared and self._encrypted:
-                    # Un-shares tensor memory in preparation for in-place
-                    # operations on the buffer that would otherwise conflict
-                    # with one another. Full support for shared-memory tensors
-                    # (e.g. if they were only written once) could make
-                    # this unnecessary, once implemented.
-                    # Another option would be to reuse the same encrypted
-                    # weights and decrypt them at the end. This would require
-                    # confirming that the tensor data regions are actually
-                    # identical, and don't just overlap.
-                    tensor = tensor.clone().detach()
-                    temp_tensor = True
-                else:
-                    temp_tensor = False
+            for w in write_specs:
+                self._idx = w.idx
                 next_pos = self._write_tensor(
-                    idx,
-                    name,
-                    tensor_type,
-                    tensor,
+                    w.idx,
+                    w.name,
+                    w.tensor_type,
+                    w.tensor,
                     _synchronize=False,
                     _start_pos=next_pos,
-                    _temporary_buffer=temp_tensor,
+                    _temporary_buffer=w.temp_tensor,
                 )
-                if callback is not None:
-                    callback()
+                if w.callback is not None:
+                    w.callback()
         except Exception:
             if interrupt_transfer is not None:
                 interrupt_transfer()
@@ -3893,6 +3945,7 @@ class TensorSerializer:
                         tensor_type=tensor_type,
                         tensor=tensor,
                         callback=callback,
+                        temporary_buffer=False,
                     )
 
         def persistent_buffers() -> Set[str]:
@@ -3954,6 +4007,7 @@ class TensorSerializer:
                 tensor_type=TensorType.STATE_DICT,
                 tensor=param,
                 callback=None,
+                temporary_buffer=False,
             )
             for name, param in state_dict.items()
         )
