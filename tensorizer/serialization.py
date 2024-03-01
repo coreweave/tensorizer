@@ -3852,10 +3852,10 @@ class TensorSerializer:
         write_specs = collections.deque(write_specs)
         next_pos = self._file.tell()
         if _syscalls.has_fallocate() and self._fd:
-            size = sum(len(t.name) for t in tensors)
+            size = sum(len(w.name) for w in write_specs)
             size += sum(
-                t.tensor.element_size()
-                * t.tensor.nelement()
+                w.tensor.element_size()
+                * w.tensor.nelement()
                 * (not w.tensor.is_meta)
                 for w in write_specs
             )
@@ -3880,7 +3880,7 @@ class TensorSerializer:
                     w.tensor,
                     _synchronize=False,
                     _start_pos=next_pos,
-                    _temporary_buffer=w.temp_tensor,
+                    _temporary_buffer=w.temporary_buffer,
                 )
                 if w.callback is not None:
                     w.callback()
