@@ -1551,6 +1551,8 @@ class TensorDeserializer(
                     "Cannot deserialize to CUDA device"
                     " because CUDA is not available"
                 )
+            if is_cuda:
+                self._preload_cuda()
 
             self._dtype: Optional[torch.dtype] = dtype
 
@@ -1848,6 +1850,27 @@ class TensorDeserializer(
             return self._file.response_headers.get("x-cache-status", None)
         else:
             return None
+
+    @staticmethod
+    def _preload_cuda() -> Callable:
+        called: bool = TensorDeserializer._preload_cuda_called
+        TensorDeserializer._preload_cuda_called = True
+        if not called and torch.cuda.is_available():
+
+            def _attempt_preload():
+                # noinspection PyBroadException
+                try:
+                    torch.empty((1,), device="cuda")
+                except Exception:
+                    pass
+
+            preload_thread = threading.Thread(target=_attempt_preload)
+            preload_thread.start()
+            return preload_thread.join
+        else:
+            return lambda timeout=None: None
+
+    _preload_cuda_called: ClassVar[bool] = False
 
     def _read_single_tensor(self, expected_name: str) -> torch.nn.Parameter:
         this_one_tensor_filter = partial(operator.eq, expected_name)
@@ -3722,7 +3745,7 @@ class TensorSerializer:
                 else:
                     # Sentinel
                     transferred.put(None)
-            transfer_finished = True
+                    transfer_finished = True
 
         transfer_thread = threading.Thread(
             target=_transfer, name="TensorizerTransfer", daemon=True
