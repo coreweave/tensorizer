@@ -6,7 +6,6 @@ import abc
 import collections.abc
 import concurrent.futures
 import contextlib
-import ctypes
 import dataclasses
 import enum
 import functools
@@ -1753,10 +1752,10 @@ class TensorDeserializer(
 
     def _reopen_func(self) -> Optional[Callable]:
         spec = self._file_spec
-        if isinstance(spec, (str, bytes, os.PathLike)):
+        if isinstance(self._file, stream_io.CURLStreamFile):
+            return self._file._fork
+        elif isinstance(spec, (str, bytes, os.PathLike)):
             return partial(stream_io.open_stream, spec, mode="rb")
-        elif isinstance(spec, stream_io.CURLStreamFile):
-            return spec._fork
         # Other types of files can be reopened under certain conditions
         fd: Optional[int] = None
         if hasattr(self._file, "fileno"):
