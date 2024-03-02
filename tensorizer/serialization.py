@@ -3712,11 +3712,9 @@ class TensorSerializer:
         else:
             transferred = queue.Queue(maxsize=max_read_ahead)
 
-        biggest_tensor_bytes = max(
-            t.element_size() * t.nelement() for t in tensors
-        )
+        tensor_sizes = [t.element_size() * t.nelement() for t in tensors]
         staging_tensor = torch.empty(
-            (biggest_tensor_bytes,),
+            (max(tensor_sizes),),
             dtype=torch.uint8,
             device="cpu",
             pin_memory=True,
@@ -3731,18 +3729,22 @@ class TensorSerializer:
                 # This is in a separate CUDA stream because it shouldn't
                 # affect any other GPU operations, even though each
                 # of these transfers are synchronous
-                for t in tensors:
-                    if transfer_finished:
-                        break
-                    staging_tensor_view = (
-                        staging_tensor.narrow(0, 0, t.nbytes)
-                        .view(t.dtype)
-                        .view(t.shape)
-                    )
-                    staging_tensor_view.copy_(t)
-                    new_cpu_tensor = staging_tensor_view.clone()
-                    transferred.put(new_cpu_tensor.detach(), timeout=_TIMEOUT)
-                else:
+                try:
+                    for t, nbytes in zip(tensors, tensor_sizes):
+                        if transfer_finished:
+                            break
+                        staging_tensor_view = (
+                            staging_tensor.narrow(0, 0, nbytes)
+                            .view(t.dtype)
+                            .view(t.shape)
+                        )
+                        staging_tensor_view.copy_(t)
+                        new_cpu_tensor = staging_tensor_view.clone()
+                        transferred.put(
+                            new_cpu_tensor.detach(),
+                            timeout=_TIMEOUT,
+                        )
+                finally:
                     # Sentinel
                     transferred.put(None)
                     transfer_finished = True
