@@ -458,23 +458,23 @@ class CURLStreamFile(io.BufferedIOBase):
     ) -> Union[bytes, int]:
         self.read_operations += 1
         try:
+            eof = None if self._end is None else self._end + 1
             if ba is None:
                 rq_sz = goal_position - self._curr
-                if self._end is not None and self._curr + rq_sz > self._end:
-                    rq_sz = self._end - self._curr + 1
+                if eof is not None and self._curr + rq_sz > eof:
+                    rq_sz = eof - self._curr
                     if rq_sz <= 0:
                         return bytes()
                 ret_buff = self._curl.stdout.read(rq_sz)
                 ret_buff_sz = len(ret_buff)
             else:
                 rq_sz = len(ba)
-                if self._end is not None and self._curr + rq_sz > self._end:
-                    rq_sz = self._end - self._curr + 1
+                if eof is not None and self._curr + rq_sz > eof:
+                    rq_sz = eof - self._curr
                     if rq_sz <= 0:
                         return 0
-                    tmp_ba = bytearray(rq_sz)
-                    ret_buff_sz = self._curl.stdout.readinto(tmp_ba)
-                    ba[:ret_buff_sz] = tmp_ba[:ret_buff_sz]
+                    with memoryview(ba)[:rq_sz] as mv:
+                        ret_buff_sz = self._curl.stdout.readinto(mv)
                     ret_buff = ba
                 else:
                     ret_buff_sz = self._curl.stdout.readinto(ba)
