@@ -1496,6 +1496,21 @@ class TensorDeserializer(
         # other than __del__, so instead, enter the cleanup context
         # pre-emptively and cancel it if __init__ is successful
         with self._cleanup:
+            # If device is None, use the current device, otherwise use the given
+            # device.
+            device = (
+                utils.get_device() if device is None else torch.device(device)
+            )
+            self._device: torch.device = device
+            is_cuda: bool = self._device.type == "cuda"
+            if is_cuda and not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Cannot deserialize to CUDA device"
+                    " because CUDA is not available"
+                )
+            if is_cuda:
+                self._preload_cuda()
+
             self._verify_hash = verify_hash
             if encryption is not None and not isinstance(
                 encryption, DecryptionParams
@@ -1538,21 +1553,6 @@ class TensorDeserializer(
             self.read_bytes = 0
             self._ephemeral_bytes_read = AtomicUint(width=8)
             self._last_yielded_key: Optional[str] = None
-
-            # If device is None, use the current device, otherwise use the given
-            # device.
-            device = (
-                utils.get_device() if device is None else torch.device(device)
-            )
-            self._device: torch.device = device
-            is_cuda: bool = self._device.type == "cuda"
-            if is_cuda and not torch.cuda.is_available():
-                raise RuntimeError(
-                    "Cannot deserialize to CUDA device"
-                    " because CUDA is not available"
-                )
-            if is_cuda:
-                self._preload_cuda()
 
             self._dtype: Optional[torch.dtype] = dtype
 
