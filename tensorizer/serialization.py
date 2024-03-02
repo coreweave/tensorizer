@@ -1496,6 +1496,21 @@ class TensorDeserializer(
         # other than __del__, so instead, enter the cleanup context
         # pre-emptively and cancel it if __init__ is successful
         with self._cleanup:
+            # If device is None, use the current device, otherwise use the given
+            # device.
+            device = (
+                utils.get_device() if device is None else torch.device(device)
+            )
+            self._device: torch.device = device
+            is_cuda: bool = self._device.type == "cuda"
+            if is_cuda and not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Cannot deserialize to CUDA device"
+                    " because CUDA is not available"
+                )
+            if is_cuda:
+                self._preload_cuda()
+
             self._verify_hash = verify_hash
             if encryption is not None and not isinstance(
                 encryption, DecryptionParams
@@ -1538,19 +1553,6 @@ class TensorDeserializer(
             self.read_bytes = 0
             self._ephemeral_bytes_read = AtomicUint(width=8)
             self._last_yielded_key: Optional[str] = None
-
-            # If device is None, use the current device, otherwise use the given
-            # device.
-            device = (
-                utils.get_device() if device is None else torch.device(device)
-            )
-            self._device: torch.device = device
-            is_cuda: bool = self._device.type == "cuda"
-            if is_cuda and not torch.cuda.is_available():
-                raise RuntimeError(
-                    "Cannot deserialize to CUDA device"
-                    " because CUDA is not available"
-                )
 
             self._dtype: Optional[torch.dtype] = dtype
 
@@ -1848,6 +1850,27 @@ class TensorDeserializer(
             return self._file.response_headers.get("x-cache-status", None)
         else:
             return None
+
+    @staticmethod
+    def _preload_cuda() -> Callable:
+        called: bool = TensorDeserializer._preload_cuda_called
+        TensorDeserializer._preload_cuda_called = True
+        if not called and torch.cuda.is_available():
+
+            def _attempt_preload():
+                # noinspection PyBroadException
+                try:
+                    torch.empty((1,), device="cuda")
+                except Exception:
+                    pass
+
+            preload_thread = threading.Thread(target=_attempt_preload)
+            preload_thread.start()
+            return preload_thread.join
+        else:
+            return lambda timeout=None: None
+
+    _preload_cuda_called: ClassVar[bool] = False
 
     def _read_single_tensor(self, expected_name: str) -> torch.nn.Parameter:
         this_one_tensor_filter = partial(operator.eq, expected_name)
@@ -3689,11 +3712,9 @@ class TensorSerializer:
         else:
             transferred = queue.Queue(maxsize=max_read_ahead)
 
-        biggest_tensor_bytes = max(
-            t.element_size() * t.nelement() for t in tensors
-        )
+        tensor_sizes = [t.element_size() * t.nelement() for t in tensors]
         staging_tensor = torch.empty(
-            (biggest_tensor_bytes,),
+            (max(tensor_sizes),),
             dtype=torch.uint8,
             device="cpu",
             pin_memory=True,
@@ -3708,21 +3729,25 @@ class TensorSerializer:
                 # This is in a separate CUDA stream because it shouldn't
                 # affect any other GPU operations, even though each
                 # of these transfers are synchronous
-                for t in tensors:
-                    if transfer_finished:
-                        break
-                    staging_tensor_view = (
-                        staging_tensor.narrow(0, 0, t.nbytes)
-                        .view(t.dtype)
-                        .view(t.shape)
-                    )
-                    staging_tensor_view.copy_(t)
-                    new_cpu_tensor = staging_tensor_view.clone()
-                    transferred.put(new_cpu_tensor.detach(), timeout=_TIMEOUT)
-                else:
+                try:
+                    for t, nbytes in zip(tensors, tensor_sizes):
+                        if transfer_finished:
+                            break
+                        staging_tensor_view = (
+                            staging_tensor.narrow(0, 0, nbytes)
+                            .view(t.dtype)
+                            .view(t.shape)
+                        )
+                        staging_tensor_view.copy_(t)
+                        new_cpu_tensor = staging_tensor_view.clone()
+                        transferred.put(
+                            new_cpu_tensor.detach(),
+                            timeout=_TIMEOUT,
+                        )
+                finally:
                     # Sentinel
                     transferred.put(None)
-            transfer_finished = True
+                    transfer_finished = True
 
         transfer_thread = threading.Thread(
             target=_transfer, name="TensorizerTransfer", daemon=True
