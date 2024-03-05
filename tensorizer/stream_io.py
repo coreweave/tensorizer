@@ -188,8 +188,8 @@ class CAInfo:
 
 
 def _is_accelerated_object_storage(uri: str) -> bool:
-    domain = urlparse(uri.lower()).hostname.split(".")
-    return (domain[0], *domain[1:]) == ("accel-object", "coreweave", "com")
+    domain = urlparse(uri.lower()).hostname.split(".")[-4:]
+    return (domain[0], *domain[2:]) == ("accel-object", "coreweave", "com")
 
 
 class CURLStreamFile(io.BufferedIOBase):
