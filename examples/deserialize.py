@@ -56,7 +56,7 @@ before_mem = get_mem_usage()
 # Lazy load the tensors from S3 into the model.
 if tracer is not None:
     tracer.start()
-start = time.time()
+start = time.perf_counter()
 deserializer = TensorDeserializer(
     args.source,
     device=device,
