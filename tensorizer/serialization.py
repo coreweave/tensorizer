@@ -74,14 +74,17 @@ pthread_setname_np.restype = ctypes.c_int
 import _thread
 
 orig_start = threading.Thread.start
+
+
 def new_thread_start(self):
     orig_start(self)
     name = self.name
-    if name.startswith('Thread-'):
-        name = name[len('Thread-'):]
+    if name.startswith("Thread-"):
+        name = name[len("Thread-") :]
     name = name[-15:].encode()
     ident = self.ident
     pthread_setname_np(ident, name)
+
 
 threading.Thread.start = new_thread_start
 
@@ -3116,7 +3119,7 @@ class TensorSerializer:
             self._write_lock = None
             concurrent_writes_possible = True
         elif isinstance(self._file, mmap.mmap):
-            print('mmap pwrite')
+            print("mmap pwrite")
             self._pwrite = self._mmap_pwrite
             concurrent_writes_possible = True
         else:
@@ -3256,7 +3259,14 @@ class TensorSerializer:
                 len_src = len(data)
             src = ctypes.addressof((ctypes.c_char * len_src).from_buffer(data))
 
-        dst = ctypes.addressof((ctypes.c_char * len(self._file)).from_buffer(self._file)) + offset
+        dst = (
+            ctypes.addressof(
+                (ctypes.c_char * len(self._file)).from_buffer(self._file)
+            )
+            + offset
+        )
+        with open('pwrite.log', 'a') as log:
+            log.write(f'{os.getpid()} {time.perf_counter()} {offset} {len_src}\n')
         _syscalls.memcpy(dst, src, len_src)
         return len_src
 
@@ -3883,7 +3893,10 @@ class TensorSerializer:
 
         biggest_tensor_bytes = max(t.nbytes for t in tensors)
         staging_tensor = torch.empty(
-            (biggest_tensor_bytes,), dtype=torch.uint8, device="cpu", pin_memory=True
+            (biggest_tensor_bytes,),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
         )
 
         transfer_finished = False
@@ -3898,7 +3911,11 @@ class TensorSerializer:
                 for t in tensors:
                     if transfer_finished:
                         break
-                    staging_tensor_view = staging_tensor.narrow(0, 0, t.nbytes).view(t.dtype).view(t.shape)
+                    staging_tensor_view = (
+                        staging_tensor.narrow(0, 0, t.nbytes)
+                        .view(t.dtype)
+                        .view(t.shape)
+                    )
                     staging_tensor_view.copy_(t, non_blocking=True)
                     new_cpu_tensor = staging_tensor_view.clone()
                     transferred.put(new_cpu_tensor.detach(), timeout=_TIMEOUT)
