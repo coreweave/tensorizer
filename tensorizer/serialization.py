@@ -93,6 +93,28 @@ _perf_stats = _PerfStats()
 
 lz4 = None
 
+libpthread = ctypes.CDLL(ctypes.util.find_library("pthread"))
+pthread_setname_np = libpthread.pthread_setname_np
+pthread_setname_np.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+pthread_setname_np.restype = ctypes.c_int
+
+import _thread
+
+orig_start = threading.Thread.start
+
+
+def new_thread_start(self):
+    orig_start(self)
+    name = self.name
+    if name.startswith("Thread-"):
+        name = name[len("Thread-") :]
+    name = name[-15:].encode()
+    ident = self.ident
+    pthread_setname_np(ident, name)
+
+
+threading.Thread.start = new_thread_start
+
 __all__ = [
     "TensorSerializer",
     "TensorDeserializer",
@@ -2346,9 +2368,9 @@ class TensorDeserializer(
         a passthrough manner.
         """
         if isinstance(tensor, torch.nn.Parameter):
-            tensor.data = tensor.data.to(self._device)
+            tensor.data = tensor.data.to(self._device, non_blocking=True)
             if tensor.grad is not None:
-                tensor.grad = tensor.grad.to(self._device)
+                tensor.grad = tensor.grad.to(self._device, non_blocking=True)
             return tensor
 
         # Cast the tensor if a global dtype was given to the TensorDeserializer
