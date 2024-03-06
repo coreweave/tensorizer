@@ -1470,6 +1470,8 @@ def open_stream(
                 os.makedirs(os.path.dirname(path_uri), exist_ok=True)
         if buffer_size is None:
             buffer_size = io.DEFAULT_BUFFER_SIZE
-        handle: typing.BinaryIO = open(path_uri, mode, buffering=buffer_size)
+        fd = os.open(path_uri, flags=os.O_DIRECT | os.O_RDWR) # TODO os.O_RDONLY
+        file_len = os.stat(fd).st_size
+        handle: typing.BinaryIO = mmap.mmap(fd, file_len) # TODO prot=mmap.PROT_READ
         handle.seek(begin or 0)
         return handle

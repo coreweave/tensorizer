@@ -6,6 +6,7 @@ import abc
 import collections.abc
 import concurrent.futures
 import contextlib
+import ctypes
 import dataclasses
 import enum
 import functools
@@ -13,6 +14,7 @@ import hashlib
 import io
 import itertools
 import logging
+import mmap
 import operator
 import os
 import pathlib
@@ -206,6 +208,24 @@ class TensorEntry:
 class _FileFeatureFlags(enum.IntFlag):
     encrypted = enum.auto()
 
+def _readinto(reader: mmap.mmap, mv: memoryview) -> None:
+    """
+    Read into a memoryview from a file-like object.
+
+    Args:
+        reader: The file-like object to read from.
+        mv: The memoryview to read into.
+
+    """
+    reader_pos = reader.tell()
+    len_mv = len(mv)
+
+    dst = ctypes.addressof((ctypes.c_char * len_mv).from_buffer(mv))
+    src = ctypes.addressof((ctypes.c_char * len_mv).from_buffer(memoryview(reader))) + reader_pos
+    _syscalls.memcpy(dst, src, len_mv)
+
+    # mv[:] = reader[reader_pos : reader_pos + len_mv]
+    reader.seek(len_mv, os.SEEK_CUR)
 
 @dataclasses.dataclass
 class _FileHeader:
@@ -592,7 +612,8 @@ class _TensorHeaderDeserializer:
         buffer = bytearray(header_len)
         buffer[:offset] = header_len_bytes
         with memoryview(buffer) as mv:
-            reader.readinto(mv[offset:])
+            _readinto(reader, mv[offset:])
+            # reader.readinto(mv[offset:])
         return cls(
             buffer, zero_hashes=zero_hashes, check_crypt_info=check_crypt_info
         )
@@ -2639,7 +2660,8 @@ class TensorDeserializer(
                             mv,
                         )
                     else:
-                        file_.readinto(mv)
+                        _readinto(file_, mv)
+                        # file_.readinto(mv)
 
                     if verify_hash:
                         unsafe_self._verify_hashes(

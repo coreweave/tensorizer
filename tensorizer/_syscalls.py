@@ -14,6 +14,9 @@ except TypeError:
 
 _IN: int = 1
 
+memcpy = _libc.memcpy
+memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+memcpy.restype = ctypes.c_void_p
 
 def _errcheck(result, func, args) -> None:
     del args
