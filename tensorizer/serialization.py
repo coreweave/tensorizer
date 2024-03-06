@@ -66,6 +66,15 @@ from tensorizer._NumpyTensor import _NumpyTensor
 
 @dataclasses.dataclass
 class _PerfStats:
+    stream_open_millisecs: AtomicUint = dataclasses.field(
+        default_factory=lambda: AtomicUint(width=8)
+    )
+    buffer_alloc_millisecs: AtomicUint = dataclasses.field(
+        default_factory=lambda: AtomicUint(width=8)
+    )
+    buffer_alloc_bytes: AtomicUint = dataclasses.field(
+        default_factory=lambda: AtomicUint(width=8)
+    )
     file_readinto_millisecs: AtomicUint = dataclasses.field(
         default_factory=lambda: AtomicUint(width=8)
     )
@@ -2355,7 +2364,7 @@ class TensorDeserializer(
         gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
         start = time.perf_counter()
-        tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
+        tensor_on_device = tensor.to(device=self._device, dtype=target_dtype, non_blocking=True)
         duration = time.perf_counter() - start
         _perf_stats.cuda_to_device_millisecs.add(int(1000.0 * duration))
 
@@ -2522,9 +2531,11 @@ class TensorDeserializer(
         try:
             if thread_idx != 0:
                 try:
+                    start = time.perf_counter_ns()
                     file_ = unsafe_self._reopen(
                         begin=begin_offset, end=end_offset
                     )
+                    _perf_stats.stream_open_millisecs.add((time.perf_counter_ns() - start) // 1000000)
                 except ValueError as e:
                     msg: str = str(e)
                     # The effective num_readers in this call may be lower
@@ -2554,6 +2565,7 @@ class TensorDeserializer(
                 total_tensor_bytes: int = max(
                     t.deserialized_length for t in tensor_items
                 )
+                start = time.perf_counter_ns()
                 shared_buffer_tensor = torch.empty(
                     (total_tensor_bytes,),
                     device="cpu",
@@ -2563,6 +2575,8 @@ class TensorDeserializer(
                 shared_buffer_mv: memoryview = (
                     shared_buffer_tensor.numpy().data.cast("B")
                 )
+                _perf_stats.buffer_alloc_millisecs.add((time.perf_counter_ns() - start) // 1000000)
+                _perf_stats.buffer_alloc_bytes.add(total_tensor_bytes)
 
             tensor_sizes_by_name: Dict[str, int] = {
                 t.name: t.deserialized_length for t in tensor_items
@@ -4007,6 +4021,9 @@ class TensorSerializer:
 
 def _get_perf_stats():
     return dict(
+        stream_open_secs=float(_perf_stats.stream_open_millisecs.load()) / 1000.0,
+        buffer_alloc_secs=float(_perf_stats.buffer_alloc_millisecs.load()) / 1000.0,
+        buffer_alloc_bytes=_perf_stats.buffer_alloc_bytes.load(),
         cuda_to_device_secs=float(_perf_stats.cuda_to_device_millisecs.load())
         / 1000.0,
         cuda_bytes=_perf_stats.cuda_bytes.load(),

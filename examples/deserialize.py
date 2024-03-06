@@ -97,6 +97,8 @@ with torch.no_grad():
 
 print(f"Output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
 perf_stats = tensorizer.serialization._get_perf_stats()
+print(f"Stream Open stats: {perf_stats["stream_open_secs"]}s, {perf_stats["stream_open_secs"]/args.num_readers}s per reader")
+print(f"Alloc stats: {perf_stats["buffer_alloc_bytes"]} bytes in {perf_stats["buffer_alloc_secs"]}s, {perf_stats["buffer_alloc_secs"]/args.num_readers}s per reader")
 print(
     f"to CUDA stats: {perf_stats['cuda_bytes']} bytes in"
     f" {perf_stats['cuda_to_device_secs']}s,"
