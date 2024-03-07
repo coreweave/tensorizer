@@ -6,6 +6,8 @@ import abc
 import collections.abc
 import concurrent.futures
 import contextlib
+import ctypes
+import ctypes.util
 import dataclasses
 import enum
 import functools
@@ -1863,6 +1865,7 @@ class TensorDeserializer(
                     torch.empty((1,), device="cuda")
                 except Exception:
                     pass
+                _syscalls._load_cudaHostRegister()
 
             preload_thread = threading.Thread(target=_attempt_preload)
             preload_thread.start()
@@ -2307,8 +2310,11 @@ class TensorDeserializer(
 
             yield module_idx, tensor_type, name, arr, is_opaque, torch_dtype
 
+    @staticmethod
     def _to_torch_parameter(
-        self, tensor: Union[torch.Tensor, torch.nn.Parameter]
+        device: str,
+        target_dtype: Optional[torch.dtype],
+        tensor: Union[torch.Tensor, torch.nn.Parameter]
     ) -> torch.nn.Parameter:
         """
         Convert a tensor to a torch.nn.Parameter on a device, forcing
@@ -2316,25 +2322,24 @@ class TensorDeserializer(
         a passthrough manner.
         """
         if isinstance(tensor, torch.nn.Parameter):
-            tensor.data = tensor.data.to(self._device)
+            tensor.data = tensor.data.to(device, non_blocking=True)
             if tensor.grad is not None:
-                tensor.grad = tensor.grad.to(self._device)
+                tensor.grad = tensor.grad.to(device, non_blocking=True)
             return tensor
 
         # Cast the tensor if a global dtype was given to the TensorDeserializer
         if (
-            self._dtype is not None
-            and tensor.dtype != torch.bool
-            and tensor.dtype != self._dtype
+            target_dtype is None
+            or tensor.dtype == torch.bool
+            or tensor.dtype == target_dtype
         ):
-            target_dtype = self._dtype
-        else:
             target_dtype = None
 
         gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
         start = time.perf_counter()
-        tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
+        # TODO: may need to adjust non_blocking for non-cuda devices
+        tensor_on_device = tensor.to(device=device, dtype=target_dtype, non_blocking=True)
         duration = time.perf_counter() - start
         _perf_stats.cuda_to_device_millisecs.add(int(1000.0 * duration))
 
@@ -2444,7 +2449,6 @@ class TensorDeserializer(
         transfer_out_queue = queue.SimpleQueue()
 
         futures: List[concurrent.futures.Future] = []
-        barrier = threading.Barrier(effective_num_readers)
         halt = AtomicUint(width=4)
 
         for thread_idx, tensor_items in enumerate(tensors_per_reader):
@@ -2452,7 +2456,6 @@ class TensorDeserializer(
                 self._copy_thread,
                 thread_idx,
                 halt,
-                barrier,
                 verify_hash,
                 tensor_items,
                 transfer_out_queue,
@@ -2470,25 +2473,129 @@ class TensorDeserializer(
             halt.store(1)
             raise
 
+    
+    class _TensorArena:
+        __slots__ = ['unpinned_buffer', 'numpy_tensors', 'headers', 'buffer_offset']
+        def __init__(self, buffer_size: int):
+            buffer = torch.empty((buffer_size,), dtype=torch.uint8)
+
+            self.unpinned_buffer: memoryview = memoryview(buffer.numpy().data.cast("B"))
+            self.numpy_tensors: List[_NumpyTensor] = []
+            self.headers: List[_TensorHeaderDeserializer] = []
+            self.buffer_offset = 0
+        
+        def grab_space(self, length: int) -> Optional[memoryview]:
+            start = self.buffer_offset
+            end = start + length
+            if end > len(self.unpinned_buffer):
+                # out of space
+                return None
+            self.buffer_offset = end
+            return self.unpinned_buffer[start: end]
+
+    @staticmethod
+    def _cuda_transfer_thread(
+        cuda_device: str,
+        target_dtype: Optional[torch.dtype],
+        buffer_size: int,
+        in_queue: "queue.SimpleQueue[Optional[_TensorArena]]",
+        out_queue: "queue.SimpleQueue[Union[Exception, _CopiedData]]",
+    ):
+        """
+        The input is a queue of Arenas. Each Arena is a list of tensors all allocated in the same unpinned_buffer, which is no greater than `buffer_size`
+
+        We first allocate a pinned buffer. Then for each item in the queue, we
+        copy the data from the unpinned buffer to the pinned buffer, and then
+        update the tensor's data_ptr to point to their address in the pinned
+        buffer.
+
+        Then we transfer those tensors to CUDA, each asynchronously but with a
+        cudaSynchronize at the end. Then we put the resulting list of tensors in
+        the output queue.
+
+        """
+        cuda_stream = torch.cuda.Stream(cuda_device)
+
+        # Allocate a pinned buffer
+        pinned_buffer_tensor = torch.empty((buffer_size,), dtype=torch.uint8)
+        pinned_buffer_mv: memoryview = (
+            pinned_buffer_tensor.numpy().data.cast("B")
+        )
+        pinned_buffer_ptr = pinned_buffer_tensor.data_ptr()
+        res = _syscalls.cudaHostRegister(pinned_buffer_ptr, buffer_size, 0)
+        assert res == 0  # TODO: return exception
+
+        while True:
+            arena = in_queue.get()
+            if arena is None:
+                break
+
+            assert len(arena.unpinned_buffer) <= buffer_size
+
+            # copy the data from the unpinned buffer to the pinned buffer
+            def do_copy(): # TODO: just a func for profiling
+                pinned_buffer_mv[:len(arena.unpinned_buffer)] = arena.unpinned_buffer
+            do_copy()
+            arena_buffer_start = ctypes.addressof((ctypes.c_char * 1).from_buffer(arena.unpinned_buffer))
+
+            results: List[TensorDeserializer._CopiedData] = []
+            for numpy_tensor, header in zip(arena.numpy_tensors, arena.headers):
+                offset = ctypes.addressof((ctypes.c_char * 1).from_buffer(numpy_tensor.data)) - arena_buffer_start
+                assert offset >= 0
+
+                new_numpy_tensor = _NumpyTensor.from_buffer(
+                    numpy_tensor.numpy_dtype,
+                    torch_dtype=numpy_tensor.torch_dtype,
+                    shape_list=numpy_tensor.data.shape,
+                    buffer=pinned_buffer_mv,
+                    offset=offset # TODO: is offset ok? or should we just offset the mv itself
+                )
+
+                tensor = new_numpy_tensor.to_tensor()
+                with torch.cuda.stream(cuda_stream):
+                    parameter = TensorDeserializer._to_torch_parameter(cuda_device, target_dtype, tensor)
+
+                results.append(TensorDeserializer._CopiedData(
+                    header = header,
+                    numpy_tensor = new_numpy_tensor,
+                    parameter = parameter
+                ))
+                
+            cuda_stream.synchronize()
+
+            for result in results:
+                out_queue.put(result)
+
     def _copy_thread(
         unsafe_self,
         thread_idx: int,
         halt: AtomicUint,
-        barrier: threading.Barrier,
         verify_hash: bool,
         tensor_items: Sequence[TensorEntry],
         transfer_out_queue: "queue.SimpleQueue[Union[Exception, _CopiedData]]",
     ):
-        # Need to get rid of self or more safely have thread-local storage
+        # TODO: get rid of self or more safely have thread-local storage
+
+        max_tensor_bytes: int = max(
+            t.deserialized_length for t in tensor_items
+        )
 
         is_cuda = unsafe_self._device.type == "cuda"
-        cuda_stream = None
         if is_cuda:
-            cuda_stream = torch.cuda.Stream(unsafe_self._device)
+            cuda_transfer_in_queue = queue.SimpleQueue()
 
-        # Allocating pinned memory seems to block creating new threads, so
-        # ensure all threads are created before we go
-        barrier.wait()
+            cuda_transfer_thread = threading.Thread(
+                name=f"CudaTransfer-{thread_idx}",
+                target=TensorDeserializer._cuda_transfer_thread,
+                args=(
+                    unsafe_self._device,
+                    unsafe_self._dtype,
+                    max_tensor_bytes,
+                    cuda_transfer_in_queue,
+                    transfer_out_queue,
+                ),
+            )
+            cuda_transfer_thread.start()
 
         begin_offset = tensor_items[0].offset
         # End offsets for range requests include the final byte
@@ -2530,24 +2637,26 @@ class TensorDeserializer(
             shared_buffer_tensor: Optional[torch.Tensor] = None
             shared_buffer_mv: Optional[memoryview] = None
             if is_cuda:
-                total_tensor_bytes: int = max(
-                    t.deserialized_length for t in tensor_items
-                )
-                shared_buffer_tensor = torch.empty(
-                    (total_tensor_bytes,),
-                    device="cpu",
-                    dtype=torch.uint8,
-                    pin_memory=True,
-                )
-                shared_buffer_mv: memoryview = (
-                    shared_buffer_tensor.numpy().data.cast("B")
-                )
+                pass
+                # TODO
+                # total_tensor_bytes: int = max(
+                #     t.deserialized_length for t in tensor_items
+                # )
+                # shared_buffer_tensor = torch.empty(
+                #     (total_tensor_bytes,),
+                #     device="cpu",
+                #     dtype=torch.uint8,
+                #     pin_memory=True,
+                # )
+                # shared_buffer_mv: memoryview = (
+                #     shared_buffer_tensor.numpy().data.cast("B")
+                # )
 
             tensor_sizes_by_name: Dict[str, int] = {
                 t.name: t.deserialized_length for t in tensor_items
             }
 
-            # then for each tensor in tensor_items
+            arena = TensorDeserializer._TensorArena(max_tensor_bytes)
             tensors_read = 0
             while tensors_read < len(tensor_items):
                 if halt.load() > 0:
@@ -2612,9 +2721,16 @@ class TensorDeserializer(
                 assert is_meta or needed_buffer_size == header.data_length
 
                 if is_cuda:
+                    mv: memoryview = arena.grab_space(needed_buffer_size)
+                    if mv is None:
+                        # arena is full! Put it on the queue and start a new one
+                        cuda_transfer_in_queue.put(arena)
+                        arena = TensorDeserializer._TensorArena(max_tensor_bytes)
+                        mv: memoryview = arena.grab_space(needed_buffer_size)
+                        assert mv is not None
                     if is_meta:
+                        # TODO: fix meta.
                         shared_buffer_tensor[:needed_buffer_size].zero_()
-                    mv: memoryview = shared_buffer_mv[:needed_buffer_size]
                 else:
                     # Not in CUDA, no pinned memory.
                     # Allocate a new buffer for each tensor
@@ -2658,29 +2774,33 @@ class TensorDeserializer(
                     mv,
                 )
                 del mv
-                tensor = numpy_tensor.to_tensor()
 
-                stream_context = (
-                    torch.cuda.stream(cuda_stream)
-                    if is_cuda
-                    else contextlib.nullcontext()
-                )
-                with stream_context:
+                if is_cuda:
+                    arena.headers.append(header)
+                    arena.numpy_tensors.append(numpy_tensor)
+                else:
+                    tensor = numpy_tensor.to_tensor()
                     parameter = unsafe_self._to_torch_parameter(tensor)
-                    if cuda_stream is not None:
-                        cuda_stream.synchronize()
-
-                # put it on transfer_out_queue
-                transfer_out_queue.put(
-                    TensorDeserializer._CopiedData(
-                        header, numpy_tensor, parameter
+                    transfer_out_queue.put(
+                        TensorDeserializer._CopiedData(
+                            header, numpy_tensor, parameter
+                        )
                     )
-                )
+
                 tensors_read += 1
+
+            if is_cuda:
+                # flush the remaining arena
+                if arena.numpy_tensors:
+                    cuda_transfer_in_queue.put(arena)
+
         except Exception as e:
-            del shared_buffer_tensor, shared_buffer_mv
+            # TODO: cleanup arena(s)
+            # del shared_buffer_tensor, shared_buffer_mv
             transfer_out_queue.put(e)
         finally:
+            if is_cuda:
+                cuda_transfer_in_queue.put(None)
             if file_ is not None and file_ is not unsafe_self._file:
                 bytes_read = getattr(file_, "bytes_read", 0)
                 file_.close()

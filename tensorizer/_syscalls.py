@@ -4,6 +4,8 @@ import errno
 __all__ = (
     "has_fallocate",
     "try_fallocate",
+    "cudaHostRegister",
+    "_load_cudaHostRegister"
 )
 
 
@@ -13,6 +15,7 @@ except TypeError:
     _libc = ctypes.pythonapi
 
 _IN: int = 1
+
 
 
 def _errcheck(result, func, args) -> None:
@@ -95,3 +98,19 @@ def try_fallocate(
             return False
         else:
             raise
+
+
+_cudaHostRegister = None
+def _load_cudaHostRegister():
+    global _cudaHostRegister
+    if _cudaHostRegister is None:
+        libcudart = ctypes.CDLL(None)
+        _cudaHostRegister = libcudart.cudaHostRegister
+        _cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+
+
+def cudaHostRegister(ptr: ctypes.c_void_p, size: ctypes.c_size_t, flags: ctypes.c_uint) -> None:
+    global _cudaHostRegister
+    if _cudaHostRegister is None:
+        _load_cudaHostRegister()
+    return _cudaHostRegister(ptr, size, flags)
