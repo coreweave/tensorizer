@@ -127,7 +127,7 @@ def _get_madvise():
 _madvise = _get_madvise()
 del _get_madvise
 
-_madv_populate_read: int = 23
+_madv_populate_write: int = 23
 
 
 def _can_prefault_with_madvise() -> bool:
@@ -139,11 +139,11 @@ def _can_prefault_with_madvise() -> bool:
     flags = {} if private == 0 else {"flags": private}
     with mmap.mmap(-1, n, **flags) as m:
         try:
-            # MADV_POPULATE_READ is only available on Linux 5.14 and up
+            # MADV_POPULATE_WRITE is only available on Linux 5.14 and up
             _madvise(
                 ctypes.byref((ctypes.c_ubyte * n).from_buffer(m)),
                 n,
-                _madv_populate_read,
+                _madv_populate_write,
             )
         except OSError:
             return False
@@ -154,7 +154,7 @@ def _can_prefault_with_madvise() -> bool:
 if _can_prefault_with_madvise():
 
     def prefault(address, length: int):
-        _madvise(address, length, _madv_populate_read)
+        _madvise(address, length, _madv_populate_write)
 
 else:
 
