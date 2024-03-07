@@ -1,9 +1,11 @@
 import ctypes
 import errno
+import mmap
 
 __all__ = (
     "has_fallocate",
     "try_fallocate",
+    "prefault",
 )
 
 
@@ -95,3 +97,69 @@ def try_fallocate(
             return False
         else:
             raise
+
+
+def _get_madvise():
+    from ctypes import CFUNCTYPE, c_int, c_size_t, c_void_p
+
+    prototype = CFUNCTYPE(
+        c_int,
+        c_void_p,
+        c_size_t,
+        c_int,
+        use_errno=True,
+    )
+    paramflags = (
+        (_IN, "addr"),
+        (_IN, "length"),
+        (_IN, "advice"),
+    )
+
+    try:
+        _func = prototype(("madvise", _libc), paramflags)
+    except AttributeError:
+        return None
+    _func.errcheck = _errcheck
+
+    return _func
+
+
+_madvise = _get_madvise()
+del _get_madvise
+
+_madv_populate_write: int = 23
+
+
+def _can_prefault_with_madvise() -> bool:
+    if _madvise is None or _libc is ctypes.pythonapi:
+        # If _libc is ctypes.pythonapi then the call would hold the GIL
+        return False
+    n: int = mmap.PAGESIZE
+    private: int = getattr(mmap, "MAP_PRIVATE", 0)
+    flags = {} if private == 0 else {"flags": private}
+    with mmap.mmap(-1, n, **flags) as m:
+        try:
+            # MADV_POPULATE_WRITE is only available on Linux 5.14 and up
+            _madvise(
+                ctypes.byref((ctypes.c_ubyte * n).from_buffer(m)),
+                n,
+                _madv_populate_write,
+            )
+        except OSError:
+            return False
+        else:
+            return True
+
+
+if _can_prefault_with_madvise():
+
+    def prefault(address, length: int):
+        _madvise(address, length, _madv_populate_write)
+
+else:
+
+    def prefault(address, length: int):
+        ctypes.memset(address, 0x00, length)
+
+
+del _can_prefault_with_madvise
