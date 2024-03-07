@@ -1710,6 +1710,7 @@ class TensorDeserializer(
 
             # The offset in the file where the tensor data begins.
             self._tensors_begin = self._file.tell()
+            self._free_unpinned_buffer_queue = queue.Queue()
 
             if not self._lazy_load:
                 # If we're not in lazy_load mode, we populate the cache with all
@@ -2476,13 +2477,32 @@ class TensorDeserializer(
     
     class _TensorArena:
         __slots__ = ['unpinned_buffer', 'numpy_tensors', 'headers', 'buffer_offset']
-        def __init__(self, buffer_size: int):
-            buffer = torch.empty((buffer_size,), dtype=torch.uint8)
-
-            self.unpinned_buffer: memoryview = memoryview(buffer.numpy().data.cast("B"))
+        def __init__(self, buffer_size: int, free_unpinned_buffer_queue: "queue.Queue[memoryview]"):
             self.numpy_tensors: List[_NumpyTensor] = []
             self.headers: List[_TensorHeaderDeserializer] = []
             self.buffer_offset = 0
+
+            try:
+                seen_buffers = set()
+                while True:
+                    maybe_buffer = free_unpinned_buffer_queue.get_nowait()
+                    if id(maybe_buffer) in seen_buffers:
+                        print('Found no buffers after looking at', len(seen_buffers))
+                        raise queue.Empty()
+                    seen_buffers.add(id(maybe_buffer))
+
+                    if len(maybe_buffer) < buffer_size:
+                        free_unpinned_buffer_queue.put(maybe_buffer)
+                    else:
+                        # found one
+                        self.unpinned_buffer = maybe_buffer[:buffer_size]
+                        print('Reusing buffer')
+                        return
+            except queue.Empty:
+                pass
+            print('Making new buffer')
+            buffer = torch.empty((buffer_size,), dtype=torch.uint8)
+            self.unpinned_buffer: memoryview = memoryview(buffer.numpy().data.cast("B"))
         
         def grab_space(self, length: int) -> Optional[memoryview]:
             start = self.buffer_offset
@@ -2500,6 +2520,7 @@ class TensorDeserializer(
         buffer_size: int,
         in_queue: "queue.SimpleQueue[Optional[_TensorArena]]",
         out_queue: "queue.SimpleQueue[Union[Exception, _CopiedData]]",
+        free_unpinned_buffer_queue: "queue.Queue[memoryview]",
     ):
         """
         The input is a queue of Arenas. Each Arena is a list of tensors all allocated in the same unpinned_buffer, which is no greater than `buffer_size`
@@ -2533,10 +2554,14 @@ class TensorDeserializer(
             assert len(arena.unpinned_buffer) <= buffer_size
 
             # copy the data from the unpinned buffer to the pinned buffer
-            def do_copy(): # TODO: just a func for profiling
-                pinned_buffer_mv[:len(arena.unpinned_buffer)] = arena.unpinned_buffer
-            do_copy()
+
             arena_buffer_start = ctypes.addressof((ctypes.c_char * 1).from_buffer(arena.unpinned_buffer))
+
+            # pinned_buffer_mv[:len(arena.unpinned_buffer)] = arena.unpinned_buffer
+            src = arena_buffer_start
+            dst = pinned_buffer_ptr
+            _syscalls.memcpy(dst, src, len(arena.unpinned_buffer))
+            free_unpinned_buffer_queue.put(arena.unpinned_buffer)
 
             results: List[TensorDeserializer._CopiedData] = []
             for numpy_tensor, header in zip(arena.numpy_tensors, arena.headers):
@@ -2593,6 +2618,7 @@ class TensorDeserializer(
                     max_tensor_bytes,
                     cuda_transfer_in_queue,
                     transfer_out_queue,
+                    unsafe_self._free_unpinned_buffer_queue
                 ),
             )
             cuda_transfer_thread.start()
@@ -2635,28 +2661,12 @@ class TensorDeserializer(
             # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
 
             shared_buffer_tensor: Optional[torch.Tensor] = None
-            shared_buffer_mv: Optional[memoryview] = None
-            if is_cuda:
-                pass
-                # TODO
-                # total_tensor_bytes: int = max(
-                #     t.deserialized_length for t in tensor_items
-                # )
-                # shared_buffer_tensor = torch.empty(
-                #     (total_tensor_bytes,),
-                #     device="cpu",
-                #     dtype=torch.uint8,
-                #     pin_memory=True,
-                # )
-                # shared_buffer_mv: memoryview = (
-                #     shared_buffer_tensor.numpy().data.cast("B")
-                # )
 
             tensor_sizes_by_name: Dict[str, int] = {
                 t.name: t.deserialized_length for t in tensor_items
             }
 
-            arena = TensorDeserializer._TensorArena(max_tensor_bytes)
+            arena = TensorDeserializer._TensorArena(max_tensor_bytes, unsafe_self._free_unpinned_buffer_queue)
             tensors_read = 0
             while tensors_read < len(tensor_items):
                 if halt.load() > 0:
@@ -2725,7 +2735,7 @@ class TensorDeserializer(
                     if mv is None:
                         # arena is full! Put it on the queue and start a new one
                         cuda_transfer_in_queue.put(arena)
-                        arena = TensorDeserializer._TensorArena(max_tensor_bytes)
+                        arena = TensorDeserializer._TensorArena(max_tensor_bytes, unsafe_self._free_unpinned_buffer_queue)
                         mv: memoryview = arena.grab_space(needed_buffer_size)
                         assert mv is not None
                     if is_meta:
