@@ -2482,27 +2482,34 @@ class TensorDeserializer(
             self.headers: List[_TensorHeaderDeserializer] = []
             self.buffer_offset = 0
 
-            try:
-                seen_buffers = set()
-                while True:
-                    maybe_buffer = free_unpinned_buffer_queue.get_nowait()
-                    if id(maybe_buffer) in seen_buffers:
-                        print('Found no buffers after looking at', len(seen_buffers))
-                        raise queue.Empty()
-                    seen_buffers.add(id(maybe_buffer))
+            if True:
+                # start = time.perf_counter_ns()
+                try:
+                    seen_buffers = set()
+                    while True:
+                        maybe_buffer = free_unpinned_buffer_queue.get_nowait()
+                        if id(maybe_buffer) in seen_buffers:
+                            # print('Found no buffers after looking at', len(seen_buffers))
+                            raise queue.Empty()
+                        seen_buffers.add(id(maybe_buffer))
 
-                    if len(maybe_buffer) < buffer_size:
-                        free_unpinned_buffer_queue.put(maybe_buffer)
-                    else:
-                        # found one
-                        self.unpinned_buffer = maybe_buffer[:buffer_size]
-                        print('Reusing buffer')
-                        return
-            except queue.Empty:
-                pass
-            print('Making new buffer')
-            buffer = torch.empty((buffer_size,), dtype=torch.uint8)
-            self.unpinned_buffer: memoryview = memoryview(buffer.numpy().data.cast("B"))
+                        if len(maybe_buffer) < buffer_size:
+                            # too small
+                            free_unpinned_buffer_queue.put(maybe_buffer)
+                        else:
+                            # found one
+                            self.unpinned_buffer = maybe_buffer[:buffer_size]
+                            # end = time.perf_counter_ns()
+                            # print('Reusing buffer. spent', (end-start) / 1000000.0)
+                            return
+                except queue.Empty:
+                    pass
+                # end = time.perf_counter_ns()
+                # print('Making new buffer; spent', (end-start) / 1000000.0)
+            # buffer = torch.empty((buffer_size,), dtype=torch.uint8)
+            # buffer = bytearray(buffer_size)
+            buffer = _syscalls.malloc(buffer_size)
+            self.unpinned_buffer: memoryview = memoryview((ctypes.c_char * buffer_size).from_address(buffer))
         
         def grab_space(self, length: int) -> Optional[memoryview]:
             start = self.buffer_offset

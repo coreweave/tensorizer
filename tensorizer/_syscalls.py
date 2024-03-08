@@ -4,6 +4,7 @@ import errno
 __all__ = (
     "has_fallocate",
     "try_fallocate",
+    "malloc",
     "cudaHostRegister",
     "_load_cudaHostRegister"
 )
@@ -20,6 +21,9 @@ _IN: int = 1
 memcpy = _libc.memcpy
 memcpy.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
 
+malloc = _libc.malloc
+malloc.argtypes = (ctypes.c_size_t,)
+malloc.restype = ctypes.c_void_p
 
 def _errcheck(result, func, args) -> None:
     del args
