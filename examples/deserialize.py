@@ -1,13 +1,13 @@
 import argparse
 import os
 import time
+
 import torch
-from tensorizer import TensorDeserializer, DecryptionParams
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
 import tensorizer.serialization
-from tensorizer.utils import no_init_or_tensor, convert_bytes, get_mem_usage
-
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-
+from tensorizer import DecryptionParams, TensorDeserializer
+from tensorizer.utils import convert_bytes, get_mem_usage, no_init_or_tensor
 
 parser = argparse.ArgumentParser("deserialize")
 parser.add_argument("--source", default=None, help="local path or URL")
@@ -78,7 +78,7 @@ total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
 duration = end - start
 per_second = convert_bytes(deserializer.total_tensor_bytes / duration)
 deserializer.close()
-print(f"Deserialized {total_bytes_str} in {end - start:0.2f}s, {per_second}/s")
+print(f"Deserialized {total_bytes_str} in {duration:0.2f}s, {per_second}/s")
 print(f"Memory usage before: {before_mem}")
 print(f"Memory usage after: {after_mem}")
 
@@ -96,14 +96,21 @@ with torch.no_grad():
     )
 
 print(f"Output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
-perf_stats = tensorizer.serialization._get_perf_stats()
-print(
-    f"to CUDA stats: {perf_stats['cuda_bytes']} bytes in"
-    f" {perf_stats['cuda_to_device_secs']}s,"
-    f" {perf_stats['cuda_bytes']/perf_stats['cuda_to_device_secs']/1024/1024/1024:.3f} GiB/s"
-)
-print(
-    f"readinto stats: {perf_stats['file_readinto_bytes']} bytes in"
-    f" {perf_stats['file_readinto_secs']}s,"
-    f" {perf_stats['file_readinto_bytes']/perf_stats['file_readinto_secs']/1024/1024/1024:.3f} GiB/s"
-)
+
+if tensorizer.serialization._enable_perf_stats:
+    perf_stats = tensorizer.serialization._get_perf_stats()
+    to_device_bytes = perf_stats["tensor_to_device_bytes"]
+    to_device_secs = perf_stats["tensor_to_device_secs"]
+    to_device_speed = to_device_bytes / to_device_secs
+    readinto_bytes = perf_stats["file_readinto_bytes"]
+    readinto_secs = perf_stats["file_readinto_secs"]
+    readinto_speed = readinto_bytes / readinto_secs
+
+    print(
+        f"to CUDA stats: {to_device_bytes} bytes in"
+        f" {to_device_secs:.3f}s, {convert_bytes(to_device_speed, False)}/s"
+    )
+    print(
+        f"readinto stats: {readinto_bytes} bytes in"
+        f" {readinto_secs:.3f}s, {convert_bytes(readinto_speed, False)}/s"
+    )
