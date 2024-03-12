@@ -2470,7 +2470,6 @@ class TensorDeserializer(
                 for tensor_items in tensors_per_reader
             ]
             total_tensor_bytes: int = sum(max_sizes)
-            alloc_start = time.perf_counter_ns()
             shared_buffer_mmap = mmap.mmap(
                 -1,
                 total_tensor_bytes,
@@ -2492,10 +2491,6 @@ class TensorDeserializer(
                 total_tensor_bytes,
                 0,
             )
-            alloc_end = time.perf_counter_ns()
-            global alloc_times, alloc_bytes
-            alloc_times.append(alloc_end - alloc_start)
-            alloc_bytes.append(total_tensor_bytes)
             unregister = weakref.finalize(
                 shared_buffer_mv,
                 lambda src: cudart.cudaHostUnregister(
