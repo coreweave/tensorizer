@@ -154,12 +154,18 @@ def _can_prefault_with_madvise() -> bool:
 if _can_prefault_with_madvise():
 
     def prefault(address, length: int):
-        _madvise(address, length, _madv_populate_write)
+        try:
+            _madvise(address, length, _madv_populate_write)
+        finally:
+            del address
 
 else:
 
     def prefault(address, length: int):
-        ctypes.memset(address, 0x00, length)
+        try:
+            ctypes.memset(address, 0x00, length)
+        finally:
+            del address
 
 
 del _can_prefault_with_madvise

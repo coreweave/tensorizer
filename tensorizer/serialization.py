@@ -6,6 +6,7 @@ import abc
 import collections.abc
 import concurrent.futures
 import contextlib
+import ctypes
 import dataclasses
 import enum
 import functools
@@ -13,6 +14,7 @@ import hashlib
 import io
 import itertools
 import logging
+import mmap
 import operator
 import os
 import pathlib
@@ -50,6 +52,7 @@ import torch
 import tensorizer._crypt as _crypt
 import tensorizer._crypt_info as _crypt_info
 import tensorizer._linear_partition as _linear_partition
+import tensorizer._quick_alloc as _quick_alloc
 import tensorizer._syscalls as _syscalls
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
@@ -1509,6 +1512,12 @@ class TensorDeserializer(
                 )
             if is_cuda:
                 self._preload_cuda()
+            self._alloc_pool_threads = max(1, min(16, cpu_count - 1))
+            self._alloc_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._alloc_pool_threads,
+                thread_name_prefix="TensorizerAlloc",
+            )
+            self._cleanup.callback(self._alloc_pool.shutdown, wait=False)
 
             self._verify_hash = verify_hash
             if encryption is not None and not isinstance(
@@ -2455,9 +2464,62 @@ class TensorDeserializer(
         # So the flag is set by appending an element, and checked by its length
         halt: bytearray = bytearray()
 
-        for thread_idx, tensor_items in enumerate(tensors_per_reader):
+        if self._device.type == "cuda":
+            max_sizes: List[int] = [
+                max(t.deserialized_length for t in tensor_items)
+                for tensor_items in tensors_per_reader
+            ]
+            total_tensor_bytes: int = sum(max_sizes)
+            alloc_start = time.perf_counter_ns()
+            shared_buffer_mmap = mmap.mmap(
+                -1,
+                total_tensor_bytes,
+                flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+            )
+            _quick_alloc.prefault_mmap(
+                shared_buffer_mmap,
+                self._alloc_pool,
+                self._alloc_pool_threads,
+            )
+            shared_buffer_mv: memoryview = memoryview(shared_buffer_mmap)
+            cudart = torch.cuda.cudart()
+            cudart.cudaHostRegister(
+                ctypes.addressof(
+                    (ctypes.c_ubyte * total_tensor_bytes).from_buffer(
+                        shared_buffer_mmap
+                    )
+                ),
+                total_tensor_bytes,
+                0,
+            )
+            alloc_end = time.perf_counter_ns()
+            global alloc_times, alloc_bytes
+            alloc_times.append(alloc_end - alloc_start)
+            alloc_bytes.append(total_tensor_bytes)
+            unregister = weakref.finalize(
+                shared_buffer_mv,
+                lambda src: cudart.cudaHostUnregister(
+                    ctypes.addressof(
+                        (ctypes.c_ubyte * len(src)).from_buffer(src)
+                    )
+                ),
+                shared_buffer_mmap,
+            )
+            offsets = tuple(itertools.accumulate(max_sizes, initial=0))
+            shared_buffers = (
+                shared_buffer_mv[start:end]
+                for start, end in zip(offsets, offsets[1:])
+            )
+        else:
+            unregister = None
+            shared_buffers = itertools.repeat(None)
+
+        for (thread_idx, tensor_items), shared_mv in zip(
+            enumerate(tensors_per_reader), shared_buffers
+        ):
             future = self._reader_pool.submit(
                 self._copy_thread,
+                shared_mv,
                 thread_idx,
                 halt,
                 barrier,
@@ -2477,9 +2539,13 @@ class TensorDeserializer(
             # error occurred; halt
             halt.append(1)
             raise
+        finally:
+            if unregister is not None:
+                unregister()
 
     def _copy_thread(
         unsafe_self,
+        shared_mv: Optional[memoryview],
         thread_idx: int,
         halt: bytearray,
         barrier: threading.Barrier,
@@ -2539,18 +2605,15 @@ class TensorDeserializer(
             shared_buffer_tensor: Optional[torch.Tensor] = None
             shared_buffer_mv: Optional[memoryview] = None
             if is_cuda:
-                total_tensor_bytes: int = max(
-                    t.deserialized_length for t in tensor_items
-                )
-                shared_buffer_tensor = torch.empty(
-                    (total_tensor_bytes,),
-                    device="cpu",
-                    dtype=torch.uint8,
-                    pin_memory=True,
-                )
-                shared_buffer_mv: memoryview = (
-                    shared_buffer_tensor.numpy().data.cast("B")
-                )
+                if shared_mv is None:
+                    raise RuntimeError("Missing shared buffer")
+                shared_buffer_mv = shared_mv
+                shared_buffer_tensor = _NumpyTensor.from_buffer(
+                    "<u1",
+                    "torch.uint8",
+                    shared_buffer_mv.shape,
+                    shared_buffer_mv,
+                ).to_tensor()
 
             tensor_sizes_by_name: Dict[str, int] = {
                 t.name: t.deserialized_length for t in tensor_items
