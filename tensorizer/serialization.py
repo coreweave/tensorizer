@@ -2462,10 +2462,42 @@ class TensorDeserializer(
         # So the flag is set by appending an element, and checked by its length
         halt: bytearray = bytearray()
 
+        if self._device.type == 'cuda':
+            max_tensor_bytes = max(t.deserialized_length for t in tensor_info)
+            num_transfer_threads = 2
+            cuda_transfer_in_queue = queue.SimpleQueue()
+            transfer_threads = [
+                threading.Thread(
+                    name=f'CudaTransfer-{i}',
+                    target=self._cuda_transfer_thread,
+                    args=(
+                        self._device,
+                        self._dtype,
+                        max_tensor_bytes,
+                        cuda_transfer_in_queue,
+                        transfer_out_queue,
+                        self._free_unpinned_buffer_queue
+                    ),
+                )
+                for i in range(num_transfer_threads)
+            ]
+            [t.start() for t in transfer_threads]
+        else:
+            cuda_transfer_in_queue = None
+
+        def finish_transfer_queues():
+            print("Finish transfer queues")
+            if cuda_transfer_in_queue is not None:
+                for _ in transfer_threads:
+                    cuda_transfer_in_queue.put(None)
+        
+        done_barrier = threading.Barrier(len(tensors_per_reader), action=finish_transfer_queues)
         for thread_idx, tensor_items in enumerate(tensors_per_reader):
             future = self._reader_pool.submit(
                 self._copy_thread,
                 thread_idx,
+                done_barrier,
+                cuda_transfer_in_queue,
                 halt,
                 verify_hash,
                 tensor_items,
@@ -2501,7 +2533,7 @@ class TensorDeserializer(
             self.headers: List[_TensorHeaderDeserializer] = []
             self.buffer_offset = 0
 
-            if True:
+            if False:
                 # start = time.perf_counter_ns()
                 try:
                     seen_buffers = set()
@@ -2569,17 +2601,28 @@ class TensorDeserializer(
         cuda_stream = torch.cuda.Stream(cuda_device)
 
         # Allocate a pinned buffer
-        pinned_buffer_tensor = torch.empty((buffer_size,), dtype=torch.uint8)
-        pinned_buffer_mv: memoryview = pinned_buffer_tensor.numpy().data.cast(
-            "B"
-        )
-        pinned_buffer_ptr = pinned_buffer_tensor.data_ptr()
+        if False:
+            pinned_buffer_tensor = torch.empty((buffer_size,), dtype=torch.uint8)
+            pinned_buffer_mv: memoryview = pinned_buffer_tensor.numpy().data.cast(
+                "B"
+            )
+            pinned_buffer_ptr = pinned_buffer_tensor.data_ptr()
+        else:
+            # TODO: reuse Arena, and just pin it
+            m = mmap.mmap(-1, buffer_size, flags=mmap.MAP_PRIVATE)
+            pinned_buffer_mv: memoryview = memoryview(m)
+            pinned_buffer_ptr = ctypes.addressof((ctypes.c_char * buffer_size).from_buffer(m))
+            _syscalls.prefault(pinned_buffer_ptr, buffer_size)
+
         res = _syscalls.cudaHostRegister(pinned_buffer_ptr, buffer_size, 0)
         assert res == 0  # TODO: return exception
+
+        memcpy_time = 0
 
         while True:
             arena = in_queue.get()
             if arena is None:
+                print("Transfer queue done. memcpy time", memcpy_time * 1e-9, 's')
                 break
 
             assert len(arena.unpinned_buffer) <= buffer_size
@@ -2593,7 +2636,10 @@ class TensorDeserializer(
             # pinned_buffer_mv[:len(arena.unpinned_buffer)] = arena.unpinned_buffer
             src = arena_buffer_start
             dst = pinned_buffer_ptr
+            start = time.perf_counter_ns()
             _syscalls.memcpy(dst, src, len(arena.unpinned_buffer))
+            memcpy_time += time.perf_counter_ns() - start
+
             free_unpinned_buffer_queue.put(arena.unpinned_buffer)
 
             results: List[TensorDeserializer._CopiedData] = []
@@ -2636,6 +2682,8 @@ class TensorDeserializer(
     def _copy_thread(
         unsafe_self,
         thread_idx: int,
+        done_barrier: threading.Barrier,
+        cuda_transfer_in_queue: "queue.SimpleQueue[Optional[_TensorArena]]",
         halt: bytearray,
         verify_hash: bool,
         tensor_items: Sequence[TensorEntry],
@@ -2646,22 +2694,6 @@ class TensorDeserializer(
         max_tensor_bytes: int = max(t.deserialized_length for t in tensor_items)
 
         is_cuda = unsafe_self._device.type == "cuda"
-        if is_cuda:
-            cuda_transfer_in_queue = queue.SimpleQueue()
-
-            cuda_transfer_thread = threading.Thread(
-                name=f"CudaTransfer-{thread_idx}",
-                target=TensorDeserializer._cuda_transfer_thread,
-                args=(
-                    unsafe_self._device,
-                    unsafe_self._dtype,
-                    max_tensor_bytes,
-                    cuda_transfer_in_queue,
-                    transfer_out_queue,
-                    unsafe_self._free_unpinned_buffer_queue,
-                ),
-            )
-            cuda_transfer_thread.start()
 
         begin_offset = tensor_items[0].offset
         # End offsets for range requests include the final byte
@@ -2856,8 +2888,6 @@ class TensorDeserializer(
             # del shared_buffer_tensor, shared_buffer_mv
             transfer_out_queue.put(e)
         finally:
-            if is_cuda:
-                cuda_transfer_in_queue.put(None)
             if file_ is not None and file_ is not unsafe_self._file:
                 bytes_read = getattr(file_, "bytes_read", 0)
                 file_.close()
@@ -2868,6 +2898,7 @@ class TensorDeserializer(
                 with _perf_stats.lock:
                     _perf_stats.file_readinto_ns += readinto_duration
                     _perf_stats.file_readinto_bytes += readinto_bytes
+            done_barrier.wait()
 
     def load_into_module(
         self,
