@@ -15,6 +15,7 @@ import hashlib
 import io
 import itertools
 import logging
+import mmap
 import operator
 import os
 import pathlib
@@ -2526,9 +2527,12 @@ class TensorDeserializer(
                 # print('Making new buffer; spent', (end-start) / 1000000.0)
             # buffer = torch.empty((buffer_size,), dtype=torch.uint8)
             # buffer = bytearray(buffer_size)
-            buffer = _syscalls.malloc(buffer_size)
+            # buffer = _syscalls.malloc(buffer_size)
+            m = mmap.mmap(-1, buffer_size, flags=mmap.MAP_PRIVATE)
+            addr = (ctypes.c_char * buffer_size).from_buffer(m)
+            _syscalls.prefault(addr, buffer_size)
             self.unpinned_buffer: memoryview = memoryview(
-                (ctypes.c_char * buffer_size).from_address(buffer)
+                addr
             )
 
         def grab_space(self, length: int) -> Optional[memoryview]:
