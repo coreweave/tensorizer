@@ -1,12 +1,13 @@
 import ctypes
 import errno
+import mmap
 
 __all__ = (
     "has_fallocate",
     "try_fallocate",
     "malloc",
     "cudaHostRegister",
-    "_load_cudaHostRegister"
+    "_load_cudaHostRegisterprefault",
 )
 
 
@@ -24,6 +25,7 @@ memcpy.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
 malloc = _libc.malloc
 malloc.argtypes = (ctypes.c_size_t,)
 malloc.restype = ctypes.c_void_p
+
 
 def _errcheck(result, func, args) -> None:
     del args
@@ -108,16 +110,90 @@ def try_fallocate(
 
 
 _cudaHostRegister = None
+
+
 def _load_cudaHostRegister():
     global _cudaHostRegister
     if _cudaHostRegister is None:
         libcudart = ctypes.CDLL(None)
         _cudaHostRegister = libcudart.cudaHostRegister
-        _cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+        _cudaHostRegister.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
 
 
-def cudaHostRegister(ptr: ctypes.c_void_p, size: ctypes.c_size_t, flags: ctypes.c_uint) -> None:
+def cudaHostRegister(
+    ptr: ctypes.c_void_p, size: ctypes.c_size_t, flags: ctypes.c_uint
+) -> None:
     global _cudaHostRegister
     if _cudaHostRegister is None:
         _load_cudaHostRegister()
     return _cudaHostRegister(ptr, size, flags)
+
+
+def _get_madvise():
+    from ctypes import CFUNCTYPE, c_int, c_size_t, c_void_p
+
+    prototype = CFUNCTYPE(
+        c_int,
+        c_void_p,
+        c_size_t,
+        c_int,
+        use_errno=True,
+    )
+    paramflags = (
+        (_IN, "addr"),
+        (_IN, "length"),
+        (_IN, "advice"),
+    )
+
+    try:
+        _func = prototype(("madvise", _libc), paramflags)
+    except AttributeError:
+        return None
+    _func.errcheck = _errcheck
+
+    return _func
+
+
+_madvise = _get_madvise()
+del _get_madvise
+
+_madv_populate_write: int = 23
+
+
+def _can_prefault_with_madvise() -> bool:
+    if _madvise is None or _libc is ctypes.pythonapi:
+        # If _libc is ctypes.pythonapi then the call would hold the GIL
+        return False
+    n: int = mmap.PAGESIZE
+    private: int = getattr(mmap, "MAP_PRIVATE", 0)
+    flags = {} if private == 0 else {"flags": private}
+    with mmap.mmap(-1, n, **flags) as m:
+        try:
+            # MADV_POPULATE_WRITE is only available on Linux 5.14 and up
+            _madvise(
+                ctypes.byref((ctypes.c_ubyte * n).from_buffer(m)),
+                n,
+                _madv_populate_write,
+            )
+        except OSError:
+            return False
+        else:
+            return True
+
+
+if _can_prefault_with_madvise():
+
+    def prefault(address, length: int):
+        _madvise(address, length, _madv_populate_write)
+
+else:
+
+    def prefault(address, length: int):
+        ctypes.memset(address, 0x00, length)
+
+
+del _can_prefault_with_madvise

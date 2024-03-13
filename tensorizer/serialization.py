@@ -48,7 +48,6 @@ from typing import (
 import numpy
 import redis
 import torch
-from atomics.base import AtomicUint
 
 import tensorizer._crypt as _crypt
 import tensorizer._crypt_info as _crypt_info
@@ -66,21 +65,21 @@ from tensorizer._NumpyTensor import _NumpyTensor
 
 @dataclasses.dataclass
 class _PerfStats:
-    file_readinto_millisecs: AtomicUint = dataclasses.field(
-        default_factory=lambda: AtomicUint(width=8)
-    )
-    file_readinto_bytes: AtomicUint = dataclasses.field(
-        default_factory=lambda: AtomicUint(width=8)
-    )
-    cuda_to_device_millisecs: AtomicUint = dataclasses.field(
-        default_factory=lambda: AtomicUint(width=8)
-    )
-    cuda_bytes: AtomicUint = dataclasses.field(
-        default_factory=lambda: AtomicUint(width=8)
+    file_readinto_ns: int = 0
+    file_readinto_bytes: int = 0
+    tensor_to_device_ns: int = 0
+    tensor_to_device_bytes: int = 0
+    lock: threading.Lock = dataclasses.field(
+        init=False,
+        repr=False,
+        hash=False,
+        compare=False,
+        default_factory=threading.Lock,
     )
 
 
-_perf_stats = _PerfStats()
+_enable_perf_stats: bool = bool(os.environ.get("TENSORIZER_ENABLE_PERF_STATS"))
+_perf_stats = _PerfStats() if _enable_perf_stats else None
 
 lz4 = None
 
@@ -1553,7 +1552,8 @@ class TensorDeserializer(
             self._cleanup.callback(self._file.close)
             self.total_compressed_tensor_bytes = 0
             self.read_bytes = 0
-            self._ephemeral_bytes_read = AtomicUint(width=8)
+            self._ephemeral_bytes_read: int = 0
+            self._ephemeral_bytes_read_lock = threading.Lock()
             self._last_yielded_key: Optional[str] = None
 
             self._dtype: Optional[torch.dtype] = dtype
@@ -1834,7 +1834,7 @@ class TensorDeserializer(
     @property
     def total_bytes_read(self) -> int:
         if hasattr(self._file, "bytes_read"):
-            return self._file.bytes_read + self._ephemeral_bytes_read.load()
+            return self._file.bytes_read + self._ephemeral_bytes_read
         if self._file.closed:
             # Caution: This case is an underestimate because it doesn't include
             # any metadata read, unlike the other cases.
@@ -2315,13 +2315,14 @@ class TensorDeserializer(
     def _to_torch_parameter(
         device: str,
         target_dtype: Optional[torch.dtype],
-        tensor: Union[torch.Tensor, torch.nn.Parameter]
+        tensor: Union[torch.Tensor, torch.nn.Parameter],
     ) -> torch.nn.Parameter:
         """
         Convert a tensor to a torch.nn.Parameter on a device, forcing
         gradient when appropriate. We also handle torch.nn.Parameter objects in
         a passthrough manner.
         """
+        original_device: torch.device = tensor.device
         if isinstance(tensor, torch.nn.Parameter):
             tensor.data = tensor.data.to(device, non_blocking=True)
             if tensor.grad is not None:
@@ -2338,17 +2339,22 @@ class TensorDeserializer(
 
         gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
-        start = time.perf_counter()
-        # TODO: may need to adjust non_blocking for non-cuda devices
-        tensor_on_device = tensor.to(device=device, dtype=target_dtype, non_blocking=True)
-        duration = time.perf_counter() - start
-        _perf_stats.cuda_to_device_millisecs.add(int(1000.0 * duration))
+        start = time.perf_counter_ns() if _perf_stats else 0
+        tensor_on_device = tensor.to(
+            device=device, dtype=target_dtype, non_blocking=True
+        )
+        end = time.perf_counter_ns() if _perf_stats else 0
 
         result = torch.nn.Parameter(
             tensor_on_device,
             requires_grad=gradient,
         )
-        _perf_stats.cuda_bytes.add(result.element_size() * result.nelement())
+        if _perf_stats and original_device != result.device:
+            duration = end - start
+            bytes_transferred = result.element_size() * result.nelement()
+            with _perf_stats.lock:
+                _perf_stats.tensor_to_device_ns += duration
+                _perf_stats.tensor_to_device_bytes += bytes_transferred
         return result
 
     def _generate_state_dict(self) -> None:
@@ -2450,7 +2456,10 @@ class TensorDeserializer(
         transfer_out_queue = queue.SimpleQueue()
 
         futures: List[concurrent.futures.Future] = []
-        halt = AtomicUint(width=4)
+
+        # Essentially a mutable atomic flag; bytearray operations are atomic,
+        # So the flag is set by appending an element, and checked by its length
+        halt: bytearray = bytearray()
 
         for thread_idx, tensor_items in enumerate(tensors_per_reader):
             future = self._reader_pool.submit(
@@ -2471,13 +2480,22 @@ class TensorDeserializer(
                 yield copied_data
         except BaseException:
             # error occurred; halt
-            halt.store(1)
+            halt.append(1)
             raise
 
-    
     class _TensorArena:
-        __slots__ = ['unpinned_buffer', 'numpy_tensors', 'headers', 'buffer_offset']
-        def __init__(self, buffer_size: int, free_unpinned_buffer_queue: "queue.Queue[memoryview]"):
+        __slots__ = [
+            "unpinned_buffer",
+            "numpy_tensors",
+            "headers",
+            "buffer_offset",
+        ]
+
+        def __init__(
+            self,
+            buffer_size: int,
+            free_unpinned_buffer_queue: "queue.Queue[memoryview]",
+        ):
             self.numpy_tensors: List[_NumpyTensor] = []
             self.headers: List[_TensorHeaderDeserializer] = []
             self.buffer_offset = 0
@@ -2509,8 +2527,10 @@ class TensorDeserializer(
             # buffer = torch.empty((buffer_size,), dtype=torch.uint8)
             # buffer = bytearray(buffer_size)
             buffer = _syscalls.malloc(buffer_size)
-            self.unpinned_buffer: memoryview = memoryview((ctypes.c_char * buffer_size).from_address(buffer))
-        
+            self.unpinned_buffer: memoryview = memoryview(
+                (ctypes.c_char * buffer_size).from_address(buffer)
+            )
+
         def grab_space(self, length: int) -> Optional[memoryview]:
             start = self.buffer_offset
             end = start + length
@@ -2518,7 +2538,7 @@ class TensorDeserializer(
                 # out of space
                 return None
             self.buffer_offset = end
-            return self.unpinned_buffer[start: end]
+            return self.unpinned_buffer[start:end]
 
     @staticmethod
     def _cuda_transfer_thread(
@@ -2546,8 +2566,8 @@ class TensorDeserializer(
 
         # Allocate a pinned buffer
         pinned_buffer_tensor = torch.empty((buffer_size,), dtype=torch.uint8)
-        pinned_buffer_mv: memoryview = (
-            pinned_buffer_tensor.numpy().data.cast("B")
+        pinned_buffer_mv: memoryview = pinned_buffer_tensor.numpy().data.cast(
+            "B"
         )
         pinned_buffer_ptr = pinned_buffer_tensor.data_ptr()
         res = _syscalls.cudaHostRegister(pinned_buffer_ptr, buffer_size, 0)
@@ -2562,7 +2582,9 @@ class TensorDeserializer(
 
             # copy the data from the unpinned buffer to the pinned buffer
 
-            arena_buffer_start = ctypes.addressof((ctypes.c_char * 1).from_buffer(arena.unpinned_buffer))
+            arena_buffer_start = ctypes.addressof(
+                (ctypes.c_char * 1).from_buffer(arena.unpinned_buffer)
+            )
 
             # pinned_buffer_mv[:len(arena.unpinned_buffer)] = arena.unpinned_buffer
             src = arena_buffer_start
@@ -2572,7 +2594,12 @@ class TensorDeserializer(
 
             results: List[TensorDeserializer._CopiedData] = []
             for numpy_tensor, header in zip(arena.numpy_tensors, arena.headers):
-                offset = ctypes.addressof((ctypes.c_char * 1).from_buffer(numpy_tensor.data)) - arena_buffer_start
+                offset = (
+                    ctypes.addressof(
+                        (ctypes.c_char * 1).from_buffer(numpy_tensor.data)
+                    )
+                    - arena_buffer_start
+                )
                 assert offset >= 0
 
                 new_numpy_tensor = _NumpyTensor.from_buffer(
@@ -2580,19 +2607,23 @@ class TensorDeserializer(
                     torch_dtype=numpy_tensor.torch_dtype,
                     shape_list=numpy_tensor.data.shape,
                     buffer=pinned_buffer_mv,
-                    offset=offset # TODO: is offset ok? or should we just offset the mv itself
+                    offset=offset,  # TODO: is offset ok? or should we just offset the mv itself
                 )
 
                 tensor = new_numpy_tensor.to_tensor()
                 with torch.cuda.stream(cuda_stream):
-                    parameter = TensorDeserializer._to_torch_parameter(cuda_device, target_dtype, tensor)
+                    parameter = TensorDeserializer._to_torch_parameter(
+                        cuda_device, target_dtype, tensor
+                    )
 
-                results.append(TensorDeserializer._CopiedData(
-                    header = header,
-                    numpy_tensor = new_numpy_tensor,
-                    parameter = parameter
-                ))
-                
+                results.append(
+                    TensorDeserializer._CopiedData(
+                        header=header,
+                        numpy_tensor=new_numpy_tensor,
+                        parameter=parameter,
+                    )
+                )
+
             cuda_stream.synchronize()
 
             for result in results:
@@ -2601,16 +2632,14 @@ class TensorDeserializer(
     def _copy_thread(
         unsafe_self,
         thread_idx: int,
-        halt: AtomicUint,
+        halt: bytearray,
         verify_hash: bool,
         tensor_items: Sequence[TensorEntry],
         transfer_out_queue: "queue.SimpleQueue[Union[Exception, _CopiedData]]",
     ):
         # TODO: get rid of self or more safely have thread-local storage
 
-        max_tensor_bytes: int = max(
-            t.deserialized_length for t in tensor_items
-        )
+        max_tensor_bytes: int = max(t.deserialized_length for t in tensor_items)
 
         is_cuda = unsafe_self._device.type == "cuda"
         if is_cuda:
@@ -2625,7 +2654,7 @@ class TensorDeserializer(
                     max_tensor_bytes,
                     cuda_transfer_in_queue,
                     transfer_out_queue,
-                    unsafe_self._free_unpinned_buffer_queue
+                    unsafe_self._free_unpinned_buffer_queue,
                 ),
             )
             cuda_transfer_thread.start()
@@ -2637,6 +2666,7 @@ class TensorDeserializer(
         )
 
         file_ = None
+        readinto_duration = readinto_bytes = 0
 
         try:
             if thread_idx != 0:
@@ -2673,10 +2703,12 @@ class TensorDeserializer(
                 t.name: t.deserialized_length for t in tensor_items
             }
 
-            arena = TensorDeserializer._TensorArena(max_tensor_bytes, unsafe_self._free_unpinned_buffer_queue)
+            arena = TensorDeserializer._TensorArena(
+                max_tensor_bytes, unsafe_self._free_unpinned_buffer_queue
+            )
             tensors_read = 0
             while tensors_read < len(tensor_items):
-                if halt.load() > 0:
+                if halt:
                     break
 
                 header = _TensorHeaderDeserializer.from_io(
@@ -2742,7 +2774,10 @@ class TensorDeserializer(
                     if mv is None:
                         # arena is full! Put it on the queue and start a new one
                         cuda_transfer_in_queue.put(arena)
-                        arena = TensorDeserializer._TensorArena(max_tensor_bytes, unsafe_self._free_unpinned_buffer_queue)
+                        arena = TensorDeserializer._TensorArena(
+                            max_tensor_bytes,
+                            unsafe_self._free_unpinned_buffer_queue,
+                        )
                         mv: memoryview = arena.grab_space(needed_buffer_size)
                         assert mv is not None
                     if is_meta:
@@ -2761,7 +2796,7 @@ class TensorDeserializer(
                     del buffer_tensor
 
                 if not is_meta:
-                    start = time.perf_counter_ns()
+                    start = time.perf_counter_ns() if _perf_stats else 0
 
                     if unsafe_self._encrypted and mv.nbytes > 0:
                         TensorDeserializer._stream_decrypt(
@@ -2779,9 +2814,10 @@ class TensorDeserializer(
                             header.name, header.hashes, header_hashes, mv
                         )
 
-                    duration = time.perf_counter_ns() - start
-                    _perf_stats.file_readinto_millisecs.add(duration // 1000000)
-                    _perf_stats.file_readinto_bytes.add(mv.nbytes)
+                    readinto_duration += (
+                        time.perf_counter_ns() - start if _perf_stats else 0
+                    )
+                    readinto_bytes += mv.nbytes
 
                 # create a tensor around it and maybe torch.to('cuda')
                 numpy_tensor = _NumpyTensor.from_buffer(
@@ -2822,7 +2858,12 @@ class TensorDeserializer(
                 bytes_read = getattr(file_, "bytes_read", 0)
                 file_.close()
                 if bytes_read:
-                    unsafe_self._ephemeral_bytes_read.add(bytes_read)
+                    with unsafe_self._ephemeral_bytes_read_lock:
+                        unsafe_self._ephemeral_bytes_read += bytes_read
+            if _perf_stats and (readinto_duration or readinto_bytes):
+                with _perf_stats.lock:
+                    _perf_stats.file_readinto_ns += readinto_duration
+                    _perf_stats.file_readinto_bytes += readinto_bytes
 
     def load_into_module(
         self,
@@ -4121,11 +4162,12 @@ class TensorSerializer:
 
 
 def _get_perf_stats():
-    return dict(
-        cuda_to_device_secs=float(_perf_stats.cuda_to_device_millisecs.load())
-        / 1000.0,
-        cuda_bytes=_perf_stats.cuda_bytes.load(),
-        file_readinto_secs=float(_perf_stats.file_readinto_millisecs.load())
-        / 1000.0,
-        file_readinto_bytes=_perf_stats.file_readinto_bytes.load(),
-    )
+    if _perf_stats is None:
+        raise RuntimeError("Performance stats are not enabled")
+    with _perf_stats.lock:
+        return dict(
+            tensor_to_device_secs=_perf_stats.tensor_to_device_ns * 1e-9,
+            tensor_to_device_bytes=_perf_stats.tensor_to_device_bytes,
+            file_readinto_secs=_perf_stats.file_readinto_ns * 1e-9,
+            file_readinto_bytes=_perf_stats.file_readinto_bytes,
+        )
