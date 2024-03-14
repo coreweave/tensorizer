@@ -6,6 +6,7 @@ import abc
 import collections.abc
 import concurrent.futures
 import contextlib
+import ctypes
 import dataclasses
 import enum
 import functools
@@ -43,6 +44,8 @@ from typing import (
     Union,
 )
 
+import cupy
+import kvikio
 import numpy
 import redis
 import torch
@@ -89,6 +92,18 @@ __all__ = [
     "EncryptionParams",
     "DecryptionParams",
 ]
+
+_np_to_torch_dtype = {
+    numpy.dtype(bool): torch.bool,
+    numpy.dtype(numpy.uint8): torch.uint8,   
+    numpy.dtype(numpy.int8):  torch.int8,    
+    numpy.dtype(numpy.int16): torch.int16,   
+    numpy.dtype(numpy.int32): torch.int32,   
+    numpy.dtype(numpy.int64): torch.int64,   
+    numpy.dtype(numpy.float16): torch.float16,
+    numpy.dtype(numpy.float32): torch.float32,
+    numpy.dtype(numpy.float64): torch.float64,
+}
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -1460,7 +1475,7 @@ class TensorDeserializer(
     class _CopiedData:
         __slots__ = ("header", "numpy_tensor", "parameter")
         header: _TensorHeaderDeserializer
-        numpy_tensor: _NumpyTensor
+        numpy_tensor: Optional[_NumpyTensor]  # only when device='cpu'
         parameter: torch.nn.Parameter
 
     def __init__(
@@ -2505,6 +2520,7 @@ class TensorDeserializer(
         )
 
         file_ = None
+        cufile = None
         readinto_duration = readinto_bytes = 0
 
         try:
@@ -2533,24 +2549,10 @@ class TensorDeserializer(
                 file_ = unsafe_self._file
                 file_.seek(begin_offset)
 
+            cufile = kvikio.CuFile(file_.name, "r")
+
             # create CPU-pinned memory buffer
             # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
-
-            shared_buffer_tensor: Optional[torch.Tensor] = None
-            shared_buffer_mv: Optional[memoryview] = None
-            if is_cuda:
-                total_tensor_bytes: int = max(
-                    t.deserialized_length for t in tensor_items
-                )
-                shared_buffer_tensor = torch.empty(
-                    (total_tensor_bytes,),
-                    device="cpu",
-                    dtype=torch.uint8,
-                    pin_memory=True,
-                )
-                shared_buffer_mv: memoryview = (
-                    shared_buffer_tensor.numpy().data.cast("B")
-                )
 
             tensor_sizes_by_name: Dict[str, int] = {
                 t.name: t.deserialized_length for t in tensor_items
@@ -2622,8 +2624,12 @@ class TensorDeserializer(
 
                 if is_cuda:
                     if is_meta:
+                        # TODO
                         shared_buffer_tensor[:needed_buffer_size].zero_()
-                    mv: memoryview = shared_buffer_mv[:needed_buffer_size]
+                    buffer_tensor = torch.empty(
+                        (needed_buffer_size,), device='cuda', dtype=torch.uint8
+                    )
+                    mv = buffer_tensor.data
                 else:
                     # Not in CUDA, no pinned memory.
                     # Allocate a new buffer for each tensor
@@ -2648,7 +2654,10 @@ class TensorDeserializer(
                             mv,
                         )
                     else:
-                        file_.readinto(mv)
+                        # print(needed_buffer_size, len(mv))
+                        future = cufile.pread(mv, len(mv), file_.tell())
+                        file_.seek(len(mv), io.SEEK_CUR)
+                        # file_.readinto(mv)
 
                     if verify_hash:
                         unsafe_self._verify_hashes(
@@ -2661,14 +2670,18 @@ class TensorDeserializer(
                     readinto_bytes += mv.nbytes
 
                 # create a tensor around it and maybe torch.to('cuda')
-                numpy_tensor = _NumpyTensor.from_buffer(
-                    numpy_dtype,
-                    torch_dtype,
-                    header.shape,
-                    mv,
-                )
-                del mv
-                tensor = numpy_tensor.to_tensor()
+                future_result = future.get()
+                #numpy_tensor = _NumpyTensor.from_buffer(
+                #    numpy_dtype,
+                #    torch_dtype,
+                #    header.shape,
+                #    memoryview((ctypes.c_char * mv.nbytes).from_address(mv.data_ptr())),
+                #)
+                # del mv
+                numpy_tensor = None
+                if torch_dtype is None:
+                    torch_dtype = _np_to_torch_dtype[numpy.dtype(numpy_dtype)]
+                tensor = buffer_tensor.view(torch_dtype).view(header.shape)
 
                 stream_context = (
                     torch.cuda.stream(cuda_stream)
@@ -2688,7 +2701,6 @@ class TensorDeserializer(
                 )
                 tensors_read += 1
         except Exception as e:
-            del shared_buffer_tensor, shared_buffer_mv
             transfer_out_queue.put(e)
         finally:
             if file_ is not None and file_ is not unsafe_self._file:
