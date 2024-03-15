@@ -2899,6 +2899,11 @@ class TensorSerializer:
             can be a S3 URI.
         encryption: An `EncryptionParams` object holding a password or key
             to use for encryption. If None, no encryption will be used.
+        limit_cpu_concurrency: If not ``None`` (the default), try to limit
+            CPU-bound thread pools to at most this many worker threads each.
+            There are multiple thread pools, so the number of total threads
+            will exceed this number. The default limits are based on the CPU
+            count or the active cgroups CPU resource limit if applicable.
         compress_tensors: Not implemented. Specifying this option does nothing.
             Previously, if True, compress the tensors using lz4. This
             exists as an internal curiosity as it doesn't seem to make
@@ -2946,12 +2951,26 @@ class TensorSerializer:
         compress_tensors: bool = False,
         *,
         encryption: Optional[EncryptionParams] = None,
+        limit_cpu_concurrency: Optional[int] = None,
     ) -> None:
         if isinstance(file_obj, (str, bytes, os.PathLike, int)):
             self._file = stream_io.open_stream(file_obj, "wb+")
         else:
             self._mode_check(file_obj)
             self._file = file_obj
+
+        if limit_cpu_concurrency is not None:
+            if not isinstance(limit_cpu_concurrency, int):
+                raise TypeError(
+                    "limit_cpu_concurrency parameter: expected int or None,"
+                    f" {limit_cpu_concurrency.__class__.__name__} found"
+                )
+            if limit_cpu_concurrency < 1:
+                raise ValueError(
+                    "limit_cpu_concurrency parameter: must be positive"
+                    f" (or None for unbound), got {limit_cpu_concurrency}"
+                )
+        self.cpu_limit: int = limit_cpu_concurrency or cpu_count
 
         if encryption is not None and not isinstance(
             encryption, EncryptionParams
@@ -3006,7 +3025,7 @@ class TensorSerializer:
         # multithreading in spite of the GIL because CPython's hash function
         # implementations release the GIL during longer hash computations.
         self._computation_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=cpu_count,
+            max_workers=self.cpu_limit,
             thread_name_prefix="TensorizerComputation",
         )
         self._pools.append(self._computation_pool)
@@ -3172,7 +3191,7 @@ class TensorSerializer:
         raise RuntimeError("pwrite was called before being initialized")
 
     @staticmethod
-    def _mv_suffix(data, start: int):
+    def _mv_suffix(data: "collections.abc.Buffer", start: int):
         if not isinstance(data, memoryview):
             data = memoryview(data)
         try:
