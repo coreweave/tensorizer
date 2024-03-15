@@ -902,8 +902,7 @@ class EncryptionParams:
         __slots__ = ()
 
         @abc.abstractmethod
-        def chunk(self) -> _crypt_info.KeyDerivationChunk:
-            ...
+        def chunk(self) -> _crypt_info.KeyDerivationChunk: ...
 
     @dataclasses.dataclass
     class _FromStringPWHashAlgorithm(_Algorithm):
