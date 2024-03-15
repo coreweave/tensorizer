@@ -281,7 +281,7 @@ Model = TypeVar("Model")
 
 
 def no_init_or_tensor(
-    loading_code: Optional[Callable[..., Model]] = None
+    loading_code: Optional[Callable[..., Model]] = None,
 ) -> Union[Model, ContextManager]:
     """
     Suppress the initialization of weights while loading a model.

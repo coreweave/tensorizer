@@ -65,7 +65,7 @@ def _get_s3cfg_values(
         Union[
             Tuple[Union[str, bytes, os.PathLike], ...], str, bytes, os.PathLike
         ]
-    ] = None
+    ] = None,
 ) -> _ParsedCredentials:
     """
     Gets S3 credentials from the .s3cfg file.

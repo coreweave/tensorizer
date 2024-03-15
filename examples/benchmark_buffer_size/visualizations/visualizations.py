@@ -478,7 +478,7 @@ def plot(
 def simple_plot(
     filename: Optional[Union[str, os.PathLike]] = (
         out_dir / "tensorizer-deserialization"
-    )
+    ),
 ):
     # Filter to the fewest variables possible
     filtered_schemes = ("s3", "redis", "s3s", "https")

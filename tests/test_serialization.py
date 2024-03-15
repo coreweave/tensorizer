@@ -989,8 +989,7 @@ class TestDeserialization(unittest.TestCase):
                 " or matches all tensor names."
                 " Update the pattern and/or custom_check"
                 " to use more informative filtering criteria."
-                "\n\nTensors present in the model: "
-                + " ".join(all_keys)
+                "\n\nTensors present in the model: " + " ".join(all_keys)
             ),
         )
 
