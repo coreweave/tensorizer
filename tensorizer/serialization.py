@@ -21,6 +21,7 @@ import stat
 import struct
 import threading
 import time
+import types
 import typing
 import weakref
 import zlib
@@ -51,6 +52,7 @@ import tensorizer._crypt as _crypt
 import tensorizer._crypt_info as _crypt_info
 import tensorizer._linear_partition as _linear_partition
 import tensorizer._syscalls as _syscalls
+import tensorizer._tensor_path as _tensor_path
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
 from tensorizer._crypt._cgroup_cpu_count import (
@@ -59,6 +61,21 @@ from tensorizer._crypt._cgroup_cpu_count import (
 from tensorizer._internal_utils import Chunked as _Chunked
 from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor
+from tensorizer._tensor_path import (
+    _TensorPath,
+    _TensorPathComponent,
+    _TensorPathRegistry,
+)
+
+__all__ = [
+    "TensorSerializer",
+    "TensorDeserializer",
+    "TensorType",
+    "CryptographyError",
+    "EncryptionParams",
+    "DecryptionParams",
+    "FilterFuncType",
+]
 
 
 @dataclasses.dataclass
@@ -81,21 +98,24 @@ _perf_stats = _PerfStats() if _enable_perf_stats else None
 
 lz4 = None
 
-__all__ = [
-    "TensorSerializer",
-    "TensorDeserializer",
-    "TensorType",
-    "CryptographyError",
-    "EncryptionParams",
-    "DecryptionParams",
-]
-
 # Setup logger
 logger = logging.getLogger(__name__)
 
 
 # Get CPU count
 cpu_count: int = _effective_cpu_count()
+
+
+class _SupportsBool(typing.Protocol):
+    def __bool__(self) -> bool: ...
+
+
+# Filter functions take either a single string (for a simple top-level dict key)
+# or a tensor path (a sequence of path components, each a string or integer).
+# Tensor paths are used for anything that is not a top-level string dict key.
+FilterFuncType: "typing.TypeAlias" = Callable[
+    [Union[str, Sequence[_TensorPathComponent]]], _SupportsBool
+]
 
 
 class CryptographyError(_crypt.CryptographyError):
@@ -183,7 +203,7 @@ class TensorEntry:
         "hashes",
         "header_hashes",
     )
-    name: str
+    name: _TensorPath
     type: TensorType
     dtype: str
     shape: Tuple[int, ...]
@@ -549,7 +569,7 @@ class _TensorHeaderDeserializer:
     buffer: bytearray
     module_idx: int
     tensor_type: TensorType
-    name: str
+    name: _TensorPath
     dtype: str
     shape: Tuple[int, ...]
     hashes: List[TensorHash]
@@ -613,7 +633,12 @@ class _TensorHeaderDeserializer:
         # Read the name.
         name_slice, offset = self.read_name(buffer, offset)
         with name_slice:
-            self.name: str = str(name_slice, "utf-8")
+            self.name: _TensorPath = _TensorPath.deserialize_(name_slice)
+        if self.tensor_type != TensorType.STATE_DICT and not self.name.is_str_:
+            raise ValueError(
+                "Cannot deserialize structured tensor paths"
+                " from non-state-dicts"
+            )
 
         # Read the dtype of the tensor.
         dtype_slice, offset = self.read_dtype(buffer, offset)
@@ -750,31 +775,37 @@ class _MetadataDeserializer(dict):
     @classmethod
     def from_io(
         cls, reader: io.BufferedIOBase, count: int
-    ) -> Tuple["_MetadataDeserializer", bytes]:
+    ) -> Tuple["_MetadataDeserializer", _TensorPathRegistry, bytes]:
         raw = reader.read(cls._total_len_segment.size)
         total_len: int = cls._total_len_segment.unpack(raw)[0]
         if total_len == 0:
-            return cls(), raw
+            return cls(), _TensorPathRegistry(), raw
         else:
             encoded_metadata: bytes = reader.read(total_len)
             raw += encoded_metadata
-            return cls.from_buffer(encoded_metadata, count), raw
+            return cls.from_buffer(encoded_metadata, count) + (raw,)
 
     @classmethod
-    def from_buffer(cls, buffer: bytes, count: int) -> "_MetadataDeserializer":
+    def from_buffer(
+        cls, buffer: bytes, count: int
+    ) -> Tuple["_MetadataDeserializer", _TensorPathRegistry]:
         offset = 0
         entries = cls()
+        registry = _TensorPathRegistry()
         for i in range(count):
-            entry, offset = cls._read_entry(buffer, offset)
+            entry, offset = cls._read_entry(buffer, offset, registry)
             entries[entry.name] = entry
-        return entries
+        return entries, registry
 
     @classmethod
-    def _read_entry(cls, buffer: bytes, offset: int) -> Tuple[TensorEntry, int]:
+    def _read_entry(
+        cls, buffer: bytes, offset: int, registry: _TensorPathRegistry
+    ) -> Tuple[TensorEntry, int]:
         # Read the name.
         name_slice, offset = cls._read_name(buffer, offset)
         with name_slice:
-            name: str = str(name_slice, "utf-8")
+            name: _TensorPath = _TensorPath.deserialize_(name_slice)
+            registry.register_path(name)
 
         tensor_type = TensorType(buffer[offset])
         offset += 1
@@ -1396,9 +1427,15 @@ class TensorDeserializer(
         file_obj: A file-like object to read from. It can also be a string
             representing a path to a file or an HTTP/HTTPS/S3 URI.
         device: The device to load the tensors to.
-        filter_func: A function (tensor_name: str) -> bool that returns True
+        filter_func: A function ``(tensor_name: str) -> bool`` that returns True
             if a tensor should be loaded, or False if it should be skipped.
             If None, all tensors are loaded.
+            For objects that were serialized from lists or nested mappings,
+            the tensor name will be given as a ``Sequence`` of path components
+            (each ``str`` or ``int``) for anything that is not a plain top-level
+            ``str`` key in the original serialized object. In this case,
+            the filter function should be compatible with the signature
+            ``(tensor_path: str | Sequence[str | int] -> bool)`` instead.
         dtype: The dtype to cast the tensors as when loading them into a torch
             module. If None, the dtype will be inferred from the file.
         lazy_load: If True, tensors will be loaded and cached when keys are
@@ -1474,7 +1511,7 @@ class TensorDeserializer(
             int,
         ],
         device: Optional[Union[torch.device, str]] = None,
-        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        filter_func: Optional[FilterFuncType] = None,
         dtype: Optional[torch.dtype] = None,
         *,
         lazy_load: bool = False,
@@ -1557,7 +1594,7 @@ class TensorDeserializer(
 
             self._lazy_load: bool = lazy_load
 
-            self._metadata: Dict[str, TensorEntry] = {}
+            self._metadata: Dict[_TensorPath, TensorEntry] = {}
 
             # Read the magic
             magic = self._file.read(5)
@@ -1624,20 +1661,25 @@ class TensorDeserializer(
             # Read the metadata index of tensors.
             # This is a list of offsets into the file where the per-tensor data
             # is stored.
-            self._metadata: Dict[str, TensorEntry]
-            self._metadata, self._metadata_raw = _MetadataDeserializer.from_io(
-                self._file, self._file_header.tensor_count
+            self._metadata: Dict[_TensorPath, TensorEntry]
+            self._metadata, structure, self._metadata_raw = (
+                _MetadataDeserializer.from_io(
+                    self._file, self._file_header.tensor_count
+                )
             )
             if not self._metadata:
                 raise ValueError("Tensor index in the file is empty")
             # filter_func is a test that determines the tensor names to read.
             # If filter_func is None, all tensors are read.
             if filter_func is not None:
-                self._metadata: Dict[str, TensorEntry] = {
+                self._metadata = {
                     name: entry
                     for name, entry in self._metadata.items()
-                    if filter_func(name)
+                    if filter_func(name.normalize_())
                 }
+                # Remove keys from structure that aren't in self._metadata
+                structure.filter(self._metadata.__contains__)
+            self._structure: Dict[Union[str, int], Any] = structure.dict()
 
             if not isinstance(num_readers, int):
                 raise TypeError(
@@ -1690,7 +1732,7 @@ class TensorDeserializer(
                 )
 
             self._keys_enumerated: Dict[str, int] = {
-                k: i for i, k in enumerate(self.keys())
+                k: i for i, k in enumerate(self._metadata.keys())
             }
 
             # The number of bytes we've allocated so far. Tensors may be read
@@ -1871,12 +1913,17 @@ class TensorDeserializer(
 
     _preload_cuda_called: ClassVar[bool] = False
 
-    def _read_single_tensor(self, expected_name: str) -> torch.nn.Parameter:
-        this_one_tensor_filter = partial(operator.eq, expected_name)
+    def _read_single_tensor(
+        self, expected_path: _TensorPath
+    ) -> torch.nn.Parameter:
+        expected_name: Union[tuple, str] = expected_path.normalize_()
+        this_one_tensor_filter: FilterFuncType = partial(
+            operator.eq, expected_name
+        )
         tensors = tuple(self.read_tensors(filter_func=this_one_tensor_filter))
         num_tensors = len(tensors)
         if num_tensors == 0:
-            raise RuntimeError("Tensor not found")
+            raise RuntimeError(f"Tensor not found: {expected_name!r}")
         elif num_tensors > 1:
             raise RuntimeError(
                 f"Found too many tensors: expected 1, found {num_tensors}"
@@ -1889,8 +1936,180 @@ class TensorDeserializer(
             )
         return tensor
 
-    def __getitem__(self, name) -> torch.nn.Parameter:
-        maybe_copied_data = self._cache.get(name)
+    def _load_prefixed(
+        self,
+        prefix: Iterable[_TensorPathComponent],
+        use_dict_proxies: bool,
+        strip_prefix: bool = True,
+        filter_func: Optional[FilterFuncType] = None,
+    ) -> Union[dict, list, None]:
+        prefix: Tuple[_TensorPathComponent, ...] = tuple(prefix)
+        prefix_len: int = len(prefix)
+
+        keys = [
+            k
+            for k in self._metadata.keys()
+            if k[:prefix_len] == prefix
+            and (filter_func is None or filter_func(k.normalize_()))
+        ]
+        if not keys:
+            return None
+
+        with contextlib.closing(self._bulk_load(keys)) as loader:
+            unstructured: Dict[_TensorPath, torch.Tensor] = {}
+            for data in loader:
+                data: TensorDeserializer._CopiedData
+                unstructured[data.header.name] = data.parameter
+                del data
+
+        restructured = _tensor_path.restructure(unstructured, use_dict_proxies)
+
+        if strip_prefix:
+            for i in range(prefix_len):
+                if not restructured:
+                    restructured = None
+                    break
+                elif isinstance(restructured, list):
+                    restructured = restructured[0]
+                else:
+                    restructured = restructured[prefix[i]]
+        return restructured
+
+    def tree(
+        self,
+        prefix: Optional[Iterable[_TensorPathComponent]] = None,
+        *,
+        default: Any = None,
+        filter_func: Optional[FilterFuncType] = None,
+    ) -> Union[typing.Mapping, Sequence, torch.Tensor, Any]:
+        """
+        Loads a (sub)tree of the serialized object's structure
+        as a mix of potentially-nested mappings and sequences,
+        or a leaf tensor. If no leaf tensors match the prefix,
+        `default` is returned.
+
+        Structures other than simple one-level mappings can be serialized via
+        ``TensorSerializer.write_state_dict``.
+
+        When accessing nested structures without this function
+        (e.g. when using ``__getitem__``), all layers are accessed as
+        read-only mappings instead of a mix of mappings and sequences.
+        In that scenario, sequences are represented as mappings with
+        integer keys instead of string keys.
+        This function, conversely, allows loading sequences as actual
+        ``Sequence`` type objects.
+
+        Args:
+            prefix: Path to a nested layer to load directly, as a sequence.
+                If ``None`` (the default) or an empty sequence, loads
+                all layers starting from the root.
+            default: Object to return if no leaf tensors match the prefix.
+            filter_func: An optional callable with the signature
+                ``(tensor_name: str | Sequence[str | int]) -> bool``
+                that takes the full path of each tensor in the subtree that
+                would be loaded, and can apply additional filtering logic to
+                decide whether each tensor should be loaded
+                on a per-tensor basis (more granular than a full subtree).
+                The function should return ``False`` to skip loading the tensor,
+                or ``True`` to load the tensor.
+                Note that the callable will always receive full tensor paths
+                relative to the root of the deserializer, including the
+                subtree's full prefix, if any.
+
+        Returns:
+            An object composed of potentially-nested mappings, sequences,
+            and tensors representing the subtree beginning at the specified
+            prefix.
+
+        Examples:
+            Serialize and deserialize nested objects::
+
+                serializer = TensorSerializer(path)
+                nested_structure = {
+                    "model": {
+                        "layer": [
+                            {"weight": torch.tensor(...)},
+                            {"weight": torch.tensor(...)},
+                        ],
+                    },
+                    "lm_head": torch.tensor(...),
+                }
+                serializer.write_state_dict(nested_structure)
+                serializer.close()
+
+                deserializer = TensorDeserializer(path)
+
+                # All the layers can be accessed as nested mappings
+                assert list(deserializer.keys()) == ["model", "lm_head"]
+                assert list(deserializer["model"].keys()) == ["layer"]
+
+                # Note: when accessed without .tree(),
+                # the list turns into a mapping with int keys
+                assert list(deserializer["model"]["layer"].keys()) == [0, 1]
+
+                assert list(
+                    deserializer["model"]["layer"][0].keys()
+                ) == ["weight"]
+
+                # The layers can be accessed with their
+                # original structure as well
+
+                from typing import Sequence, Mapping
+
+                tree = deserializer.tree()
+                assert isinstance(tree, Mapping)
+                assert isinstance(tree["model"]["layer"], Sequence)
+
+                # You can load the structure of a specific prefix
+                subtree = deserializer.tree(("model", "layer"))
+                assert isinstance(subtree, Sequence) and len(subtree) == 2
+
+            Serialize and deserialize a simple list::
+
+                serializer = TensorSerializer(path)
+                items = [
+                    torch.tensor(...), torch.tensor(...), torch.tensor(...)
+                ]
+                serializer.write_state_dict(items)
+                serializer.close()
+
+                deserializer = TensorDeserializer(path)
+
+                # The deserializer object is a mapping with int keys
+                # that resembles the original sequence
+                assert list(deserializer.keys()) == [0, 1, 2]
+                for i in range(3):
+                    print(deserializer[i].sum())
+                for tensor in deserializer.values():
+                    # Needs .values() to iterate over the contents
+                    print(tensor.sum())
+
+                # The result of deserializer.tree() is an actual sequence
+                from typing import Sequence
+                deserialized_sequence = deserializer.tree()
+                assert isinstance(deserialized_sequence, Sequence)
+                for i in range(3):
+                    print(deserialized_sequence[i].sum())
+                for tensor in deserialized_sequence:
+                    # Not a mapping; doesn't need .values()
+                    print(tensor.sum())
+        """
+        if prefix is None:
+            prefix = ()
+        if isinstance(prefix, (str, int)):
+            raise TypeError(
+                "Invalid prefix: expected sequence,"
+                f" got {prefix.__class__.__name__!r}"
+                " (for a single-element prefix, use a single-element sequence)"
+            )
+        prefixed = self._load_prefixed(
+            prefix, use_dict_proxies=False, filter_func=filter_func
+        )
+        return prefixed if prefixed is not None else default
+
+    def __getitem__(self, name) -> Union[torch.nn.Parameter, typing.Mapping]:
+        path: tuple = (name,)
+        maybe_copied_data = self._cache.get(path)
         if maybe_copied_data is not None:
             return maybe_copied_data.parameter
 
@@ -1898,10 +2117,15 @@ class TensorDeserializer(
         # tensor data and then convert it to a torch parameter. Most
         # of the time, access patterns are front to back, so seeking
         # forward in a stream works well even for HTTP/HTTPS streams.
-        if name in self._metadata:
-            return self._read_single_tensor(name)
-        else:
+        if name not in self._structure:
             raise KeyError(f"Tensor {name} not found")
+        branch = self._structure[name]
+        if isinstance(branch, _TensorPath):
+            return self._read_single_tensor(_TensorPath(path))
+        else:
+            return self._load_prefixed(
+                path, use_dict_proxies=True
+            ) or types.MappingProxyType({})
 
     # To implement collections.abc.Mapping, this class needs to define:
     # 1. __getitem__(key)
@@ -1937,13 +2161,13 @@ class TensorDeserializer(
 
     def __iter__(self):
         # iter() on a mapping returns an iterator of only keys
-        yield from self._metadata
+        yield from self._structure
 
     def __len__(self):
-        return len(self._metadata)
+        return len(self._structure)
 
     def __contains__(self, key: str):
-        return key in self._metadata
+        return key in self._structure
 
     def keys(self):
         # We override keys() because dict_keys can be slightly more efficient
@@ -1952,7 +2176,7 @@ class TensorDeserializer(
         # Technically this makes mapping.keys().mapping invalid on
         # Python 3.10+ but it is not intended to be supported anyway, so treat
         # it as not implemented.
-        return self._metadata.keys()
+        return self._structure.keys()
 
     def _verify_hashes(
         self,
@@ -2113,7 +2337,7 @@ class TensorDeserializer(
 
     def _read_numpytensors(
         self,
-        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        filter_func: Optional[FilterFuncType] = None,
         num_tensors: int = -1,
         verify_hash: Optional[bool] = None,
     ) -> Iterator[_CopiedData]:
@@ -2144,12 +2368,14 @@ class TensorDeserializer(
             raise ValueError("num_tensors must be -1 or non-negative")
         elif num_tensors == 0:
             return
-        keys_to_read = self.keys()
+        keys_to_read = self._metadata.keys()
         if self._last_yielded_key is not None:
             start = self._keys_enumerated[self._last_yielded_key]
             keys_to_read = itertools.islice(keys_to_read, start + 1, None)
         if filter_func is not None:
-            keys_to_read = filter(filter_func, keys_to_read)
+            keys_to_read = (
+                k for k in keys_to_read if filter_func(k.normalize_())
+            )
         if num_tensors != -1:
             keys_to_read = itertools.islice(keys_to_read, num_tensors)
 
@@ -2159,7 +2385,7 @@ class TensorDeserializer(
 
     def read_tensors(
         self,
-        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        filter_func: Optional[FilterFuncType] = None,
         num_tensors: int = -1,
         verify_hash: Optional[bool] = None,
     ) -> Iterator[Tuple[int, int, str, torch.Tensor]]:
@@ -2194,11 +2420,11 @@ class TensorDeserializer(
             verify_hash=verify_hash,
         )
         for data in copied_data:
-            yield data.header.module_idx, data.header.tensor_type, data.header.name, data.parameter
+            yield data.header.module_idx, data.header.tensor_type, data.header.name.normalize_(), data.parameter
 
     def read_numpy_arrays(
         self,
-        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        filter_func: Optional[FilterFuncType] = None,
         num_tensors: int = -1,
         allow_raw_data: bool = False,
         verify_hash: Optional[bool] = None,
@@ -2304,7 +2530,7 @@ class TensorDeserializer(
                     f"with a datatype of {np_dtype}"
                 )
 
-            yield module_idx, tensor_type, name, arr, is_opaque, torch_dtype
+            yield module_idx, tensor_type, name.normalize_(), arr, is_opaque, torch_dtype
 
     def _to_torch_parameter(
         self, tensor: Union[torch.Tensor, torch.nn.Parameter]
@@ -2358,7 +2584,7 @@ class TensorDeserializer(
             raise IOError("IO closed, instantiate if you want to load again.")
 
         self._cache = OrderedDict()
-        keys = tuple(self.keys())
+        keys = tuple(self._metadata.keys())
         bulk_loader = self._bulk_load(keys)
         with contextlib.closing(bulk_loader):
             for _ in bulk_loader:
@@ -2371,14 +2597,16 @@ class TensorDeserializer(
         self._file.close()
 
     def _bulk_load(
-        self, keys: Iterable[str], verify_hash: Optional[bool] = None
+        self,
+        keys: Iterable[Union[str, _TensorPath]],
+        verify_hash: Optional[bool] = None,
     ) -> Generator[_CopiedData, None, None]:
         # For each key in keys, identify the ones that are not in self._cache,
         # and run those through _bulk_load_uncached.
         # Results are stored in self._cache
         # Results are then yielded in order with the keys provided
 
-        keys = list(keys)
+        keys: List[_TensorPath] = list(map(_TensorPath.wrap_, keys))
         if len(set(keys)) != len(keys):
             raise ValueError("Keys must not have any duplicates")
 
@@ -2388,9 +2616,11 @@ class TensorDeserializer(
         remaining = list(map(self._cache.get, keys))
         # Also allow looking up entries by key
         # This would just use one dict if they had efficient .last() methods
-        indices: Dict[str, int] = {k: i for i, k in enumerate(keys)}
+        indices: Dict[_TensorPath, int] = {k: i for i, k in enumerate(keys)}
         # Begin loading any that are not already cached
-        uncached: List[str] = [k for k, v in zip(keys, remaining) if v is None]
+        uncached: List[_TensorPath] = [
+            k for k, v in zip(keys, remaining) if v is None
+        ]
         loader = self._bulk_load_uncached(uncached, verify_hash)
         with contextlib.closing(loader):
             while remaining:
@@ -2407,13 +2637,15 @@ class TensorDeserializer(
                     remaining[indices[key]] = self._cache[key] = item
 
     def _bulk_load_uncached(
-        self, keys: Sequence[str], verify_hash: Optional[bool] = None
+        self, keys: Sequence[_TensorPath], verify_hash: Optional[bool] = None
     ) -> Generator[_CopiedData, None, None]:
         if not keys:
             return
 
-        # Ensure all keys are present and in sorted order with self.keys()
-        # This will raise a KeyError if a requested key isn't in self.keys()
+        # Ensure all keys are present and in sorted
+        # order relative to self._metadata.keys().
+        # This will raise a KeyError if a requested key
+        # isn't in self._metadata.keys().
         keys = sorted(keys, key=self._keys_enumerated.__getitem__)
         if any(itertools.starmap(operator.eq, zip(keys, keys[1:]))):
             raise ValueError("Keys must not have any duplicates")
@@ -2551,7 +2783,7 @@ class TensorDeserializer(
                     shared_buffer_tensor.numpy().data.cast("B")
                 )
 
-            tensor_sizes_by_name: Dict[str, int] = {
+            tensor_sizes_by_name: Dict[_TensorPath, int] = {
                 t.name: t.deserialized_length for t in tensor_items
             }
 
@@ -2704,7 +2936,7 @@ class TensorDeserializer(
     def load_into_module(
         self,
         m: torch.nn.Module,
-        filter_func: Optional[Callable[[str], Union[bool, Any]]] = None,
+        filter_func: Optional[FilterFuncType] = None,
         verify_hash: Optional[bool] = None,
     ) -> int:
         """
@@ -2740,26 +2972,23 @@ class TensorDeserializer(
             modules[name] = module
 
         keys = tuple(
-            k for k in self.keys() if filter_func is None or filter_func(k)
+            k
+            for k in self._metadata.keys()
+            if filter_func is None or filter_func(k.normalize_())
         )
 
         tensor_ct = len(keys)
 
+        buffer_type = TensorType.BUFFER
+        param_type = TensorType.PARAM
+        state_dict_type = TensorType.STATE_DICT
+
         bulk_loader = self._bulk_load(keys, verify_hash=verify_hash)
         with contextlib.closing(bulk_loader):
             for copied_data in bulk_loader:
-                name = copied_data.header.name
-                tensor = copied_data.parameter
-
-                obj_path, attr = name.rsplit(".", 1)
-                module: torch.nn.Module = modules[obj_path]
-                entry = self._metadata[name]
-
-                if entry.type is TensorType.PARAM:
-                    module.register_parameter(attr, tensor)
-                elif entry.type is TensorType.BUFFER:
-                    module.register_buffer(attr, tensor)
-                elif entry.type is TensorType.STATE_DICT:
+                path: _TensorPath = copied_data.header.name
+                entry = self._metadata[path]
+                if entry.type is state_dict_type:
                     raise NotImplementedError(
                         "This was serialized using"
                         " TensorSerializer.write_state_dict(), so it cannot be"
@@ -2767,8 +2996,26 @@ class TensorDeserializer(
                         " Use the TensorDeserializer object directly as a"
                         " state_dict mapping instead."
                     )
-                else:
+                elif (
+                    entry.type is not buffer_type
+                    and entry.type is not param_type
+                ):
                     raise RuntimeError(f"Invalid tensor type: {entry.type}")
+                elif not path.is_str_:
+                    raise NotImplementedError(
+                        "Cannot deserialize structured tensor keys as a module;"
+                        " try using the TensorDeserializer directly"
+                        " as a state_dict mapping instead."
+                    )
+                tensor = copied_data.parameter
+                name: str = path.normalize_()
+                obj_path, attr = name.rsplit(".", 1)
+                module: torch.nn.Module = modules[obj_path]
+
+                if entry.type is param_type:
+                    module.register_parameter(attr, tensor)
+                elif entry.type is buffer_type:
+                    module.register_buffer(attr, tensor)
 
         self._file.close()
         return tensor_ct
@@ -2817,13 +3064,13 @@ class TensorDeserializer(
         # but aren't included in a state_dict() in PyTorch.
         modules.update(m.named_buffers())
 
-        for name in self.keys():
+        for path, entry in self._metadata.items():
+            name = path.normalize_()
             # Check if the module has this tensor.
             if name not in modules:
                 results.append((name, False))
                 continue
             module: torch.nn.Module = modules[name]
-            entry = self._metadata[name]
             if entry.hashes is None:
                 raise RuntimeError(
                     f"No hashes found in metadata for {name}. This is usually"
@@ -2867,21 +3114,23 @@ class TensorDeserializer(
         header_entry += self._metadata_raw
         redis_client.set(f"{key_prefix}:header:0", header_entry)
 
-        for name in self._metadata:
-            entry = self._metadata[name]
-            offset = self._metadata[name].offset
-            data_offset = self._metadata[name].data_offset
+        for name, entry in self._metadata.items():
+            offset = entry.offset
+            data_offset = entry.data_offset
             header_size = data_offset - offset
             self._file.seek(offset)
             header_entry = self._file.read(header_size)
             # Check if the key already exists
+            name_str: str = name.serialized_().decode("utf-8")
             if not force and redis_client.exists(
-                f"{key_prefix}:{name}:{offset}"
+                f"{key_prefix}:{name_str}:{offset}"
             ):
                 continue
-            redis_client.set(f"{key_prefix}:{name}:{offset}", header_entry)
+            redis_client.set(f"{key_prefix}:{name_str}:{offset}", header_entry)
             data_entry = self._file.read(entry.data_length)
-            redis_client.set(f"{key_prefix}:{name}:{data_offset}", data_entry)
+            redis_client.set(
+                f"{key_prefix}:{name_str}:{data_offset}", data_entry
+            )
 
 
 class TensorSerializer:
@@ -2988,6 +3237,7 @@ class TensorSerializer:
         else:
             self._crypt_chunk_size = None
             self._used_nonces = None
+        self._path_registry: _TensorPathRegistry = _TensorPathRegistry()
 
         # Get information about the file object's capabilities
         _fd_getter = getattr(self._file, "fileno", None)
@@ -3394,7 +3644,7 @@ class TensorSerializer:
     def _write_tensor(
         self,
         idx,
-        name,
+        name: Union[_TensorPath, str],
         tensor_type: TensorType,
         tensor: Union[torch.Tensor, numpy.ndarray],
         *,
@@ -3420,6 +3670,7 @@ class TensorSerializer:
                 Where in the file to write the tensor entry. If not specified,
                 writes starting at the current file offset.
         """
+        self._path_registry.register_path(name)
         if isinstance(tensor, torch.Tensor):
             shape: Sequence[int] = tensor.size()
             has_data: bool = not tensor.is_meta
@@ -3471,7 +3722,10 @@ class TensorSerializer:
                 f" buffer size of underlying memory ({tensor_memory.nbytes})"
                 f" doesn't match reported size ({tensor_size})"
             )
-        name_bytes = name.encode("utf-8")
+        if isinstance(name, str):
+            name_bytes: bytes = name.encode("utf-8")
+        else:
+            name_bytes: bytes = name.serialized_()
         dtype_bytes = dtype_name.encode("utf-8")
         if len(dtype_bytes) >= 256:
             raise ValueError("dtype name length should be less than 256")
@@ -3807,7 +4061,7 @@ class TensorSerializer:
 
     class _WriteSpec(typing.NamedTuple):
         idx: int
-        name: str
+        path: Union[_TensorPath, str]
         tensor_type: TensorType
         tensor: torch.Tensor
         callback: Optional[Callable]
@@ -3816,7 +4070,9 @@ class TensorSerializer:
         tensors = collections.deque(tensors)
         next_pos = self._file.tell()
         if _syscalls.has_fallocate() and self._fd:
-            size = sum(len(t.name) for t in tensors)
+            size = sum(
+                len(_TensorPath.wrap_(t.path).serialized_()) for t in tensors
+            )
             size += sum(
                 t.tensor.element_size()
                 * t.tensor.nelement()
@@ -3946,7 +4202,7 @@ class TensorSerializer:
                         callback = partial(setattr, module, name, None)
                     yield TensorSerializer._WriteSpec(
                         idx=idx,
-                        name=label,
+                        path=label,
                         tensor_type=tensor_type,
                         tensor=tensor,
                         callback=callback,
@@ -3989,30 +4245,150 @@ class TensorSerializer:
                 spec
                 for spec in all_tensors
                 if spec.tensor_type != TensorType.BUFFER
-                or spec.name in persistent
+                or spec.path in persistent
             )
 
         self._bulk_write(all_tensors)
 
-    def write_state_dict(self, state_dict: Dict):
+    def write_state_dict(self, state_dict: Union[Dict, List, Tuple]):
         """
         Write the state_dict to the file in Tensorizer format.
 
+        The values are accessed at deserialization time by using
+        a ``TensorDeserializer`` object as a mapping.
+
+        The object passed to this function can be a ``dict``, a ``list``,
+        or any combination of dictionaries and lists nested together,
+        as long as the dictionaries have only string keys, as in JSON.
+        Other recognized mapping and sequence types (like tuples)
+        are converted to dictionaries and lists.
+
+        All leaf values must be instances of ``torch.Tensor``.
+
+        When deserialized, the original structure of mappings and sequences
+        can be accessed via the ``TensorDeserializer.tree`` method,
+        or the ``TensorDeserializer`` can still be used as a mapping,
+        which will provide uniform access to all layers as read-only mapping
+        proxies, with either ``str`` or ``int`` keys, for mapping and sequence
+        layers, respectively.
+
         It is strongly recommended that you use write_module instead of
         this function, as it will also write out the parameter type,
-        allowing for zero-copy loading of the module with
-        TensorDeserializer.load_into_module.
+        and allow for zero-copy loading of the module with
+        ``TensorDeserializer.load_into_module``.
+
+        See Also:
+            `TensorDeserializer.tree`
+
+        Examples:
+            Serialize a normal state dict::
+
+                serializer = TensorSerializer(path)
+                state_dict = model.state_dict()
+                serializer.write_state_dict(state_dict)
+                serializer.close()
+
+                deserializer = TensorDeserializer(path)
+                assert deserializer.keys() == state_dict.keys()
+
+            Serialize any dictionary of tensors::
+
+                serializer = TensorSerializer(path)
+                state_dict = {
+                    "model.layer.0.weight": torch.tensor(...),
+                    "model.layer.1.weight": torch.tensor(...),
+                    "lm_head": torch.tensor(...),
+                }
+                serializer.write_state_dict(state_dict)
+                serializer.close()
+
+                deserializer = TensorDeserializer(path)
+                assert deserializer.keys() == state_dict.keys()
+
+            Serialize nested objects::
+
+                serializer = TensorSerializer(path)
+                nested_structure = {
+                    "model": {
+                        "layer": [
+                            {"weight": torch.tensor(...)},
+                            {"weight": torch.tensor(...)},
+                        ],
+                    },
+                    "lm_head": torch.tensor(...),
+                }
+                serializer.write_state_dict(nested_structure)
+                serializer.close()
+
+                deserializer = TensorDeserializer(path)
+
+                # All the layers can be accessed as nested mappings
+                assert list(deserializer.keys()) == ["model", "lm_head"]
+                assert list(deserializer["model"].keys()) == ["layer"]
+
+                # Note: when accessed without .tree(),
+                # the list turns into a mapping with int keys
+                assert list(deserializer["model"]["layer"].keys()) == [0, 1]
+
+                assert list(
+                    deserializer["model"]["layer"][0].keys()
+                ) == ["weight"]
+
+                # The layers can be accessed with their
+                # original structure as well
+
+                from typing import Sequence, Mapping
+
+                tree = deserializer.tree()
+                assert isinstance(tree, Mapping)
+                assert isinstance(tree["model"]["layer"], Sequence)
+
+                # You can load the structure of a specific prefix
+                subtree = deserializer.tree(("model", "layer"))
+                assert isinstance(subtree, Sequence) and len(subtree) == 2
+
+            Serialize a simple list::
+
+                serializer = TensorSerializer(path)
+                items = [
+                    torch.tensor(...), torch.tensor(...), torch.tensor(...)
+                ]
+                serializer.write_state_dict(items)
+                serializer.close()
+
+                deserializer = TensorDeserializer(path)
+
+                # The deserializer object is a mapping with int keys
+                # that resembles the original sequence
+                assert list(deserializer.keys()) == [0, 1, 2]
+                for i in range(3):
+                    print(deserializer[i].sum())
+                for tensor in deserializer.values():
+                    # Needs .values() to iterate over the contents
+                    print(tensor.sum())
+
+                # The result of deserializer.tree() is an actual sequence
+                from typing import Sequence
+                deserialized_sequence = deserializer.tree()
+                assert isinstance(deserialized_sequence, Sequence)
+                for i in range(3):
+                    print(deserialized_sequence[i].sum())
+                for tensor in deserialized_sequence:
+                    # Not a mapping; doesn't need .values()
+                    print(tensor.sum())
         """
         idx = 0
         self._bulk_write(
             TensorSerializer._WriteSpec(
                 idx=idx,
-                name=name,
+                path=name,
                 tensor_type=TensorType.STATE_DICT,
                 tensor=param,
                 callback=None,
             )
-            for name, param in state_dict.items()
+            for name, param in _tensor_path.flatten_structure(
+                torch.Tensor, state_dict
+            )
         )
 
 

@@ -12,6 +12,7 @@ import secrets
 import sys
 import tempfile
 import time
+import typing
 import unittest
 from typing import Iterator, Mapping, NamedTuple, Optional, Tuple
 from unittest.mock import patch
@@ -559,6 +560,255 @@ class TestSerialization(unittest.TestCase):
                             )
                 finally:
                     os.unlink(tensorized_file.name)
+
+    def test_structure(self):
+        with temporary_file(mode="wb+") as file:
+            devices = ("cpu", "cuda") if is_cuda_available else ("cpu",)
+            for lazy_load, device, num_readers in itertools.product(
+                (False, True), devices, (1, 4)
+            ):
+
+                def try_serialize(obj):
+                    serializer = TensorSerializer(file.name)
+                    serializer.write_state_dict(obj)
+                    serializer.close()
+                    return TensorDeserializer(
+                        file.name,
+                        lazy_load=lazy_load,
+                        device=device,
+                        num_readers=num_readers,
+                    )
+
+                tensors: typing.List[torch.Tensor] = [
+                    torch.tensor((i,), device=device, dtype=torch.uint8)
+                    for i in range(10)
+                ]
+
+                with self.subTest("Flat list"), try_serialize(
+                    tensors
+                ) as deserialized:
+                    # Should have consecutive integer keys
+                    self.assertSequenceEqual(
+                        tuple(deserialized.keys()), range(10)
+                    )
+
+                    # Iterating over the mapping values should be equivalent
+                    # to iterating over the list values
+                    self.assertSequenceEqual(
+                        [v[0] for v in deserialized.values()],
+                        [v[0] for v in tensors],
+                    )
+
+                    # The tree view should be an actual flat list
+                    tree: list = deserialized.tree()
+                    self.assertListEqual(tree, list(deserialized.values()))
+
+                    # Elements should be accessible by index
+                    self.assertListEqual(
+                        [deserialized[i] for i in range(10)], tree
+                    )
+
+                    # Should be able to check for integer keys
+                    self.assertIn(5, deserialized)
+                    self.assertNotIn(-1, deserialized)
+                    self.assertNotIn(11, deserialized)
+                    # And there should be no string keys
+                    self.assertNotIn("5", deserialized)
+                    self.assertNotIn("-1", deserialized)
+                    self.assertNotIn("11", deserialized)
+
+                structure = {str(i): v for i, v in enumerate(tensors)}
+
+                with self.subTest("Flat state_dict"), try_serialize(
+                    structure
+                ) as deserialized:
+                    # Should have string keys
+                    structure_keys = tuple(map(str, range(10)))
+                    self.assertSequenceEqual(
+                        tuple(deserialized.keys()), structure_keys
+                    )
+
+                    # Iterating over the mapping values should be equivalent
+                    # to iterating over the list values
+                    self.assertSequenceEqual(
+                        [v[0] for v in deserialized.values()],
+                        [v[0] for v in tensors],
+                    )
+
+                    # The tree view should be a flat dictionary
+                    tree: dict = deserialized.tree()
+                    self.assertDictEqual(tree, dict(deserialized))
+
+                    # Elements should be accessible by string key
+                    self.assertListEqual(
+                        [deserialized[i] for i in structure_keys],
+                        [tree[i] for i in structure_keys],
+                    )
+
+                    # Should be able to check for string keys
+                    self.assertIn("5", deserialized)
+                    self.assertNotIn("-1", deserialized)
+                    self.assertNotIn("11", deserialized)
+                    # And there should be no integer keys
+                    self.assertNotIn(5, deserialized)
+                    self.assertNotIn(-1, deserialized)
+                    self.assertNotIn(11, deserialized)
+
+                structure = [{str(i): v} for i, v in enumerate(tensors)]
+
+                with self.subTest(
+                    "List of single-element state_dicts"
+                ), try_serialize(structure) as deserialized:
+                    # Should have integer keys on the first layer
+                    structure_keys = range(10)
+                    self.assertSequenceEqual(
+                        tuple(deserialized.keys()), structure_keys
+                    )
+
+                    # Iterating over the mapping values should yield
+                    # nested mappings
+                    for i, v in deserialized.items():
+                        self.assertIsInstance(i, int)
+                        self.assertIsInstance(v, typing.Mapping)
+                        # With a single string key each
+                        key = str(i)
+                        self.assertSequenceEqual(tuple(v.keys()), (key,))
+                        # And the appropriate value
+                        reference = structure[i]
+                        self.assertEqual(v[key][0], reference[key][0])
+
+                    # The tree view should look just like the original structure
+                    tree: list = deserialized.tree()
+                    self.assertListEqual(tree, list(deserialized.values()))
+
+                    # Elements should be accessible by integer key
+                    self.assertListEqual(
+                        [deserialized[i] for i in structure_keys],
+                        [tree[i] for i in structure_keys],
+                    )
+
+                    # Should be able to check for integer keys
+                    self.assertIn(5, deserialized)
+                    self.assertNotIn(-1, deserialized)
+                    self.assertNotIn(11, deserialized)
+                    # And there should be no string keys in the first layer
+                    self.assertNotIn("5", deserialized)
+                    self.assertNotIn("-1", deserialized)
+                    self.assertNotIn("11", deserialized)
+
+                structure = {
+                    str(i): [tensors[i], tensors[-i]] for i in range(10)
+                }
+
+                with self.subTest("Dict of two-element lists"), try_serialize(
+                    structure
+                ) as deserialized:
+                    # Should have string keys on the first layer
+                    structure_keys = tuple(map(str, range(10)))
+                    self.assertSequenceEqual(
+                        tuple(deserialized.keys()), structure_keys
+                    )
+
+                    # Iterating over the mapping values should yield
+                    # nested mappings with integer keys, not lists
+                    for i, v in deserialized.items():
+                        self.assertIsInstance(i, str)
+                        self.assertIsInstance(v, typing.Mapping)
+                        # With two integer keys each
+                        self.assertSequenceEqual(tuple(v.keys()), (0, 1))
+                        reference = structure[i]
+                        for idx in range(2):
+                            self.assertEqual(v[idx][0], reference[idx][0])
+
+                    # The tree view should look just like the original structure
+                    tree: dict = deserialized.tree()
+                    self.assertSequenceEqual(tuple(tree.keys()), structure_keys)
+                    for k in structure_keys:
+                        # The nested lists are actual lists here
+                        tree_sublist = tree[k]
+                        self.assertIsInstance(tree_sublist, list)
+                        # And their contents should match the originals
+                        # and the ordering of the originals
+                        original_sublist = structure[k]
+                        self.assertListEqual(
+                            [v[0] for v in tree_sublist],
+                            [v[0] for v in original_sublist],
+                        )
+
+                    # Should be able to check for string keys in the first layer
+                    self.assertIn("5", deserialized)
+                    self.assertNotIn("-1", deserialized)
+                    self.assertNotIn("11", deserialized)
+                    # And there should be no integer keys
+                    self.assertNotIn(5, deserialized)
+                    self.assertNotIn(-1, deserialized)
+                    self.assertNotIn(11, deserialized)
+
+                structure = [
+                    {str(i): tensors[i], str(10 - i - 1): tensors[10 - i - 1]}
+                    for i in range(10)
+                ]
+
+                with self.subTest("List of two-element dicts"), try_serialize(
+                    structure
+                ) as deserialized:
+                    # Should have integer keys on the first layer
+                    structure_keys = range(10)
+                    self.assertSequenceEqual(
+                        tuple(deserialized.keys()), structure_keys
+                    )
+
+                    # Iterating over the mapping values should yield
+                    # nested mappings
+                    for i, v in deserialized.items():
+                        self.assertIsInstance(i, int)
+                        self.assertIsInstance(v, typing.Mapping)
+                        # With two string keys each
+                        keys = (str(i), str(10 - i - 1))
+                        self.assertSequenceEqual(tuple(v.keys()), keys)
+                        reference = structure[i]
+                        for k in keys:
+                            self.assertEqual(v[k][0], reference[k][0])
+
+                    # The tree view should look just like the original structure
+                    tree: list = deserialized.tree()
+                    self.assertIsInstance(tree, list)
+                    for k in structure_keys:
+                        tree_subdict = tree[k]
+                        self.assertIsInstance(tree_subdict, typing.Mapping)
+                        # And their contents should match the originals
+                        # and the ordering of the originals
+                        original_subdict = structure[k]
+                        self.assertTupleEqual(
+                            tuple(tree_subdict.keys()),
+                            tuple(original_subdict.keys()),
+                        )
+                        self.assertListEqual(
+                            [v[0] for v in tree_subdict.values()],
+                            [v[0] for v in original_subdict.values()],
+                        )
+
+                    # Test subtree access of a nested mapping
+                    subtree: typing.Mapping = deserialized.tree((1,))
+                    self.assertIsInstance(subtree, typing.Mapping)
+                    for (k1, v1), (k2, v2) in zip(
+                        subtree.items(), tree[1].items()
+                    ):
+                        self.assertEqual(k1, k2)
+                        self.assertEqual(v1[0], v2[0])
+                    # Test subtree access of a specific leaf tensor
+                    self.assertEqual(
+                        deserialized.tree((0, "9"))[0], tree[0]["9"][0]
+                    )
+
+                    # Should be able to check for int keys in the first layer
+                    self.assertIn(5, deserialized)
+                    self.assertNotIn(-1, deserialized)
+                    self.assertNotIn(11, deserialized)
+                    # And there should be no string keys
+                    self.assertNotIn("5", deserialized)
+                    self.assertNotIn("-1", deserialized)
+                    self.assertNotIn("11", deserialized)
 
 
 @unittest.skipUnless(
