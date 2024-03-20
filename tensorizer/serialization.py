@@ -54,6 +54,7 @@ import tensorizer._linear_partition as _linear_partition
 import tensorizer._syscalls as _syscalls
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
+from tensorizer import name_threads  # noqa
 from tensorizer._crypt._cgroup_cpu_count import (
     effective_cpu_count as _effective_cpu_count,
 )
@@ -1479,7 +1480,7 @@ class TensorDeserializer(
     class _CopiedData:
         __slots__ = ("header", "numpy_tensor", "parameter")
         header: _TensorHeaderDeserializer
-        numpy_tensor: _NumpyTensor
+        numpy_tensor: Optional[_NumpyTensor]  # set if device is 'cpu'
         parameter: torch.nn.Parameter
 
     def __init__(
@@ -2585,7 +2586,20 @@ class TensorDeserializer(
                         begin_offset,
                         0,
                     ]
+
+                    start = time.perf_counter_ns() if _perf_stats else 0
                     _syscalls.cuFileRead(*cufileread_args)
+                    cufile_read_duration = (
+                        time.perf_counter_ns() - start if _perf_stats else 0
+                    )
+
+                    cufile_read_bytes = end_offset - begin_offset
+                    if _perf_stats and (
+                        cufile_read_duration or cufile_read_bytes
+                    ):
+                        with _perf_stats.lock:
+                            _perf_stats.file_readinto_ns += cufile_read_duration
+                            _perf_stats.file_readinto_bytes += cufile_read_bytes
 
                 cufileread_thread = threading.Thread(target=load_into_cuda)
                 cufileread_thread.start()
@@ -2702,8 +2716,11 @@ class TensorDeserializer(
                             mv,
                         )
                     else:
-                        file_.seek(tensor_metadata.data_length, os.SEEK_CUR)
-                        # file_.readinto(mv)
+                        if is_cuda:
+                            file_.seek(tensor_metadata.data_length, os.SEEK_CUR)
+                        else:
+                            file_.readinto(mv)
+                            readinto_bytes += mv.nbytes
 
                     if verify_hash:
                         unsafe_self._verify_hashes(
@@ -2711,9 +2728,10 @@ class TensorDeserializer(
                         )
 
                     readinto_duration += (
-                        time.perf_counter_ns() - start if _perf_stats else 0
+                        time.perf_counter_ns() - start
+                        if _perf_stats and not is_cuda
+                        else 0
                     )
-                    # readinto_bytes += mv.nbytes
 
                 # create a tensor around it and maybe torch.to('cuda')
                 if is_cuda:
