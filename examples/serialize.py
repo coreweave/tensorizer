@@ -1,3 +1,4 @@
+import os
 import torch
 from tensorizer import TensorSerializer
 from transformers import AutoModelForCausalLM
@@ -17,6 +18,6 @@ model = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
 )
 
-serializer = TensorSerializer(s3_uri)
+serializer = TensorSerializer('gpt-j-6B-padded.tensors')
 serializer.write_module(model)
 serializer.close()
