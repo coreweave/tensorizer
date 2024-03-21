@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Sequential calls to `read_tensors` still read consecutive parts of the file
 - Importing `tensorizer` doesn't implicitly initialize `torch.cuda`
   whenever a GPU is available
-  - This allows forking after importing tensorizer, and using the library
+  - This allows forking after importing `tensorizer`, and using the library
     in a subprocess
 - `TensorDeserializer.read_numpy_arrays` now throws an error when used with
   CUDA deserialization, since numpy arrays can't be deserialized to CUDA
