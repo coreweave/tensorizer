@@ -59,11 +59,6 @@ from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor
 from tensorizer.stream_io import CURLStreamFile
 
-if torch.cuda.is_available():
-    cudart = torch.cuda.cudart()
-else:
-    cudart = None
-
 lz4 = None
 
 __all__ = [
@@ -1750,6 +1745,7 @@ class TensorDeserializer(
                 del ctb
 
                 # Register the buffer with CUDA
+                cudart = torch.cuda.cudart()
                 cudart.cudaHostRegister(buffer_addr, len(self._buffer), 0)
                 self._cleanup.callback(cudart.cudaHostUnregister, buffer_addr)
             end_allocate = time.monotonic()
