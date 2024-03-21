@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0a0] - 2024-03-21
+
+### Added
+
+- Multiple file readers during deserialization ([#87])
+  - Controlled by the new `num_readers` `int` parameter
+    to the `TensorDeserializer` constructor
+  - Files capable of having multiple readers opened to the same source can
+    make use of this parameter to increase deserialization speed
+    - Files on the filesystem and some HTTP(S) & S3 streams from
+      `stream_io.open_stream` are eligible to be reopened this way
+  - The default is one sequential reader
+- Structured object serialization ([#115])
+  - `TensorSerializer.write_state_dict` can now write nested mappings,
+    sequences, and other mixtures of mappings and sequences nested in each other
+  - When accessing an object serialized this way with a `TensorDeserializer`,
+    sequences are converted to mappings with integer keys
+  - `TensorDeserializer.tree` allows converting the deserialized objects back
+    to a compatible collection type
+    - Serialized as a sequence → `collections.abc.Sequence`
+    - Serialized as a mapping → `collections.abc.Mapping`
+  - For more information, see:
+    - The `TensorSerializer.write_state_dict` docstring
+    - The `TensorDeserializer.tree` docstring
+    - PR [#115]
+- Configurable CPU concurrency limit during serialization
+  - Controlled by the new `limit_cpu_concurrency` `int` parameter
+    to the `TensorSerializer` constructor
+- New optional keyword parameters to `stream_io.open_stream`:
+  - Object storage connection settings `s3_region_name` & `s3_signature_version`
+  - File byte range markers `start` & `end`
+    - `start` applies to all files and streams
+    - `end` applies only to HTTP(S) & S3 streams, for which it is interpreted
+      as the `start` and `end` parameters for the created `CURLStreamFile`
+      object
+      - `end` is inclusive, like in an HTTP byte range request,
+        not one-past-the-end
+
+[#87]: https://github.com/coreweave/tensorizer/pull/87
+[#115]: https://github.com/coreweave/tensorizer/pull/115
+
+### Changed
+
+- The `plaid_mode` and `plaid_mode_buffers` parameters to `TensorDeserializer`
+  no longer have an effect
+  - The previous default behaviour (`plaid_mode=True` wherever available)
+    is now always applied
+- Serialization performance has been improved
+- `TensorDeserializer.read_tensors` now returns tensors on the target device,
+  and functions more efficiently
+  - Previously, the returned values were always on the CPU
+- `TensorDeserializer.read_tensors`'s behaviour is no longer affected by
+  the position of the file descriptor at the time of the call
+  - Sequential calls to `read_tensors` still read consecutive parts of the file
+- Importing `tensorizer` doesn't implicitly initialize `torch.cuda`
+  whenever a GPU is available
+  - This allows forking after importing tensorizer, and using the library
+    in a subprocess
+- `TensorDeserializer.read_numpy_arrays` now throws an error when used with
+  CUDA deserialization, since numpy arrays can't be deserialized to CUDA
+
+### Fixed
+
+- The `end` parameter to `stream_io.CURLStreamFile` now matches the semantics
+  of an HTTP range request
+  - The `end` marker is inclusive, not one-past-the-end
+
 ## [2.8.1] - 2024-02-15
 
 ### Changed
@@ -334,6 +401,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[2.9.0a0]: https://github.com/coreweave/tensorizer/compare/v2.8.1...v2.9.0a0
 [2.8.1]: https://github.com/coreweave/tensorizer/compare/v2.8.0...v2.8.1
 [2.8.0]: https://github.com/coreweave/tensorizer/compare/v2.7.2...v2.8.0
 [2.7.2]: https://github.com/coreweave/tensorizer/compare/v2.7.1...v2.7.2
