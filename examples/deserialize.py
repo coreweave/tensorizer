@@ -49,6 +49,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 with torch.device(device), no_init_or_tensor():
     model = AutoModelForCausalLM.from_config(config)
 
+input(f"PID {os.getpid()}")
 print(f"Deserializing to {device}:")
 before_mem = get_mem_usage()
 
