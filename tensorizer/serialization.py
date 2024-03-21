@@ -1923,10 +1923,11 @@ class TensorDeserializer(
                     torch.empty((1,), device="cuda")
                 except Exception:
                     pass
-                _syscalls.cuFileDriverOpen()
 
             preload_thread = threading.Thread(target=_attempt_preload)
             preload_thread.start()
+            threading.Thread(target=_syscalls.cuFileDriverOpen).start()
+
             return preload_thread.join
         else:
             return lambda timeout=None: None
@@ -2741,13 +2742,6 @@ class TensorDeserializer(
         # Need to get rid of self or more safely have thread-local storage
 
         is_cuda = unsafe_self._device.type == "cuda"
-        cuda_stream = None
-        if is_cuda:
-            cuda_stream = torch.cuda.Stream(unsafe_self._device)
-
-        # Allocating pinned memory seems to block creating new threads, so
-        # ensure all threads are created before we go
-        barrier.wait()
 
         # read starting at the previous 8-byte aligned offset
         begin_offset_bump = tensor_items[0].offset % 8
@@ -2798,9 +2792,15 @@ class TensorDeserializer(
                 )
 
                 def load_into_cuda():
+                    if os.environ.get("O_DIRECT"):
+                        fd = os.open(
+                            unsafe_self._file_spec, os.O_RDONLY | os.O_DIRECT
+                        )
+                    else:
+                        fd = file_.fileno()
                     cufile_handle = ctypes.c_void_p()
                     desc = _syscalls.CUfileDescr_t(
-                        type=1, fd=file_.fileno(), fs_ops=ctypes.c_void_p(None)
+                        type=1, fd=fd, fs_ops=ctypes.c_void_p(None)
                     )
 
                     res = _syscalls.libcufile.cuFileHandleRegister(
