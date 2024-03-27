@@ -88,7 +88,7 @@ model.eval()
 tokenizer = AutoTokenizer.from_pretrained(model_ref)
 eos = tokenizer.eos_token_id
 input_ids = tokenizer.encode(
-    "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
+    "Hello! The best place to eat in San Francisco is ", return_tensors="pt"
 ).to(device)
 
 with torch.no_grad():
