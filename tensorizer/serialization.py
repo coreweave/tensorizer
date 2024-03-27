@@ -60,6 +60,7 @@ from tensorizer import name_threads  # noqa
 from tensorizer._crypt._cgroup_cpu_count import (
     effective_cpu_count as _effective_cpu_count,
 )
+from tensorizer import _cuda_file
 from tensorizer._internal_utils import Chunked as _Chunked
 from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor
@@ -1926,7 +1927,6 @@ class TensorDeserializer(
 
             preload_thread = threading.Thread(target=_attempt_preload)
             preload_thread.start()
-            threading.Thread(target=_syscalls.cuFileDriverOpen).start()
 
             return preload_thread.join
         else:
@@ -2792,33 +2792,29 @@ class TensorDeserializer(
                 )
 
                 def load_into_cuda():
+                    pinned_buffer_size = 1024 * 1024 * 16
+                    pinned_buffer = _cuda_file.allocate_buffer(pinned_buffer_size)
+
                     if os.environ.get("O_DIRECT"):
                         fd = os.open(
                             unsafe_self._file_spec, os.O_RDONLY | os.O_DIRECT
                         )
                     else:
                         fd = file_.fileno()
-                    cufile_handle = ctypes.c_void_p()
-                    desc = _syscalls.CUfileDescr_t(
-                        type=1, fd=fd, fs_ops=ctypes.c_void_p(None)
-                    )
-
-                    res = _syscalls.libcufile.cuFileHandleRegister(
-                        ctypes.POINTER(ctypes.c_void_p)(cufile_handle),
-                        ctypes.POINTER(_syscalls.CUfileDescr_t)(desc),
-                    )
-                    assert res == 0
-
+                    
                     cufileread_args = [
-                        cufile_handle,
+                        fd,
                         big_tensor.data_ptr(),
                         end_offset - begin_offset,
                         begin_offset,
-                        0,
+                        pinned_buffer,
+                        pinned_buffer_size
                     ]
 
+
                     start = time.perf_counter_ns() if _perf_stats else 0
-                    _syscalls.cuFileRead(*cufileread_args)
+                    _cuda_file.copy_to_device(*cufileread_args)
+                    # _syscalls.cuFileRead(*cufileread_args)
                     cufile_read_duration = (
                         time.perf_counter_ns() - start if _perf_stats else 0
                     )
