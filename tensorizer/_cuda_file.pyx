@@ -87,8 +87,12 @@ def copy_to_device(int fd, unsigned long device_ptr, ssize_t size, unsigned long
 
     cdef ssize_t read_bytes
     cdef ssize_t to_read_size
+    cdef ssize_t to_read_size_aligned
     cdef cudaError_t err
     cdef ssize_t orig_size = size
+    cdef unsigned int to_skip
+    cdef unsigned int to_strip
+    cdef unsigned long fd_offset_aligned
 
     cdef PerfTimer readTimer = _NewPerfTimer()
     cdef PerfTimer copyTimer = _NewPerfTimer()
@@ -97,25 +101,44 @@ def copy_to_device(int fd, unsigned long device_ptr, ssize_t size, unsigned long
     cdef char_ptr[2] pinned_buffers_flipflop = [<char*>(pinned_buffer), <char*>(pinned_buffer) + (pinned_buffer_size)]
     cdef int flipflop = 0
 
+    # Align fd_offset to the page boundary
+    fd_offset_aligned = fd_offset & ~4095
+    to_skip = fd_offset - fd_offset_aligned
+    size += to_skip
+    fd_offset = fd_offset_aligned
+
     with nogil:
         while size > 0:
             to_read_size = min(size, pinned_buffer_size)
+
+            # if to_read_size is not page-aligned, bump it up to the next page boundary
+            to_read_size_aligned = (to_read_size + 4095) & ~4095
+            to_strip = to_read_size_aligned - to_read_size
+            to_read_size = to_read_size_aligned
+            
             StartTimer(&readTimer)
             read_bytes = pread(fd, <void *>(pinned_buffers_flipflop[flipflop]), to_read_size, fd_offset)
             StopTimer(&readTimer)
             if read_bytes != to_read_size:
-                # TODO: warning?
-                raise ValueError('Read %d bytes, expected %d. errno=%d' % (read_bytes, to_read_size, errno))
+                if read_bytes < 0 or (read_bytes % 4096 != 0 and read_bytes < size):
+                    raise ValueError('Read %d bytes, expected %d. size=%d to_skip=%d errno=%d' % (read_bytes, to_read_size, size, to_skip, errno))
+                elif read_bytes == 0:
+                    continue
+                else:
+                    pass # warning?
+
 
             StartTimer(&copyTimer)
-            err = cudaMemcpyAsync(_device_ptr, <void *>(pinned_buffers_flipflop[flipflop]), read_bytes, cudaMemcpyHostToDevice, 0)
+            err = cudaMemcpyAsync(_device_ptr, <void *>(pinned_buffers_flipflop[flipflop] + to_skip), read_bytes - to_skip - to_strip, cudaMemcpyHostToDevice, 0)
             StopTimer(&copyTimer)
             if err != 0:
                 raise ValueError('Cuda error in cudaMemcpy: %d' % err)
 
-            fd_offset += read_bytes
-            _device_ptr += read_bytes
-            size -= read_bytes
+            fd_offset += read_bytes - to_strip
+            _device_ptr += read_bytes - to_skip - to_strip
+            size -= read_bytes - to_strip
+
+            to_skip = 0
             flipflop = not flipflop
 
         printf("Read time: %ldns, %.3f GB/s\n", readTimer.elapsed_ns, orig_size / readTimer.elapsed_ns)
