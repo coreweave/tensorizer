@@ -1,11 +1,20 @@
 # cython: language_level=3
 
-from libc.errno cimport errno
-from libc.stdio cimport printf
-from libc.stdint cimport int64_t
-from posix.mman cimport mmap, munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, MAP_FAILED
-from posix.time cimport clock_gettime, CLOCK_MONOTONIC, timespec
+from posix.mman cimport (
+    MAP_ANONYMOUS,
+    MAP_FAILED,
+    MAP_PRIVATE,
+    PROT_READ,
+    PROT_WRITE,
+    mmap,
+    munmap,
+)
+from posix.time cimport CLOCK_MONOTONIC, clock_gettime, timespec
 from posix.unistd cimport pread
+
+from libc.errno cimport errno
+from libc.stdint cimport int64_t
+from libc.stdio cimport printf
 
 ctypedef char* char_ptr
 
@@ -22,8 +31,6 @@ cdef extern from "cuda_runtime_api.h":
 
 
 cdef void* create_anonymous_mmap(size_t length) nogil:
-    # Using MAP_PRIVATE | MAP_ANONYMOUS to create an anonymous mapping
-    # Pass -1 as the file descriptor and 0 as offset for anonymous mapping
     cdef void* addr = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
     
     if addr == MAP_FAILED:
@@ -136,7 +143,7 @@ def copy_to_device(int fd, unsigned long device_ptr, ssize_t size, unsigned long
 
             fd_offset += read_bytes - to_strip
             _device_ptr += read_bytes - to_skip - to_strip
-            size -= read_bytes - to_strip
+            size -= min(size, read_bytes)
 
             to_skip = 0
             flipflop = not flipflop
