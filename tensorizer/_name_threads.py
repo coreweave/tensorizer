@@ -1,3 +1,5 @@
+"""Monkeypatches Thread.start so that pthreads have a useful name for debugging"""
+
 import ctypes
 import threading
 

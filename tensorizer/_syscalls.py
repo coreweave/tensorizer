@@ -1,16 +1,11 @@
 import ctypes
-import ctypes.util
 import errno
 import mmap
-import sys
 
 __all__ = (
     "has_fallocate",
     "try_fallocate",
     "prefault",
-    
-    "libcufile",
-    "CUfileDescr_t"
 )
 
 
@@ -168,46 +163,3 @@ else:
 
 
 del _can_prefault_with_madvise
-
-libcufile_name = ctypes.util.find_library("cufile")
-if libcufile_name:
-    libcufile = ctypes.CDLL(libcufile_name, use_errno=True)
-
-    cuFileDriverOpen = libcufile.cuFileDriverOpen
-    cuFileDriverOpen.restype = ctypes.c_int
-    cuFileDriverOpen.argtypes = []
-
-    class CUfileDescr_t(ctypes.Structure):
-        _fields_ = [
-            ("type", ctypes.c_long),
-            ("fd", ctypes.c_long),
-            ("fs_ops", ctypes.c_void_p),
-        ]
-
-    cuFileHandleRegister = libcufile.cuFileHandleRegister
-    cuFileHandleRegister.restype = ctypes.c_int
-    cuFileHandleRegister.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p), # CUFileHandle_t *fh
-        ctypes.POINTER(CUfileDescr_t) # CUfileDescr_t *descr
-    ]
-    
-    cuFileRead = libcufile.cuFileRead
-    cuFileRead.restype = ctypes.c_ssize_t
-    cuFileRead.argtypes = [
-        ctypes.c_void_p, # CUFileHandle_t fh
-        ctypes.c_void_p, # void *bufPtr_base
-        ctypes.c_size_t, # ssize_t size
-        ctypes.c_size_t, # off_t file_offset
-        ctypes.c_size_t, # off_t devPtr_offset
-    ]
-
-    cuFileBufRegister = libcufile.cuFileBufRegister
-    cuFileBufRegister.restype = ctypes.c_int
-    cuFileBufRegister.argtypes = [
-        ctypes.c_void_p, # void *bufPtr_base
-        ctypes.c_size_t, # ssize_t size
-        ctypes.c_int, # int flags
-    ]
-else:
-    print('Warning: cufile library not found. libcufile will not be available.', file=sys.stderr)
-    libcufile = None

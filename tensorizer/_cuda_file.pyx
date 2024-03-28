@@ -132,7 +132,7 @@ def copy_to_device(int fd, unsigned long device_ptr, ssize_t size, unsigned long
 
 
             StartTimer(&copyTimer)
-            err = cudaMemcpy(_device_ptr, <void *>(pinned_buffer + to_skip), read_bytes - to_skip - to_strip, cudaMemcpyHostToDevice)
+            err = cudaMemcpy(_device_ptr, <void *>(pinned_buffer + to_skip), read_bytes - to_skip - to_strip, cudaMemcpyHostToDevice, 0)
             StopTimer(&copyTimer)
             if err != 0:
                 raise RuntimeError('Cuda error in cudaMemcpy: %d' % err)

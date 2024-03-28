@@ -56,11 +56,11 @@ import tensorizer._syscalls as _syscalls
 import tensorizer._tensor_path as _tensor_path
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
-from tensorizer import name_threads  # noqa
+from tensorizer import _name_threads  # noqa
+from tensorizer import _cuda_file
 from tensorizer._crypt._cgroup_cpu_count import (
     effective_cpu_count as _effective_cpu_count,
 )
-from tensorizer import _cuda_file
 from tensorizer._internal_utils import Chunked as _Chunked
 from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor
@@ -119,6 +119,7 @@ _np_to_torch_dtype = {
     numpy.dtype(numpy.float32): torch.float32,
     numpy.dtype(numpy.float64): torch.float64,
 }
+
 
 class _SupportsBool(typing.Protocol):
     def __bool__(self) -> bool: ...
@@ -462,10 +463,8 @@ class _TensorHeaderSerializer:
             )
         )
         self.size = self.data_offset
-        self.data_offset += (
-            8 - ((file_offset + self.data_offset) % 8)
-        ) % 8  # align to next 8-byte boundary
-        assert (file_offset + self.data_offset) % 8 == 0
+        # align to next 8-byte boundary
+        self.data_offset = (self.data_offset + 7) & ~7
 
         self.buffer = bytearray(self.size)
         self.start_segment.pack_into(
@@ -2782,7 +2781,7 @@ class TensorDeserializer(
 
             shared_buffer_tensor: Optional[torch.Tensor] = None
             shared_buffer_mv: Optional[memoryview] = None
-            cufileread_thread = None
+            cuda_copy_thread = None
             if is_cuda:
                 total_tensor_bytes = end_offset - begin_offset
                 big_tensor = torch.empty(
@@ -2793,31 +2792,39 @@ class TensorDeserializer(
 
                 def load_into_cuda():
                     pinned_buffer_size = 1024 * 1024 * 16
-                    pinned_buffer = _cuda_file.allocate_buffer(pinned_buffer_size)
-
-                    if os.environ.get("O_DIRECT"):
-                        fd = os.open(
-                            unsafe_self._file_spec, os.O_RDONLY | os.O_DIRECT
-                        )
-                    else:
-                        fd = file_.fileno()
-                    
-                    cufileread_args = [
-                        fd,
-                        big_tensor.data_ptr(),
-                        end_offset - begin_offset,
-                        begin_offset,
-                        pinned_buffer,
+                    pinned_buffer = _cuda_file.allocate_buffer(
                         pinned_buffer_size
-                    ]
-
-
-                    start = time.perf_counter_ns() if _perf_stats else 0
-                    _cuda_file.copy_to_device(*cufileread_args)
-                    # _syscalls.cuFileRead(*cufileread_args)
-                    cufile_read_duration = (
-                        time.perf_counter_ns() - start if _perf_stats else 0
                     )
+
+                    fd = None
+                    try:
+                        if os.environ.get("O_DIRECT"):
+                            fd = os.open(
+                                unsafe_self._file_spec,
+                                os.O_RDONLY | os.O_DIRECT,
+                            )
+                        else:
+                            fd = file_.fileno()
+
+                        cufileread_args = [
+                            fd,
+                            big_tensor.data_ptr(),
+                            end_offset - begin_offset,
+                            begin_offset,
+                            pinned_buffer,
+                            pinned_buffer_size,
+                        ]
+                        start = time.perf_counter_ns() if _perf_stats else 0
+                        _cuda_file.copy_to_device(*cufileread_args)
+                        cufile_read_duration = (
+                            time.perf_counter_ns() - start if _perf_stats else 0
+                        )
+                    finally:
+                        if fd is not None and fd != file_.fileno():
+                            os.close(fd)
+                        _cuda_file.deallocate_buffer(
+                            pinned_buffer, pinned_buffer_size
+                        )
 
                     cufile_read_bytes = end_offset - begin_offset
                     if _perf_stats and (
@@ -2827,12 +2834,11 @@ class TensorDeserializer(
                             _perf_stats.file_readinto_ns += cufile_read_duration
                             _perf_stats.file_readinto_bytes += cufile_read_bytes
 
-                cufileread_thread = threading.Thread(target=load_into_cuda)
-                cufileread_thread.start()
+                cuda_copy_thread = threading.Thread(target=load_into_cuda)
+                cuda_copy_thread.start()
 
             tensor_items_by_name: Dict[str, int] = {
                 t.name: t for t in tensor_items
-
             }
 
             # skip past whatever we started at to adjust for 8-byte aligned offset
@@ -3002,7 +3008,7 @@ class TensorDeserializer(
                 tensors_read += 1
 
             if is_cuda:
-                cufileread_thread.join()
+                cuda_copy_thread.join()
                 for item in to_out_queue:
                     transfer_out_queue.put(item)
         except Exception as e:
