@@ -2820,7 +2820,7 @@ class TensorDeserializer(
                             time.perf_counter_ns() - start if _perf_stats else 0
                         )
                     finally:
-                        if fd is not None and fd != file_.fileno():
+                        if fd is not None and os.environ.get("O_DIRECT"):
                             os.close(fd)
                         _cuda_file.deallocate_buffer(
                             pinned_buffer, pinned_buffer_size
