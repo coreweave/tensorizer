@@ -104,10 +104,6 @@ def copy_to_device(int fd, unsigned long device_ptr, ssize_t size, unsigned long
     cdef PerfTimer readTimer = _NewPerfTimer()
     cdef PerfTimer copyTimer = _NewPerfTimer()
 
-    pinned_buffer_size = pinned_buffer_size>>1
-    cdef char_ptr[2] pinned_buffers_flipflop = [<char*>(pinned_buffer), <char*>(pinned_buffer) + (pinned_buffer_size)]
-    cdef int flipflop = 0
-
     # Align fd_offset to the page boundary
     fd_offset_aligned = fd_offset & ~4095
     to_skip = fd_offset - fd_offset_aligned
@@ -124,11 +120,11 @@ def copy_to_device(int fd, unsigned long device_ptr, ssize_t size, unsigned long
             to_read_size = to_read_size_aligned
             
             StartTimer(&readTimer)
-            read_bytes = pread(fd, <void *>(pinned_buffers_flipflop[flipflop]), to_read_size, fd_offset)
+            read_bytes = pread(fd, <void *>(pinned_buffer), to_read_size, fd_offset)
             StopTimer(&readTimer)
             if read_bytes != to_read_size:
                 if read_bytes < 0 or (read_bytes % 4096 != 0 and read_bytes < size):
-                    raise ValueError('Read %d bytes, expected %d. size=%d to_skip=%d errno=%d' % (read_bytes, to_read_size, size, to_skip, errno))
+                    raise OSError(errno, 'Read %d bytes, expected %d. size=%d to_skip=%d' % (read_bytes, to_read_size, size, to_skip))
                 elif read_bytes == 0:
                     continue
                 else:
@@ -136,10 +132,10 @@ def copy_to_device(int fd, unsigned long device_ptr, ssize_t size, unsigned long
 
 
             StartTimer(&copyTimer)
-            err = cudaMemcpyAsync(_device_ptr, <void *>(pinned_buffers_flipflop[flipflop] + to_skip), read_bytes - to_skip - to_strip, cudaMemcpyHostToDevice, 0)
+            err = cudaMemcpy(_device_ptr, <void *>(pinned_buffer + to_skip), read_bytes - to_skip - to_strip, cudaMemcpyHostToDevice)
             StopTimer(&copyTimer)
             if err != 0:
-                raise ValueError('Cuda error in cudaMemcpy: %d' % err)
+                raise RuntimeError('Cuda error in cudaMemcpy: %d' % err)
 
             fd_offset += read_bytes - to_strip
             _device_ptr += read_bytes - to_skip - to_strip
