@@ -2751,26 +2751,7 @@ class TensorDeserializer(
         shared_buffer_mv: Optional[memoryview] = None
         try:
             if thread_idx != 0:
-                try:
-                    file_ = unsafe_self._reopen(
-                        begin=begin_offset, end=end_offset
-                    )
-                except ValueError as e:
-                    msg: str = str(e)
-                    # The effective num_readers in this call may be lower
-                    # than the originally requested value.
-                    original_num_readers = unsafe_self._num_readers
-                    if "Cannot request a byte range" in msg:
-                        extended_msg: str = (
-                            f"{msg}"
-                            "\nRange requests can be avoided during"
-                            " tensor deserialization by instantiating a"
-                            " TensorDeserializer object with num_readers=1"
-                            f" (currently: num_readers={original_num_readers})."
-                        )
-                        raise ValueError(extended_msg) from e
-                    else:
-                        raise
+                file_ = unsafe_self._reopen(begin=begin_offset, end=end_offset)
             else:
                 file_ = unsafe_self._file
                 file_.seek(begin_offset)

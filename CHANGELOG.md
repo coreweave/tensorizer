@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to the `TensorDeserializer` constructor
   - Files capable of having multiple readers opened to the same source can
     make use of this parameter to increase deserialization speed
-    - Files on the filesystem and some HTTP(S) & S3 streams from
+    - Files on the filesystem and HTTP(S) & S3 streams from
       `stream_io.open_stream` are eligible to be reopened this way
   - The default is one sequential reader
 - Structured object serialization ([#115])
