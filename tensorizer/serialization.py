@@ -2720,24 +2720,35 @@ class TensorDeserializer(
     ):
         # Need to get rid of self or more safely have thread-local storage
 
-        is_cuda = unsafe_self._device.type == "cuda"
-        cuda_stream = None
-        if is_cuda:
-            cuda_stream = torch.cuda.Stream(unsafe_self._device)
+        try:
+            is_cuda = unsafe_self._device.type == "cuda"
+            cuda_stream = None
+            if is_cuda:
+                cuda_stream = torch.cuda.Stream(unsafe_self._device)
 
-        # Allocating pinned memory seems to block creating new threads, so
-        # ensure all threads are created before we go
-        barrier.wait()
+            # Allocating pinned memory seems to block creating new threads, so
+            # ensure all threads are created before we go
+            barrier.wait(timeout=_TIMEOUT)
 
-        begin_offset = tensor_items[0].offset
-        # End offsets for range requests include the final byte
-        end_offset = (
-            tensor_items[-1].data_offset + tensor_items[-1].data_length - 1
-        )
+            if len(tensor_items) == 0:
+                return
+
+            begin_offset = tensor_items[0].offset
+            # End offsets for range requests include the final byte
+            end_offset = (
+                tensor_items[-1].data_offset + tensor_items[-1].data_length - 1
+            )
+        except Exception as e:
+            barrier.abort()
+            transfer_out_queue.put(e)
+            del transfer_out_queue
+            return
 
         file_ = None
         readinto_duration = readinto_bytes = 0
 
+        shared_buffer_tensor: Optional[torch.Tensor] = None
+        shared_buffer_mv: Optional[memoryview] = None
         try:
             if thread_idx != 0:
                 try:
@@ -2767,8 +2778,6 @@ class TensorDeserializer(
             # create CPU-pinned memory buffer
             # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
 
-            shared_buffer_tensor: Optional[torch.Tensor] = None
-            shared_buffer_mv: Optional[memoryview] = None
             if is_cuda:
                 total_tensor_bytes: int = max(
                     t.deserialized_length for t in tensor_items
@@ -2921,6 +2930,7 @@ class TensorDeserializer(
         except Exception as e:
             del shared_buffer_tensor, shared_buffer_mv
             transfer_out_queue.put(e)
+            del transfer_out_queue
         finally:
             if file_ is not None and file_ is not unsafe_self._file:
                 bytes_read = getattr(file_, "bytes_read", 0)
