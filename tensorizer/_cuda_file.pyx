@@ -41,7 +41,7 @@ cdef void* create_anonymous_mmap(size_t length) nogil:
 
 cdef struct PerfTimer:
     timespec start_time
-    int64_t elapsed_ns
+    int64_t* elapsed_ns
 
 cdef void StartTimer(PerfTimer* timer) noexcept nogil:
     clock_gettime(CLOCK_MONOTONIC, &timer.start_time)
@@ -142,7 +142,6 @@ def copy_to_device(int fd, unsigned long device_ptr, ssize_t size, unsigned long
             size -= min(size, read_bytes)
 
             to_skip = 0
-            flipflop = not flipflop
 
         printf("Read time: %ldns, %.3f GB/s\n", readTimer.elapsed_ns, orig_size / readTimer.elapsed_ns)
         printf("Copy time: %ldns, %.3f GB/s\n", copyTimer.elapsed_ns, orig_size / copyTimer.elapsed_ns)
