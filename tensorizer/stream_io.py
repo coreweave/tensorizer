@@ -187,11 +187,6 @@ class CAInfo:
         return hash(self._curl_flags)
 
 
-def _is_accelerated_object_storage(uri: str) -> bool:
-    domain = urlparse(uri.lower()).hostname.split(".")[-4:]
-    return (domain[0], *domain[2:]) == ("accel-object", "coreweave", "com")
-
-
 class CURLStreamFile(io.BufferedIOBase):
     """
     CURLStreamFile implements a file-like object around an HTTP download, the
@@ -249,17 +244,6 @@ class CURLStreamFile(io.BufferedIOBase):
 
         self._error_context = []
         self._curl = None
-        uses_range_request: bool = begin != 0 or end is not None
-
-        # Avoid Coreweave accel-object footgun
-        if uses_range_request and _is_accelerated_object_storage(uri):
-            raise ValueError(
-                "Cannot request a byte range from the"
-                " accel-object.<region>.coreweave.com object storage endpoint."
-                " Request a complete file, or use the"
-                " object.<region>.coreweave.com endpoint instead"
-                " via open_stream(uri, ..., s3_endpoint=...)."
-            )
 
         if curl_path is None:
             raise RuntimeError(
@@ -294,6 +278,7 @@ class CURLStreamFile(io.BufferedIOBase):
             uri,
         ]
 
+        uses_range_request: bool = begin != 0 or end is not None
         if uses_range_request:
             cmd.extend(["--range", f"{begin}-{end or ''}"])
 

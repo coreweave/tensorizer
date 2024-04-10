@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.9.0a0] - 2024-03-21
+## [2.9.0a0] & [2.9.0a1] - 2024-03-21–2024-04-10
 
 ### Added
 
@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to the `TensorDeserializer` constructor
   - Files capable of having multiple readers opened to the same source can
     make use of this parameter to increase deserialization speed
-    - Files on the filesystem and some HTTP(S) & S3 streams from
+    - Files on the filesystem and HTTP(S) & S3 streams from
       `stream_io.open_stream` are eligible to be reopened this way
   - The default is one sequential reader
 - Structured object serialization ([#115])
@@ -401,6 +401,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[2.9.0a1]: https://github.com/coreweave/tensorizer/compare/v2.9.0a1...v2.9.0a0
 [2.9.0a0]: https://github.com/coreweave/tensorizer/compare/v2.8.1...v2.9.0a0
 [2.8.1]: https://github.com/coreweave/tensorizer/compare/v2.8.0...v2.8.1
 [2.8.0]: https://github.com/coreweave/tensorizer/compare/v2.7.2...v2.8.0
