@@ -49,6 +49,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 with torch.device(device), no_init_or_tensor():
     model = AutoModelForCausalLM.from_config(config)
 
+input(f"PID {os.getpid()}")
 print(f"Deserializing to {device}:")
 before_mem = get_mem_usage()
 
@@ -87,7 +88,7 @@ model.eval()
 tokenizer = AutoTokenizer.from_pretrained(model_ref)
 eos = tokenizer.eos_token_id
 input_ids = tokenizer.encode(
-    "¡Hola! Encantado de conocerte. hoy voy a", return_tensors="pt"
+    "Hello! The best place to eat in San Francisco is ", return_tensors="pt"
 ).to(device)
 
 with torch.no_grad():
@@ -101,10 +102,10 @@ if tensorizer.serialization._enable_perf_stats:
     perf_stats = tensorizer.serialization._get_perf_stats()
     to_device_bytes = perf_stats["tensor_to_device_bytes"]
     to_device_secs = perf_stats["tensor_to_device_secs"]
-    to_device_speed = to_device_bytes / to_device_secs
+    to_device_speed = to_device_bytes / to_device_secs if to_device_secs else 0
     readinto_bytes = perf_stats["file_readinto_bytes"]
     readinto_secs = perf_stats["file_readinto_secs"]
-    readinto_speed = readinto_bytes / readinto_secs
+    readinto_speed = readinto_bytes / readinto_secs if readinto_secs else 0
 
     print(
         f"to CUDA stats: {to_device_bytes} bytes in"

@@ -36,7 +36,7 @@ classifiers = [
 "Changelog" = "https://github.com/coreweave/tensorizer/blob/main/CHANGELOG.md"
 
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools", "wheel", "Cython"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

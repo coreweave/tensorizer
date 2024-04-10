@@ -6,6 +6,7 @@ import abc
 import collections.abc
 import concurrent.futures
 import contextlib
+import ctypes
 import dataclasses
 import enum
 import functools
@@ -55,6 +56,8 @@ import tensorizer._syscalls as _syscalls
 import tensorizer._tensor_path as _tensor_path
 import tensorizer.stream_io as stream_io
 import tensorizer.utils as utils
+from tensorizer import _name_threads  # noqa
+from tensorizer import _cuda_file
 from tensorizer._crypt._cgroup_cpu_count import (
     effective_cpu_count as _effective_cpu_count,
 )
@@ -104,6 +107,18 @@ logger = logging.getLogger(__name__)
 
 # Get CPU count
 cpu_count: int = _effective_cpu_count()
+
+_np_to_torch_dtype = {
+    numpy.dtype(bool): torch.bool,
+    numpy.dtype(numpy.uint8): torch.uint8,
+    numpy.dtype(numpy.int8): torch.int8,
+    numpy.dtype(numpy.int16): torch.int16,
+    numpy.dtype(numpy.int32): torch.int32,
+    numpy.dtype(numpy.int64): torch.int64,
+    numpy.dtype(numpy.float16): torch.float16,
+    numpy.dtype(numpy.float32): torch.float32,
+    numpy.dtype(numpy.float64): torch.float64,
+}
 
 
 class _SupportsBool(typing.Protocol):
@@ -448,6 +463,8 @@ class _TensorHeaderSerializer:
             )
         )
         self.size = self.data_offset
+        # align to next 8-byte boundary
+        self.data_offset = (self.data_offset + 7) & ~7
 
         self.buffer = bytearray(self.size)
         self.start_segment.pack_into(
@@ -575,6 +592,7 @@ class _TensorHeaderDeserializer:
     hashes: List[TensorHash]
     crypt_info: Optional[_crypt_info.CryptInfo]
     data_length: int
+    header_length: int
 
     _hashable_segments: Sequence[slice]
 
@@ -677,6 +695,7 @@ class _TensorHeaderDeserializer:
         self.data_length = self.data_length_segment.unpack_from(buffer, offset)[
             0
         ]
+        self.header_length = len(buffer)
 
     def _hashable_segment_views(self):
         for segment_slice in self._hashable_segments:
@@ -1496,7 +1515,7 @@ class TensorDeserializer(
     class _CopiedData:
         __slots__ = ("header", "numpy_tensor", "parameter")
         header: _TensorHeaderDeserializer
-        numpy_tensor: _NumpyTensor
+        numpy_tensor: Optional[_NumpyTensor]  # set if device is 'cpu'
         parameter: torch.nn.Parameter
 
     def __init__(
@@ -1907,6 +1926,7 @@ class TensorDeserializer(
 
             preload_thread = threading.Thread(target=_attempt_preload)
             preload_thread.start()
+
             return preload_thread.join
         else:
             return lambda timeout=None: None
@@ -2721,23 +2741,18 @@ class TensorDeserializer(
         # Need to get rid of self or more safely have thread-local storage
 
         is_cuda = unsafe_self._device.type == "cuda"
-        cuda_stream = None
-        if is_cuda:
-            cuda_stream = torch.cuda.Stream(unsafe_self._device)
 
-        # Allocating pinned memory seems to block creating new threads, so
-        # ensure all threads are created before we go
-        barrier.wait()
+        # read starting at the previous 8-byte aligned offset
+        begin_offset_bump = tensor_items[0].offset % 8
+        begin_offset = tensor_items[0].offset - begin_offset_bump
 
-        begin_offset = tensor_items[0].offset
-        # End offsets for range requests include the final byte
-        end_offset = (
-            tensor_items[-1].data_offset + tensor_items[-1].data_length - 1
-        )
+        # TODO: push the 'off by one' logic down to HTTP
+        end_offset = tensor_items[-1].data_offset + tensor_items[-1].data_length
 
         file_ = None
         readinto_duration = readinto_bytes = 0
 
+        to_out_queue = []
         try:
             if thread_idx != 0:
                 try:
@@ -2764,28 +2779,70 @@ class TensorDeserializer(
                 file_ = unsafe_self._file
                 file_.seek(begin_offset)
 
-            # create CPU-pinned memory buffer
-            # TODO: experiment with mmap(MMAP_LOCKED | MMAP_ANONYMOUS | MMAP_PRIVATE)
-
             shared_buffer_tensor: Optional[torch.Tensor] = None
             shared_buffer_mv: Optional[memoryview] = None
+            cuda_copy_thread = None
             if is_cuda:
-                total_tensor_bytes: int = max(
-                    t.deserialized_length for t in tensor_items
-                )
-                shared_buffer_tensor = torch.empty(
+                total_tensor_bytes = end_offset - begin_offset
+                big_tensor = torch.empty(
                     (total_tensor_bytes,),
-                    device="cpu",
+                    device=unsafe_self._device,
                     dtype=torch.uint8,
-                    pin_memory=True,
-                )
-                shared_buffer_mv: memoryview = (
-                    shared_buffer_tensor.numpy().data.cast("B")
                 )
 
-            tensor_sizes_by_name: Dict[_TensorPath, int] = {
-                t.name: t.deserialized_length for t in tensor_items
+                def load_into_cuda():
+                    pinned_buffer_size = 1024 * 1024 * 16
+                    pinned_buffer = _cuda_file.allocate_buffer(
+                        pinned_buffer_size
+                    )
+
+                    fd = None
+                    try:
+                        if os.environ.get("O_DIRECT"):
+                            fd = os.open(
+                                unsafe_self._file_spec,
+                                os.O_RDONLY | os.O_DIRECT,
+                            )
+                        else:
+                            fd = file_.fileno()
+
+                        cufileread_args = [
+                            fd,
+                            big_tensor.data_ptr(),
+                            end_offset - begin_offset,
+                            begin_offset,
+                            pinned_buffer,
+                            pinned_buffer_size,
+                        ]
+                        start = time.perf_counter_ns() if _perf_stats else 0
+                        _cuda_file.copy_to_device(*cufileread_args)
+                        cufile_read_duration = (
+                            time.perf_counter_ns() - start if _perf_stats else 0
+                        )
+                    finally:
+                        if fd is not None and os.environ.get("O_DIRECT"):
+                            os.close(fd)
+                        _cuda_file.deallocate_buffer(
+                            pinned_buffer, pinned_buffer_size
+                        )
+
+                    cufile_read_bytes = end_offset - begin_offset
+                    if _perf_stats and (
+                        cufile_read_duration or cufile_read_bytes
+                    ):
+                        with _perf_stats.lock:
+                            _perf_stats.file_readinto_ns += cufile_read_duration
+                            _perf_stats.file_readinto_bytes += cufile_read_bytes
+
+                cuda_copy_thread = threading.Thread(target=load_into_cuda)
+                cuda_copy_thread.start()
+
+            tensor_items_by_name: Dict[str, int] = {
+                t.name: t for t in tensor_items
             }
+
+            # skip past whatever we started at to adjust for 8-byte aligned offset
+            file_.seek(begin_offset_bump, os.SEEK_CUR)
 
             # then for each tensor in tensor_items
             tensors_read = 0
@@ -2802,8 +2859,20 @@ class TensorDeserializer(
                 if header is None:
                     raise ValueError("Unexpected empty header")
 
+                tensor_metadata = unsafe_self._metadata.get(header.name)
+                if tensor_metadata is None:
+                    raise ValueError(
+                        "Unexpected tensor for which there is no metadata"
+                    )
+
+                padding = (
+                    tensor_metadata.data_offset - tensor_metadata.offset
+                ) - header.header_length
+                if padding:
+                    file_.seek(padding, os.SEEK_CUR)
+
                 # Skip it if this tensor is not one we're supposed to load
-                if header.name not in tensor_sizes_by_name:
+                if header.name not in tensor_items_by_name:
                     file_.seek(header.data_length, io.SEEK_CUR)
                     continue
 
@@ -2820,10 +2889,10 @@ class TensorDeserializer(
                         f"{header.dtype!r}"
                     )
 
-                unsafe_self._metadata[header.name].hashes = header.hashes
+                tensor_metadata.hashes = header.hashes
 
                 header_hashes = header.compute_hashes()
-                unsafe_self._metadata[header.name].header_hashes = header_hashes
+                tensor_metadata.header_hashes = header_hashes
 
                 is_encrypted: bool = (
                     header.crypt_info is not None
@@ -2847,14 +2916,15 @@ class TensorDeserializer(
                     key = None
                     encryption_method = None
 
-                needed_buffer_size = tensor_sizes_by_name[header.name]
+                needed_buffer_size = tensor_metadata.deserialized_length
                 is_meta = needed_buffer_size > 0 and header.data_length == 0
                 assert is_meta or needed_buffer_size == header.data_length
 
                 if is_cuda:
                     if is_meta:
                         shared_buffer_tensor[:needed_buffer_size].zero_()
-                    mv: memoryview = shared_buffer_mv[:needed_buffer_size]
+                    # BCHESS
+                    # mv: memoryview = shared_buffer_mv[:needed_buffer_size]
                 else:
                     # Not in CUDA, no pinned memory.
                     # Allocate a new buffer for each tensor
@@ -2879,7 +2949,11 @@ class TensorDeserializer(
                             mv,
                         )
                     else:
-                        file_.readinto(mv)
+                        if is_cuda:
+                            file_.seek(tensor_metadata.data_length, os.SEEK_CUR)
+                        else:
+                            file_.readinto(mv)
+                            readinto_bytes += mv.nbytes
 
                     if verify_hash:
                         unsafe_self._verify_hashes(
@@ -2887,37 +2961,56 @@ class TensorDeserializer(
                         )
 
                     readinto_duration += (
-                        time.perf_counter_ns() - start if _perf_stats else 0
+                        time.perf_counter_ns() - start
+                        if _perf_stats and not is_cuda
+                        else 0
                     )
-                    readinto_bytes += mv.nbytes
 
                 # create a tensor around it and maybe torch.to('cuda')
-                numpy_tensor = _NumpyTensor.from_buffer(
-                    numpy_dtype,
-                    torch_dtype,
-                    header.shape,
-                    mv,
-                )
-                del mv
-                tensor = numpy_tensor.to_tensor()
-
-                stream_context = (
-                    torch.cuda.stream(cuda_stream)
-                    if is_cuda
-                    else contextlib.nullcontext()
-                )
-                with stream_context:
-                    parameter = unsafe_self._to_torch_parameter(tensor)
-                    if cuda_stream is not None:
-                        cuda_stream.synchronize()
-
-                # put it on transfer_out_queue
-                transfer_out_queue.put(
-                    TensorDeserializer._CopiedData(
-                        header, numpy_tensor, parameter
+                if is_cuda:
+                    numpy_tensor = None
+                    tensor = big_tensor.as_strided(
+                        size=(needed_buffer_size,),
+                        stride=(1,),
+                        storage_offset=(
+                            tensor_metadata.data_offset - begin_offset
+                        ),
                     )
-                )
+
+                    if torch_dtype is None:
+                        torch_dtype = _np_to_torch_dtype[
+                            numpy.dtype(numpy_dtype)
+                        ]
+
+                    tensor = tensor.view(torch_dtype).view(header.shape)
+                    parameter = unsafe_self._to_torch_parameter(tensor)
+                    to_out_queue.append(
+                        TensorDeserializer._CopiedData(header, None, parameter)
+                    )
+                else:
+                    numpy_tensor = _NumpyTensor.from_buffer(
+                        numpy_dtype,
+                        torch_dtype,
+                        header.shape,
+                        mv,
+                    )
+                    del mv
+                    tensor = numpy_tensor.to_tensor()
+                    parameter = unsafe_self._to_torch_parameter(tensor)
+
+                    # put it on transfer_out_queue
+                    transfer_out_queue.put(
+                        TensorDeserializer._CopiedData(
+                            header, numpy_tensor, parameter
+                        )
+                    )
+
                 tensors_read += 1
+
+            if is_cuda:
+                cuda_copy_thread.join()
+                for item in to_out_queue:
+                    transfer_out_queue.put(item)
         except Exception as e:
             del shared_buffer_tensor, shared_buffer_mv
             transfer_out_queue.put(e)
@@ -3840,7 +3933,7 @@ class TensorSerializer:
                 header.add_sha256(sha256)
             if encrypt_future is not None:
                 header.update_crypt_info()
-            self._pwrite(header.buffer, header_pos, verify=header.data_offset)
+            self._pwrite(header.buffer, header_pos, verify=header.size)
 
         hash_tasks = []
         if encrypted and not _temporary_buffer:
