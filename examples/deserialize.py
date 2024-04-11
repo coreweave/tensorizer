@@ -10,14 +10,14 @@ from tensorizer import DecryptionParams, TensorDeserializer
 from tensorizer.utils import convert_bytes, get_mem_usage, no_init_or_tensor
 
 parser = argparse.ArgumentParser("deserialize")
-parser.add_argument("--source", default=None, help="local path or URL")
+parser.add_argument("--source", required=True, help="local path or URL")
 parser.add_argument("--model-ref", default="EleutherAI/gpt-j-6B")
 parser.add_argument("--no-plaid", action="store_true")
 parser.add_argument("--lazy-load", action="store_true")
 parser.add_argument("--verify-hash", action="store_true")
 parser.add_argument("--encryption", action="store_true")
 parser.add_argument("--viztracer", action="store_true")
-parser.add_argument("--num-readers", type=int, default=1)
+parser.add_argument("--num-readers", type=int, default=None)
 
 args = parser.parse_args()
 
@@ -25,9 +25,6 @@ model_ref = args.model_ref
 # To run this at home, swap this with the line below for a smaller example:
 # model_ref = "EleutherAI/gpt-neo-125M"
 model_name = model_ref.split("/")[-1]
-
-if args.source is None:
-    args.source = f"s3://{s3_bucket}/{model_name}.tensors"
 
 tracer = None
 if args.viztracer:
