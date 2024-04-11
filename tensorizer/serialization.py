@@ -2734,9 +2734,8 @@ class TensorDeserializer(
                 return
 
             begin_offset = tensor_items[0].offset
-            # End offsets for range requests include the final byte
             end_offset = (
-                tensor_items[-1].data_offset + tensor_items[-1].data_length - 1
+                tensor_items[-1].data_offset + tensor_items[-1].data_length
             )
         except Exception as e:
             barrier.abort()

@@ -40,8 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `end` applies only to HTTP(S) & S3 streams, for which it is interpreted
       as the `start` and `end` parameters for the created `CURLStreamFile`
       object
-      - `end` is inclusive, like in an HTTP byte range request,
-        not one-past-the-end
 
 [#87]: https://github.com/coreweave/tensorizer/pull/87
 [#115]: https://github.com/coreweave/tensorizer/pull/115
