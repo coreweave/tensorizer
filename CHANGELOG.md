@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     make use of this parameter to increase deserialization speed
     - Files on the filesystem and HTTP(S) & S3 streams from
       `stream_io.open_stream` are eligible to be reopened this way
-  - The default is one sequential reader
+  - The default number of readers is dynamic based on the type of file used
+    - To disable concurrent readers, pass `num_readers=1` as a parameter
 - Structured object serialization ([#115])
   - `TensorSerializer.write_state_dict` can now write nested mappings,
     sequences, and other mixtures of mappings and sequences nested in each other
