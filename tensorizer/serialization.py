@@ -1709,7 +1709,7 @@ class TensorDeserializer(
                 del process
                 allowed_ram = free_ram - (10 << 20)
                 tensor_sizes = sorted(
-                    (t.deserialized_length for t in self._metadata),
+                    (t.deserialized_length for t in self._metadata.values()),
                     reverse=True,
                 )
                 num_readers = min(num_readers, len(tensor_sizes)) or 1
