@@ -1701,15 +1701,7 @@ class TensorDeserializer(
                 else:
                     num_readers = 2
                 if is_cuda:
-                    process = psutil.Process()
-                    free_ram = (
-                        psutil.virtual_memory().free
-                        - process.memory_info().rss
-                        - sum(
-                            p.memory_info().rss for p in process.children(True)
-                        )
-                    )
-                    del process
+                    free_ram = psutil.virtual_memory().available
                     allowed_ram = free_ram - (10 << 20)
                     tensor_sizes = sorted(
                         (
