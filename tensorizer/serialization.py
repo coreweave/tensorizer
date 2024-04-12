@@ -61,6 +61,7 @@ import tensorizer.utils as utils
 from tensorizer._crypt._cgroup_cpu_count import (
     effective_cpu_count as _effective_cpu_count,
 )
+from tensorizer._multifuture import _MultiFuture, _future_wait_and_raise
 from tensorizer._internal_utils import Chunked as _Chunked
 from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import _NumpyTensor, OPAQUE_DTYPE_SEP
@@ -3758,16 +3759,20 @@ class TensorSerializer:
             # Additional payloads that get set and used during the prepare_for_write procedures
             self.numpy_tensor: Optional[_NumpyTensor] = None # $et in _prepare_for_write_numpy_tensor
             self.header: Optional[_TensorHeaderSerializer] = None  # $et in _prepare_for_write_headers
-            self.hash_tasks: List[concurrent.futures.Future] = []  # $et in _prepare_for_write_hashes
-            self.encrypt_task: Optional[concurrent.futures.Future] = None  # $et in _do_encryption if encrypted
             self.encryptor: Optional[_crypt.ChunkedEncryption] = None  # $et in _do_encryption if encrypted
 
+            # self.tensor_data_task is a future for processing some contents of self.tensor
+            # e.g. cuda transfer, make_contiguous, hashing, encryption, writing, or decryption.
+            # They are often chained from one step of the process to the next
+            self.tensor_data_task: Optional[concurrent.futures.Future] = None
 
         def set_min_file_version_number(self, version_number):
             self.min_file_version = max(self.min_file_version, version_number)
 
         @property
         def tensor_memory(self):
+            if self.tensor_data_task is not None:
+                raise RuntimeError("Attempt to access tensor memory while being modified")
             return self.numpy_tensor.data.data
 
     def _write_tensor(
@@ -4123,9 +4128,7 @@ class TensorSerializer:
         return tensor_endpos
 
     @staticmethod
-    def _async_bulk_device_to_host_transfer(
-        write_specs: Sequence[_WriteSpec], max_read_ahead: Optional[int] = 32
-    ) -> Tuple[Iterator[_WriteSpec], Callable]:
+    def _async_bulk_device_to_host_transfer(write_specs: Sequence[_WriteSpec]) -> None:
         """
         Transfers CUDA tensors to host memory asynchronously in bulk.
 
@@ -4137,66 +4140,7 @@ class TensorSerializer:
             A tuple containing an iterator over CPU-based WriteSpecs,
             and a callback to cancel the transfer early.
         """
-        if len(write_specs) < max_read_ahead:
-            transferred = queue.SimpleQueue()
-        else:
-            transferred = queue.Queue(maxsize=max_read_ahead)
-
-        tensor_sizes = [w.tensor.element_size() * w.tensor.nelement() for w in write_specs]
-        staging_tensor = torch.empty(
-            (max(tensor_sizes),),
-            dtype=torch.uint8,
-            device="cpu",
-            pin_memory=True,
-        )
-
-        transfer_finished = False
-
-        def _transfer():
-            nonlocal transfer_finished
-            stream = torch.cuda.Stream()
-            with torch.cuda.stream(stream):
-                # This is in a separate CUDA stream because it shouldn't
-                # affect any other GPU operations, even though each
-                # of these transfers are synchronous
-                try:
-                    for w, nbytes in zip(write_specs, tensor_sizes):
-                        if transfer_finished:
-                            break
-                        staging_tensor_view = (
-                            staging_tensor.narrow(0, 0, nbytes)
-                            .view(t.dtype)
-                            .view(t.shape)
-                        )
-                        staging_tensor_view.copy_(w.tensor)
-                        w.user_owns_tensor_data = False
-                        w.tensor = staging_tensor_view.clone().detach()
-                        transferred.put(
-                            w,
-                            timeout=_TIMEOUT,
-                        )
-                finally:
-                    # Sentinel
-                    transferred.put(None)
-                    transfer_finished = True
-
-        transfer_thread = threading.Thread(
-            target=_transfer, name="TensorizerTransfer", daemon=True
-        )
-        transfer_thread.start()
-
-        def _interrupt_transfer():
-            nonlocal transfer_finished
-            if not transfer_finished:
-                # Signal the worker thread to end on its next loop
-                transfer_finished = True
-                try:
-                    # Unstick the worker thread so that
-                    # it isn't waiting for an open spot
-                    # that will never arrive
-                    transferred.get_nowait()
-                except queue.Empty:
-                    pass
+        
 
         return (
             iter(lambda: transferred.get(timeout=_TIMEOUT), None),
@@ -4233,9 +4177,9 @@ class TensorSerializer:
 
         # TODO: It's bizarre that we have both generator and future patterns for
         # async tasks. Lets move _prepare_for_write_cuda to a future pattern and get rid of the iterators
-        write_specs_i = self._prepare_for_write_cuda(write_specs)
-        write_specs_i = self._prepare_for_write_contiguous(write_specs_i)
-        write_specs = list(self._prepare_for_write_numpy_tensor(write_specs_i))
+        cuda_executor = self._prepare_for_write_cuda(write_specs)
+        self._prepare_for_write_contiguous(write_specs)
+        self._prepare_for_write_numpy_tensor(write_specs)
         self._prepare_for_write_opaque(write_specs)
         if self._encrypted:
             self._prepare_for_write_encryption(write_specs)
@@ -4561,6 +4505,7 @@ class TensorSerializer:
 
     @staticmethod
     def _prepare_with_filter(filter_fn: Callable[[_WriteSpec], bool]):
+        # BCHESS TODO: remove
         """ Helper for functions that prep tensors but only act on certain tensors, based on a filter
         The wrapped function only gets called with tensors that pass the filter
         Any tensors that don't pass the filter are passed through directly by the wrapper
@@ -4605,26 +4550,72 @@ class TensorSerializer:
             return wrapper
         return decorator
 
-    @_prepare_with_filter(lambda w: w.tensor.device.type == 'cuda')
-    def _prepare_for_write_cuda(self, cuda_specs: Sequence[_WriteSpec]) -> Iterator[_WriteSpec]:
-        (
-            transferred,
-            interrupt_transfer,
-        ) = self._async_bulk_device_to_host_transfer(cuda_specs)
-        # BCHESS TODO: interrupt_transfer
-        yield from transferred
+    def _prepare_for_write_cuda(self, write_specs: Sequence[_WriteSpec]) -> concurrent.futures.ThreadPoolExecutor:
+        cuda_specs = [w for w in write_specs if w.tensor.device.type == "cuda"]
+        if not cuda_specs:
+            return
 
-    @_prepare_with_filter(lambda w: not w.tensor.is_contiguous())
-    def _prepare_for_write_contiguous(self, non_contiguous_specs: Sequence[_WriteSpec]) -> Iterator[_WriteSpec]:
-        for w in non_contiguous_specs:
-            # BCHESS TODO: put this on an async pool
-            w.tensor = w.tensor.contiguous()
-            w.data_length = w.tensor.nbytes
-            w.user_owns_tensor_data = False
-            yield w
+        class CudaTransfer():
+            def __init__(self, max_size):
+                self.executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix='TransferThread',
+                    initializer=self._allocate_staging_tensor,
+                    initargs=(max_size,),
+                )
 
-    def _prepare_for_write_numpy_tensor(self, write_specs: Iterator[_WriteSpec]) -> Iterator[_WriteSpec]:
+            def submit(self, write_spec) -> concurrent.futures.Future:
+                return self.executor.submit(self._transfer, write_spec)
+
+            def _allocate_staging_tensor(self, max_size):
+                self._stream = torch.cuda.Stream()
+                self._staging_tensor = torch.empty(
+                    (max_size,),
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                )
+
+            def _transfer(self, write_spec):
+                nbytes = write_spec.tensor.element_size() * write_spec.tensor.nelement()
+                staging_tensor_view = (
+                    self._staging_tensor.narrow(0, 0, nbytes)
+                    .view(write_spec.dtype)
+                    .view(write_spec.shape)
+                )
+                with torch.cuda.stream(self._stream):
+                    staging_tensor_view.copy_(write_spec.tensor)
+                write_spec.user_owns_tensor_data = False
+                write_spec.tensor = staging_tensor_view.clone().detach()
+
+        max_tensor_size = [w.tensor.element_size() * w.tensor.nelement() for w in cuda_specs]
+        cuda_transfer = CudaTransfer(max_tensor_size)
+
+        for cuda_spec in cuda_specs:
+            assert cuda_specs.tensor_data_task is None
+            cuda_specs.tensor_data_task = cuda_transfer.submit(cuda_specs)
+
+        return cuda_transfer.executor
+
+    def _prepare_for_write_contiguous(self, write_specs: Sequence[_WriteSpec]):
+        def make_contiguous(write_spec, dependency):
+            if dependency is not None:
+                dependency.result(_TIMEOUT)
+            write_spec.tensor = write_spec.tensor.contiguous()
+            write_spec.data_length = write_spec.tensor.nbytes
+            write_spec.user_owns_tensor_data = False
+
         for w in write_specs:
+            if w.tensor.is_contiguous():
+                continue
+            w.tensor_data_task = self._computation_pool.submit(make_contiguous, w, w.tensor_data_task)
+
+    def _prepare_for_write_numpy_tensor(self, write_specs: Sequence[_WriteSpec]):
+        for w in write_specs:
+            # all futures are resolved here. This step is not multi-threaded.
+            if w.tensor_data_task is not None:
+                w.tensor_data_task.result(_TIMEOUT)
+                w.tensor_data_task = None
             w.numpy_tensor = _NumpyTensor.from_tensor(w.tensor)
             w.dtype = w.numpy_tensor.numpy_dtype
             if w.numpy_tensor.data.data.nbytes != w.tensor.nbytes:
@@ -4633,19 +4624,18 @@ class TensorSerializer:
                     f" buffer size of underlying memory ({w.numpy_tensor.data.data.nbytes})"
                     f" doesn't match reported size ({w.tensor.nbytes})"
                 )
-            yield w
 
     def _prepare_for_write_opaque(self, write_specs: Sequence[_WriteSpec]) -> None:
         for w in write_specs:
-            if not w.numpy_tensor.is_opaque:
+            if not w.numpy_tensor.is_opaque:  # type: ignore
                 continue
             # The datatype name needs to contain both the numpy dtype that the
             # data is serialized as and the original torch dtype.
-            w.dtype += OPAQUE_DTYPE_SEP + w.numpy_tensor.torch_dtype
+            w.dtype += OPAQUE_DTYPE_SEP + w.numpy_tensor.torch_dtype  # type: ignore
             w.set_min_file_version_number(OPAQUE_TENSORIZER_VERSION)
 
     def _prepare_for_write_encryption(self, write_specs: Sequence[_WriteSpec]) -> None:
-        assert self._encrypted
+        assert self._encrypted and self._encryption is not None
 
         for w in write_specs:
             assert w.numpy_tensor is not None
@@ -4657,7 +4647,11 @@ class TensorSerializer:
                 w.crypt_info = _crypt_info.CryptInfo()
                 return
 
-            tensor_memory: memoryview = w.numpy_tensor.data.data
+            if w.tensor_data_task is not None:
+                w.tensor_data_task.result(_TIMEOUT)
+                w.tensor_data_task = None
+
+            tensor_memory: memoryview = w.tensor_memory
             chunked = _Chunked(
                 total_size=tensor_memory.nbytes,
                 chunk_size=self._crypt_chunk_size,
@@ -4677,15 +4671,12 @@ class TensorSerializer:
                 nonce=nonces[0],
                 macs=w.encryptor.macs,
             )
+            chunks: Sequence[Any]
             if key_derivation_chunk is not None:
                 chunks = (key_derivation_chunk, encryption_algorithm_chunk)
             else:
                 chunks = (encryption_algorithm_chunk,)
             w.crypt_info = _crypt_info.CryptInfo(chunks)
-
-    def _prepare_for_write_meta(self, write_specs: Sequence[_WriteSpec]) -> None:
-        # TDOO
-        pass
 
     def _prepare_for_write_headers(self, write_specs: Sequence[_WriteSpec]) -> None:
         file_offset = self._file.tell()
@@ -4714,30 +4705,45 @@ class TensorSerializer:
             w.header.build(file_offset)  # type: ignore
             file_offset += w.data_length
 
+    def _prepare_for_write_meta(self, write_specs: Sequence[_WriteSpec]) -> None:
+        # TDOO
+        pass
+
     def _prepare_for_write_hashes(self, write_specs: Sequence[_WriteSpec]) -> None:
-        def compute_crc32(write_spec):
+        def compute_crc32(write_spec: TensorSerializer._WriteSpec, dependency: Optional[concurrent.futures.Future]):
+            if dependency is not None:
+                dependency.result(_TIMEOUT)
             header_crc32 = write_spec.header.compute_crc32()
             crc32 = zlib.crc32(write_spec.tensor_memory, header_crc32)
             write_spec.header.add_crc32(crc32)
 
-        def compute_sha256(write_spec):
+        def compute_sha256(write_spec: TensorSerializer._WriteSpec, dependency: Optional[concurrent.futures.Future]):
+            if dependency is not None:
+                dependency.result(_TIMEOUT)
             sha256 = write_spec.header.compute_sha256()
             sha256.update(write_spec.tensor_memory)
             write_spec.header.add_sha256(sha256.digest())
 
         for w in write_specs:
             # BCHESS TODO: account for tensor sharing memory with other tensors (w.user_owns_tensor_data)
+            old_tensor_data_task = w.tensor_data_task
+
+            hash_tasks = []
             if w.include_crc32:
-                crc32_task = self._computation_pool.submit(compute_crc32, w)
-                w.hash_tasks.append(crc32_task)
+                crc32_task = self._computation_pool.submit(compute_crc32, w, old_tensor_data_task)
+                hash_tasks.append(crc32_task)
             if w.include_sha256:
-                sha256_task = self._computation_pool.submit(compute_sha256, w)
-                w.hash_tasks.append(sha256_task)
-            self._jobs.extend(w.hash_tasks)
+                sha256_task = self._computation_pool.submit(compute_sha256, w, old_tensor_data_task)
+                hash_tasks.append(sha256_task)
+
+            if hash_tasks:
+                w.tensor_data_task = _MultiFuture(hash_tasks)
+                self._jobs.extend(hash_tasks)
 
     def _do_encryption(self, write_specs: Sequence[_WriteSpec]) -> None:
-        def encrypt(write_spec):
-            _future_wait_and_raise(write_spec.hash_tasks, timeout=_TIMEOUT)
+        def encrypt(write_spec, dependency):
+            if dependency is not None:
+                dependency.result(_TIMEOUT)
             try:
                 write_spec.encryptor.encrypt_all(
                     wait=True,
@@ -4749,34 +4755,30 @@ class TensorSerializer:
 
         for w in write_specs:
             # TODO: account for tensor sharing memory with other tensors (w.user_owns_tensor_data)
-            w.encrypt_task = self._encryption_pool.submit(encrypt, w)
-            self._jobs.append(w.encrypt_task)
+            w.tensor_data_task = self._encryption_pool.submit(encrypt, w, w.tensor_data_task)
+            self._jobs.append(w.tensor_data_task)
 
     def _do_commit_headers(self, write_specs: Sequence[_WriteSpec]) -> None:
 
-        def commit_header(write_spec):
-            dependent_tasks = write_spec.hash_tasks
-            maybe_encrypt_task = getattr(write_spec, 'encrypt_task', None)
-            if maybe_encrypt_task:
-                # do not use += because that will modify the original hash_tasks list object
-                dependent_tasks = dependent_tasks + maybe_encrypt_task
-            _future_wait_and_raise(dependent_tasks, timeout=_TIMEOUT)
+        def commit_header(write_spec, dependency):
+            if dependency is not None:
+                dependency.result(_TIMEOUT)
             self._pwrite(write_spec.header.buffer, write_spec.header.file_offset, verify=write_spec.header.size)
 
         for w in write_specs:
-            commit_header_task = self._header_writer_pool.submit(commit_header, w)
+            commit_header_task = self._header_writer_pool.submit(commit_header, w, w.tensor_data_task)
+            # Note this does _not_ set w.tensor_data_task, as committing headers is safe
             self._jobs.append(commit_header_task)
 
     def _do_commit_tensor_data(self, write_specs: Sequence[_WriteSpec]):
-        def commit_tensor_data(write_spec):
+        def commit_tensor_data(write_spec: TensorSerializer._WriteSpec, dependency: Optional[concurrent.futures.Future]):
+            if dependency is not None:
+                dependency.result(_TIMEOUT)
             if write_spec.tensor.is_meta:
                 # TODO
                 return 0
-            maybe_encrypt_task = getattr(write_spec, 'encrypt_task', None)
-            if maybe_encrypt_task:
-                maybe_encrypt_task.result(_TIMEOUT)
             bytes_written = self._pwrite(
-                write_spec.tensor_memory, write_spec.header.data_offset, verify=write_spec.header.data_length
+                write_spec.tensor_memory, write_spec.header.data_offset, verify=write_spec.header.data_length  # tyoe: ignore
             )
             with self._tensor_count_update_lock: # BCHESS TODO ???
                 self._file_header.tensor_count += 1
@@ -4784,19 +4786,20 @@ class TensorSerializer:
             return bytes_written
 
         for w in write_specs:
-            w.write_task = self._writer_pool.submit(
-                commit_tensor_data, w
+            w.tensor_data_task = self._writer_pool.submit(
+                commit_tensor_data, w, w.tensor_data_task
             )
-            self._jobs.append(w.write_task)
+            self._jobs.append(w.tensor_data_task)
             
     def _maybe_decrypt_data(self, write_specs: Sequence[_WriteSpec]):
-        def decrypt(write_spec: _WriteSpec):
+        def decrypt(write_spec: TensorSerializer._WriteSpec, dependency: Optional[concurrent.futures.Future]):
             try:
-                write_spec.write_task.result(_TIMEOUT)
+                if dependency is not None:
+                    dependency.result(_TIMEOUT)
             finally:
                 # Try to decrypt again even if writing to disk failed
                 # to avoid exiting with the tensor memory in a modified state
-                fs = w.encryptor.decrypt_all(wait=False)
+                fs = write_spec.encryptor.decrypt_all(wait=False)  # type: ignore
                 try:
                     _crypt.ChunkedEncryption.wait_or_raise(
                         fs,
@@ -4805,7 +4808,7 @@ class TensorSerializer:
                     )
                 except _crypt.CryptographyError as e:
                     try:
-                        original_exc = write_spec.write_task.exception(timeout=0)
+                        original_exc = dependency.exception(timeout=0) if dependency is not None else None
                     except (
                         concurrent.futures.TimeoutError,
                         concurrent.futures.CancelledError,
@@ -4818,23 +4821,11 @@ class TensorSerializer:
         for w in write_specs:
             if not w.user_owns_tensor_data:
                 continue
-            decrypt_task = self._decryption_pool.submit(decrypt, w)
-            self._jobs.append(decrypt_task)
+            w.tensor_data_task = self._decryption_pool.submit(decrypt, w, w.tensor_data_task)
+            self._jobs.append(w.tensor_data_task)
             # TODO: BCHESS
             # assert mem_pointer is not None
             # self._decryption_jobs[mem_pointer] = decrypt_task
-
-
-
-def _future_wait_and_raise(futures: Sequence[concurrent.futures.Future], timeout: int):
-    # Wait on a list of futures with a timeout, and raise exceptions
-    fs = concurrent.futures.wait(futures, timeout=timeout)
-    for f in fs.done:
-        # if the future has an exception, this will raise it
-        f.result()
-    for f in fs.not_done:
-        # force raise of TimeoutError
-        f.result(0)
 
 def _get_perf_stats():
     if _perf_stats is None:
