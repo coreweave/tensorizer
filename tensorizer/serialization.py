@@ -1692,31 +1692,9 @@ class TensorDeserializer(
                 )
 
             if dynamic_num_readers:
-                if isinstance(
-                    getattr(self._file, "raw", self._file), io.FileIO
-                ):
-                    num_readers = 8
-                elif self._verify_hash:
-                    num_readers = 4
-                else:
-                    num_readers = 2
-                if is_cuda:
-                    free_ram = psutil.virtual_memory().available
-                    allowed_ram = free_ram - (10 << 20)
-                    tensor_sizes = sorted(
-                        (
-                            t.deserialized_length
-                            for t in self._metadata.values()
-                        ),
-                        reverse=True,
-                    )
-                    num_readers = min(num_readers, len(tensor_sizes)) or 1
-                    while (
-                        num_readers > 1
-                        and sum(tensor_sizes[:num_readers]) > allowed_ram
-                    ):
-                        num_readers -= 1
-                    del tensor_sizes
+                num_readers = self._choose_dynamic_num_readers(
+                    self._metadata.values()
+                )
 
             if num_readers < 1:
                 raise ValueError("num_readers must be positive")
@@ -1916,6 +1894,29 @@ class TensorDeserializer(
 
             return reopen_file
         return None
+
+    def _choose_dynamic_num_readers(
+        self, tensors: Iterable[TensorEntry]
+    ) -> int:
+        if isinstance(getattr(self._file, "raw", self._file), io.FileIO):
+            num_readers = 8
+        elif self._verify_hash:
+            num_readers = 4
+        else:
+            num_readers = 2
+        if self._device.type == "cuda":
+            free_ram = psutil.virtual_memory().available
+            allowed_ram = free_ram - (10 << 20)
+            tensor_sizes = sorted(
+                (t.deserialized_length for t in tensors), reverse=True
+            )
+            num_readers = min(num_readers, len(tensor_sizes)) or 1
+            while (
+                num_readers > 1
+                and sum(tensor_sizes[:num_readers]) > allowed_ram
+            ):
+                num_readers -= 1
+        return num_readers
 
     def __del__(self):
         self.close()
