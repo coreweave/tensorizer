@@ -348,3 +348,7 @@ class _NumpyTensor(NamedTuple):
             raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}") from e
 
         return dtype
+    
+    @property
+    def tensor_memory(self):
+        return self.data.data

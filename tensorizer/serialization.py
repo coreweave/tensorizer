@@ -505,13 +505,7 @@ class _TensorHeaderSerializer:
             self.buffer, self.data_length_offset, self.data_length
         )
 
-        metadata_entry_segment: struct.Struct = struct.Struct(
-            self.metadata_entry_segment_template.format(
-                name_len=self.name_len,
-                dtype_len=self.dtype_len,
-                shape_len=self.shape_len,
-            )
-        )
+        metadata_entry_segment = self.get_metadata_entry_segment()
 
         self.metadata_entry = metadata_entry_segment.pack(
             self.name_len,  # Name length
@@ -525,6 +519,15 @@ class _TensorHeaderSerializer:
             # Tensor data start (relative to the file):
             self.file_offset + self.data_offset,
             self.data_length,  # Tensor length
+        )
+
+    def get_metadata_entry_segment(self) -> struct.Struct:
+        return struct.Struct(
+            self.metadata_entry_segment_template.format(
+                name_len=self.name_len,
+                dtype_len=self.dtype_len,
+                shape_len=self.shape_len,
+            )
         )
 
     def _hashable_segment_views(self):
@@ -1668,13 +1671,6 @@ class TensorDeserializer(
                 raise CryptographyError(
                     "Tensor is encrypted, but decryption was not requested"
                 )
-
-            # The total size of the file.
-            # WARNING: this is not accurate. This field isn't used in the
-            # deserializer, but has been available as a public attribute,
-            # so it is kept how it was for compatibility until the next
-            # major version.
-            self.total_file_bytes = self._file_header.tensor_size
 
             # Read the metadata index of tensors.
             # This is a list of offsets into the file where the per-tensor data
@@ -3451,22 +3447,13 @@ class TensorSerializer:
         )
         self._write(self._file_header.to_bytes())
 
+        self._metadata_cur = self._file.tell()
         if max_tensors:
-            self._reserve_metadata(max_tensors)
+            self._metadata_end = self._metadata_cur + 8 + max_tensors * 1024  # 8 bytes for metadata length field
         else:
-            self._metadata_cur = None
             self._metadata_end = None
-        
-    def _reserve_metadata(self, num_tensors: int) -> None:
-        # Reserve 1 KiB per tensor
-        metadata_size = num_tensors * 1024
-        self._write(struct.pack("<Q", metadata_size))
-        metadata_loc = self._file.tell()
-        self._write(bytes(metadata_size))
-        self._flush()
-        self._metadata_cur = metadata_loc
-        self._metadata_end = metadata_loc + metadata_size
 
+        
     @property
     def total_tensor_bytes(self):
         return self._file_header.tensor_size
@@ -3759,6 +3746,7 @@ class TensorSerializer:
             # Additional payloads that get set and used during the prepare_for_write procedures
             self.numpy_tensor: Optional[_NumpyTensor] = None # $et in _prepare_for_write_numpy_tensor
             self.header: Optional[_TensorHeaderSerializer] = None  # $et in _prepare_for_write_headers
+            self.metadata_pos = -1  # Set in _prepare_for_write_headers
             self.encryptor: Optional[_crypt.ChunkedEncryption] = None  # $et in _do_encryption if encrypted
 
             # self.tensor_data_task is a future for processing some contents of self.tensor
@@ -3769,11 +3757,6 @@ class TensorSerializer:
         def set_min_file_version_number(self, version_number):
             self.min_file_version = max(self.min_file_version, version_number)
 
-        @property
-        def tensor_memory(self):
-            if self.tensor_data_task is not None:
-                raise RuntimeError("Attempt to access tensor memory while being modified")
-            return self.numpy_tensor.data.data
 
     def _write_tensor(
         self,
@@ -3922,22 +3905,23 @@ class TensorSerializer:
 
             tensor_pos = header_pos + header.data_offset
 
-        # Add our tensor metadata to the index.
-        metadata = header.metadata_entry
-        # Check for overflow
-        if self._metadata_cur + len(metadata) > self._metadata_end:
-            raise RuntimeError("Metadata overflow")
+        if False:
+            # Add our tensor metadata to the index.
+            metadata = header.metadata_entry
+            # Check for overflow
+            if self._metadata_cur + len(metadata) > self._metadata_end:
+                raise RuntimeError("Metadata overflow")
 
-        metadata_pos = self._metadata_cur
-        metadata_len = len(metadata)
-        self._metadata_cur += metadata_len
+            metadata_pos = self._metadata_cur
+            metadata_len = len(metadata)
+            self._metadata_cur += metadata_len
 
-        # This task is I/O-bound and has no prerequisites,
-        # so it goes into the regular writer pool.
-        def write_metadata():
-            self._pwrite(metadata, metadata_pos, verify=metadata_len)
+            # This task is I/O-bound and has no prerequisites,
+            # so it goes into the regular writer pool.
+            def write_metadata():
+                self._pwrite(metadata, metadata_pos, verify=metadata_len)
 
-        self._jobs.append(self._writer_pool.submit(write_metadata))
+            self._jobs.append(self._writer_pool.submit(write_metadata))
 
         if False:
             # Calculate the hashes.
@@ -4127,27 +4111,6 @@ class TensorSerializer:
         )
         return tensor_endpos
 
-    @staticmethod
-    def _async_bulk_device_to_host_transfer(write_specs: Sequence[_WriteSpec]) -> None:
-        """
-        Transfers CUDA tensors to host memory asynchronously in bulk.
-
-        Args:
-            write_specs: The list of WriteSpecs to transfer.
-            max_read_ahead: The maximum number of tensors to queue.
-
-        Returns:
-            A tuple containing an iterator over CPU-based WriteSpecs,
-            and a callback to cancel the transfer early.
-        """
-        
-
-        return (
-            iter(lambda: transferred.get(timeout=_TIMEOUT), None),
-            _interrupt_transfer,
-        )
-
-
     def _maybe_fallocate(self, tensors: Sequence[_WriteSpec]):
         if not _syscalls.has_fallocate() or not self._fd:
             return
@@ -4175,46 +4138,41 @@ class TensorSerializer:
         
         self._maybe_fallocate(write_specs)
 
-        # TODO: It's bizarre that we have both generator and future patterns for
-        # async tasks. Lets move _prepare_for_write_cuda to a future pattern and get rid of the iterators
         cuda_executor = self._prepare_for_write_cuda(write_specs)
-        self._prepare_for_write_contiguous(write_specs)
-        self._prepare_for_write_numpy_tensor(write_specs)
-        self._prepare_for_write_opaque(write_specs)
-        if self._encrypted:
-            self._prepare_for_write_encryption(write_specs)
-        self._prepare_for_write_headers(write_specs)
-        self._prepare_for_write_meta(write_specs) # TODO; where does this go
-        self._prepare_for_write_hashes(write_specs)
+        try:
+            self._prepare_for_write_contiguous(write_specs)
+            self._prepare_for_write_numpy_tensor(write_specs)
+            self._prepare_for_write_opaque(write_specs)
+            if self._encrypted:
+                self._prepare_for_write_encryption(write_specs)
+            self._prepare_for_write_headers(write_specs)
+            self._prepare_for_write_meta(write_specs) # TODO; where does this go
+            self._prepare_for_write_hashes(write_specs)
 
-        if self._encrypted:
-            self._do_encryption(write_specs)
-        self._do_commit_headers(write_specs)
-        self._do_commit_tensor_data(write_specs)
-        if self._encrypted:
-            self._maybe_decrypt_data(write_specs)
+            if self._encrypted:
+                self._do_encryption(write_specs)
+            self._do_commit_headers(write_specs)
+            self._do_commit_tensor_data(write_specs)
+            if self._encrypted:
+                self._maybe_decrypt_data(write_specs)
 
-        if False:
-            cuda_tensors = [
-                w.tensor for w in write_specs if w.tensor.device.type == "cuda"
-            ]
-            if cuda_tensors:
-                (
-                    transferred,
-                    interrupt_transfer,
-                ) = self._async_bulk_device_to_host_transfer(cuda_tensors)
-            else:
-                transferred = interrupt_transfer = None
-            del cuda_tensors
+            # Move to the end of our serialized tensor to prepare
+            # for the next one in the synchronized case.
+            endpos = write_specs[-1].header.data_offset + write_specs[-1].header.data_length
+            self._file_header.version_number = max(self._file_header.version_number, max(w.min_file_version for w in write_specs))
 
-        # Move to the end of our serialized tensor to prepare
-        # for the next one in the synchronized case.
-        endpos = write_specs[-1].header.data_offset + write_specs[-1].header.data_length
-        self._file.seek(endpos)
-        self._sync_prologue_state()
-        self._synchronize_pools()
-        return 
+            self._synchronize_pools()
+            self._file.seek(endpos)
+            self._sync_prologue_state()
+        except Exception as e:
+            if cuda_executor is not None:
+                cuda_executor.shutdown(wait=False, cancel_futures=True)
+            raise e
 
+        if cuda_executor is not None:
+            cuda_executor.shutdown(wait=True, cancel_futures=False)
+
+        return
         # BCHESS TODO
         ########################################
         if self._encrypted:
@@ -4550,10 +4508,10 @@ class TensorSerializer:
             return wrapper
         return decorator
 
-    def _prepare_for_write_cuda(self, write_specs: Sequence[_WriteSpec]) -> concurrent.futures.ThreadPoolExecutor:
+    def _prepare_for_write_cuda(self, write_specs: Sequence[_WriteSpec]) -> Optional[concurrent.futures.ThreadPoolExecutor]:
         cuda_specs = [w for w in write_specs if w.tensor.device.type == "cuda"]
         if not cuda_specs:
-            return
+            return None
 
         class CudaTransfer():
             def __init__(self, max_size):
@@ -4591,9 +4549,9 @@ class TensorSerializer:
         max_tensor_size = [w.tensor.element_size() * w.tensor.nelement() for w in cuda_specs]
         cuda_transfer = CudaTransfer(max_tensor_size)
 
-        for cuda_spec in cuda_specs:
-            assert cuda_specs.tensor_data_task is None
-            cuda_specs.tensor_data_task = cuda_transfer.submit(cuda_specs)
+        for w in cuda_specs:
+            assert w.tensor_data_task is None
+            w.tensor_data_task = cuda_transfer.submit(w)
 
         return cuda_transfer.executor
 
@@ -4651,7 +4609,7 @@ class TensorSerializer:
                 w.tensor_data_task.result(_TIMEOUT)
                 w.tensor_data_task = None
 
-            tensor_memory: memoryview = w.tensor_memory
+            tensor_memory: memoryview = w.numpy_tensor.tensor_memory
             chunked = _Chunked(
                 total_size=tensor_memory.nbytes,
                 chunk_size=self._crypt_chunk_size,
@@ -4679,7 +4637,7 @@ class TensorSerializer:
             w.crypt_info = _crypt_info.CryptInfo(chunks)
 
     def _prepare_for_write_headers(self, write_specs: Sequence[_WriteSpec]) -> None:
-        file_offset = self._file.tell()
+        # We first need to construct the headers so that we know the size of each
         for w in write_specs:
             dtype_bytes = w.dtype.encode("utf-8")  # type: ignore
             if len(dtype_bytes) >= 256:
@@ -4692,14 +4650,31 @@ class TensorSerializer:
                 dtype_bytes,
                 w.shape,
                 w.data_length,
-                file_offset,
+                0,  # bogus file_offset
                 include_crc32=w.include_crc32,
                 include_sha256=w.include_sha256,
                 crypt_info=w.crypt_info
-            ) 
+            )
 
+        # Specify the offsets for each metadata entry
+        file_offset = self._file.tell()
+        if file_offset > self._metadata_cur:
+            raise RuntimeError("File cursor unexpectedly past start of metadata")
+        file_offset = self._metadata_cur
+        file_offset += 8  # 8 bytes for metadata length
+
+        for w in write_specs:
+            w.metadata_pos = file_offset
+            file_offset += w.header.get_metadata_entry_segment().size
+
+        if self._metadata_end is None:
+            self._metadata_end = file_offset
+
+        # Now specify the offsets for each header
+        for w in write_specs:
+            w.header.file_offset = file_offset
             file_offset += w.header.size
-        
+
         # file_offset is now where we should start writing tensor data
         for w in write_specs:
             w.header.build(file_offset)  # type: ignore
@@ -4710,18 +4685,22 @@ class TensorSerializer:
         pass
 
     def _prepare_for_write_hashes(self, write_specs: Sequence[_WriteSpec]) -> None:
-        def compute_crc32(write_spec: TensorSerializer._WriteSpec, dependency: Optional[concurrent.futures.Future]):
+        def compute_crc32(
+                write_spec: TensorSerializer._WriteSpec,
+                dependency: Optional[concurrent.futures.Future]):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
             header_crc32 = write_spec.header.compute_crc32()
-            crc32 = zlib.crc32(write_spec.tensor_memory, header_crc32)
+            crc32 = zlib.crc32(write_spec.numpy_tensor.tensor_memory, header_crc32)
             write_spec.header.add_crc32(crc32)
 
-        def compute_sha256(write_spec: TensorSerializer._WriteSpec, dependency: Optional[concurrent.futures.Future]):
+        def compute_sha256(
+                write_spec: TensorSerializer._WriteSpec,
+                dependency: Optional[concurrent.futures.Future]):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
             sha256 = write_spec.header.compute_sha256()
-            sha256.update(write_spec.tensor_memory)
+            sha256.update(write_spec.numpy_tensor.tensor_memory)
             write_spec.header.add_sha256(sha256.digest())
 
         for w in write_specs:
@@ -4759,11 +4738,24 @@ class TensorSerializer:
             self._jobs.append(w.tensor_data_task)
 
     def _do_commit_headers(self, write_specs: Sequence[_WriteSpec]) -> None:
-
+        # TODO: this is lots of tiny writes. Buffer them for performance
         def commit_header(write_spec, dependency):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
-            self._pwrite(write_spec.header.buffer, write_spec.header.file_offset, verify=write_spec.header.size)
+            self._pwrite(
+                write_spec.header.metadata_entry,
+                write_spec.metadata_pos,
+                verify=len(write_spec.header.metadata_entry))
+            self._pwrite(
+                write_spec.header.buffer,
+                write_spec.header.file_offset,
+                verify=write_spec.header.size)
+
+        metadata_size = self._metadata_end - self._metadata_cur - 8  # 8 bytes for metadata length field
+        metadata_size_task = self._header_writer_pool.submit(
+            self._pwrite, struct.pack("<Q", metadata_size), self._metadata_cur, verify=8
+        )
+        self._jobs.append(metadata_size_task)
 
         for w in write_specs:
             commit_header_task = self._header_writer_pool.submit(commit_header, w, w.tensor_data_task)
@@ -4778,7 +4770,9 @@ class TensorSerializer:
                 # TODO
                 return 0
             bytes_written = self._pwrite(
-                write_spec.tensor_memory, write_spec.header.data_offset, verify=write_spec.header.data_length  # tyoe: ignore
+                write_spec.numpy_tensor.tensor_memory,
+                write_spec.header.data_offset,  # type: ignore
+                verify=write_spec.header.data_length  # tyoe: ignore
             )
             with self._tensor_count_update_lock: # BCHESS TODO ???
                 self._file_header.tensor_count += 1
