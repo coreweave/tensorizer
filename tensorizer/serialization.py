@@ -395,7 +395,7 @@ class _TensorHeaderSerializer:
         dtype: bytes,
         shape: Sequence[int],
         data_length: int,
-        file_offset: int,
+        file_offset: int,  # location of header in file
         include_crc32: bool = True,
         include_sha256: bool = True,
         crypt_info: Optional[_crypt_info.CryptInfo] = None,
@@ -403,7 +403,7 @@ class _TensorHeaderSerializer:
         self.module_index = module_index
         self.tensor_type = tensor_type
         self.name = name
-        self,shape = shape
+        self.shape = shape
         self.dtype = dtype
         self.data_length = data_length
         self.file_offset = file_offset
@@ -460,8 +460,9 @@ class _TensorHeaderSerializer:
         )
         # BCHESS self.size = self.data_offset
 
-    def build(self, data_offset):
-        self.data_offset = data_offset
+    def build(self, tensor_data_offset: int):
+        # tensor_data_offset: location of tensor data in file
+        self.data_offset = tensor_data_offset
 
         self.buffer = bytearray(self.size)
         self.start_segment.pack_into(
@@ -3907,85 +3908,88 @@ class TensorSerializer:
                 sha256.update(tensor_memory)
                 return sha256.digest()
 
-        # This task is I/O-bound and dependent on the previous two tasks,
-        # so it goes into the header writer pool.
-        def commit_header(
-            crc32_future: Optional[concurrent.futures.Future],
-            sha256_future: Optional[concurrent.futures.Future],
-            encrypt_future: Optional[concurrent.futures.Future],
-        ):
-            crc32 = sha256 = None
-            if crc32_future is not None:
-                crc32 = crc32_future.result(_TIMEOUT)
-            if sha256_future is not None:
-                sha256 = sha256_future.result(_TIMEOUT)
-            if encrypt_future is not None:
-                encrypt_future.result(_TIMEOUT)
-            # These must be written only after all other futures complete
-            # to prevent a race condition from other threads hashing
-            # a partially-filled-in hash section
-            if crc32_future is not None:
-                header.add_crc32(crc32)
-            if sha256_future is not None:
-                header.add_sha256(sha256)
-            if encrypt_future is not None:
-                header.update_crypt_info()
-            self._pwrite(header.buffer, header_pos, verify=header.data_offset)
+        if False:
+            # This task is I/O-bound and dependent on the previous two tasks,
+            # so it goes into the header writer pool.
+            def commit_header(
+                crc32_future: Optional[concurrent.futures.Future],
+                sha256_future: Optional[concurrent.futures.Future],
+                encrypt_future: Optional[concurrent.futures.Future],
+            ):
+                crc32 = sha256 = None
+                if crc32_future is not None:
+                    crc32 = crc32_future.result(_TIMEOUT)
+                if sha256_future is not None:
+                    sha256 = sha256_future.result(_TIMEOUT)
+                if encrypt_future is not None:
+                    encrypt_future.result(_TIMEOUT)
+                # These must be written only after all other futures complete
+                # to prevent a race condition from other threads hashing
+                # a partially-filled-in hash section
+                if crc32_future is not None:
+                    header.add_crc32(crc32)
+                if sha256_future is not None:
+                    header.add_sha256(sha256)
+                if encrypt_future is not None:
+                    header.update_crypt_info()
+                self._pwrite(header.buffer, header_pos, verify=header.data_offset)
 
-        hash_tasks = []
-        if encrypted and not _temporary_buffer:
-            # If multiple tensors share memory, and were encrypted in-place,
-            # then this must not start hashing until any previous decryption
-            # tasks have restored this memory to its original state
-            mem_pointer = tensor.__array_interface__["data"][0]
-            pending_decryption = self._decryption_jobs.get(mem_pointer, None)
-        else:
-            mem_pointer = None
-            pending_decryption = None
-        if include_crc32:
-            crc32_task = self._computation_pool.submit(
-                compute_crc32, pending_decryption
-            )
-            hash_tasks.append(crc32_task)
-        else:
-            crc32_task = None
-        sha256_task = self._computation_pool.submit(
-            compute_sha256, pending_decryption
-        )
-        hash_tasks.append(sha256_task)
-        self._jobs.extend(hash_tasks)
-
-        def encrypt(prerequisites: Iterable[concurrent.futures.Future]):
-            fs = concurrent.futures.wait(prerequisites, timeout=_TIMEOUT)
-            for f in fs.done:
-                # Raise exceptions
-                f.result()
-            for f in fs.not_done:
-                # Raise timeouts
-                f.result(0)
-            try:
-                encryptor.encrypt_all(
-                    wait=True,
-                    timeout=_TIMEOUT,
-                )
-            except _crypt.CryptographyError as e:
-                raise CryptographyError("Tensor encryption failed") from e
-
-        # This task is I/O-bound, so it goes into the regular writer pool.
-        def write_tensor_data(
-            prerequisite: Optional[concurrent.futures.Future], size: int
-        ):
-            if prerequisite is not None:
-                prerequisite.result(_TIMEOUT)
-            if has_data:
-                bytes_written = self._pwrite(
-                    tensor_memory, tensor_pos, verify=size
-                )
+        if False:
+            hash_tasks = []
+            if encrypted and not _temporary_buffer:
+                # If multiple tensors share memory, and were encrypted in-place,
+                # then this must not start hashing until any previous decryption
+                # tasks have restored this memory to its original state
+                mem_pointer = tensor.__array_interface__["data"][0]
+                pending_decryption = self._decryption_jobs.get(mem_pointer, None)
             else:
-                bytes_written = 0
-            with self._tensor_count_update_lock:
-                self._file_header.tensor_count += 1
-                self._file_header.tensor_size += bytes_written
+                mem_pointer = None
+                pending_decryption = None
+            if include_crc32:
+                crc32_task = self._computation_pool.submit(
+                    compute_crc32, pending_decryption
+                )
+                hash_tasks.append(crc32_task)
+            else:
+                crc32_task = None
+            sha256_task = self._computation_pool.submit(
+                compute_sha256, pending_decryption
+            )
+            hash_tasks.append(sha256_task)
+            self._jobs.extend(hash_tasks)
+
+        if False:
+            def encrypt(prerequisites: Iterable[concurrent.futures.Future]):
+                fs = concurrent.futures.wait(prerequisites, timeout=_TIMEOUT)
+                for f in fs.done:
+                    # Raise exceptions
+                    f.result()
+                for f in fs.not_done:
+                    # Raise timeouts
+                    f.result(0)
+                try:
+                    encryptor.encrypt_all(
+                        wait=True,
+                        timeout=_TIMEOUT,
+                    )
+                except _crypt.CryptographyError as e:
+                    raise CryptographyError("Tensor encryption failed") from e
+
+            # This task is I/O-bound, so it goes into the regular writer pool.
+            def write_tensor_data(
+                prerequisite: Optional[concurrent.futures.Future], size: int
+            ):
+                if prerequisite is not None:
+                    prerequisite.result(_TIMEOUT)
+                if has_data:
+                    bytes_written = self._pwrite(
+                        tensor_memory, tensor_pos, verify=size
+                    )
+                else:
+                    bytes_written = 0
+                with self._tensor_count_update_lock:
+                    self._file_header.tensor_count += 1
+                    self._file_header.tensor_size += bytes_written
 
         def decrypt(prerequisite: concurrent.futures.Future):
             try:
@@ -4012,29 +4016,34 @@ class TensorSerializer:
                         "Restoring encrypted tensor data in memory failed"
                     ) from (original_exc if original_exc is not None else e)
 
-        # Encrypt the tensor memory in-place before writing
-        if encrypted:
-            encrypt_task = self._encryption_pool.submit(encrypt, hash_tasks)
-            self._jobs.append(encrypt_task)
-        else:
-            encrypt_task = None
+        if False:
+            # Encrypt the tensor memory in-place before writing
+            if encrypted:
+                encrypt_task = self._encryption_pool.submit(encrypt, hash_tasks)
+                self._jobs.append(encrypt_task)
+            else:
+                encrypt_task = None
 
-        commit_header_task = self._header_writer_pool.submit(
-            commit_header, crc32_task, sha256_task, encrypt_task
-        )
-        self._jobs.append(commit_header_task)
+        if False:
+            commit_header_task = self._header_writer_pool.submit(
+                commit_header, crc32_task, sha256_task, encrypt_task
+            )
+            self._jobs.append(commit_header_task)
 
-        # Write the potentially-encrypted tensor memory to the file
-        write_task = self._writer_pool.submit(
-            write_tensor_data, encrypt_task, tensor_size
-        )
-        self._jobs.append(write_task)
-        # Decrypt the memory after writing is finished, if it was encrypted
-        if encrypted and not _temporary_buffer:
-            decrypt_task = self._decryption_pool.submit(decrypt, write_task)
-            self._jobs.append(decrypt_task)
-            assert mem_pointer is not None
-            self._decryption_jobs[mem_pointer] = decrypt_task
+        if False:
+            # Write the potentially-encrypted tensor memory to the file
+            write_task = self._writer_pool.submit(
+                write_tensor_data, encrypt_task, tensor_size
+            )
+            self._jobs.append(write_task)
+
+        if False:
+            # Decrypt the memory after writing is finished, if it was encrypted
+            if encrypted and not _temporary_buffer:
+                decrypt_task = self._decryption_pool.submit(decrypt, write_task)
+                self._jobs.append(decrypt_task)
+                assert mem_pointer is not None
+                self._decryption_jobs[mem_pointer] = decrypt_task
 
         tensor_endpos = tensor_pos + tensor_size
 
@@ -4160,8 +4169,6 @@ class TensorSerializer:
             self.tensor = tensor
             self.min_file_version = 0
             self.user_owns_tensor_data = True
-            self.numpy_tensor: Optional[_NumpyTensor] = None # $et in _prepare_for_write_numpy_tensor
-            self.header: Optional[_TensorHeaderSerializer] = None  # $et in _prepare_hashes
 
             # Every parameter to _TensorHeaderSerializer() exists as an attribute except self.file_offset
             # defaulting to the simplest possible case:
@@ -4181,6 +4188,14 @@ class TensorSerializer:
             self.include_crc32 = True
             self.include_sha256 = True
             self.crypt_info: Optional[_crypt_info.CryptInfo] = None  # _prepare_for_write_encryption
+            
+            # Additional payloads that get set and used during the prepare_for_write procedures
+            self.numpy_tensor: Optional[_NumpyTensor] = None # $et in _prepare_for_write_numpy_tensor
+            self.header: Optional[_TensorHeaderSerializer] = None  # $et in _prepare_for_write_headers
+            self.hash_tasks: List[concurrent.futures.Future] = []  # $et in _prepare_for_write_hashes
+            self.encrypt_task: Optional[concurrent.futures.Future] = None  # $et in _do_encryption if encrypted
+            self.encryptor: Optional[_crypt.ChunkedEncryption] = None  # $et in _do_encryption if encrypted
+
 
         def set_min_file_version_number(self, version_number):
             self.min_file_version = max(self.min_file_version, version_number)
@@ -4223,11 +4238,16 @@ class TensorSerializer:
         write_specs = self._prepare_for_write_opaque(write_specs)
         if self._encrypted:
             write_specs = self._prepare_for_write_encryption(write_specs)
-        write_specs = self._prepare_for_write_header_offsets(write_specs)
+        write_specs = self._prepare_for_write_headers(write_specs)
+        write_specs = self._prepare_for_write_meta(write_specs) # TODO; where does this go
         write_specs = self._prepare_for_write_hashes(write_specs)
+
         if self._encrypted:
-            write_specs = self._do_encryption(write_specs)
-        write_specs = self._prepare_for_write_meta(write_specs)
+            self._do_encryption(write_specs)
+        self._do_commit_headers(write_specs)
+        self._do_commit_tensor_data(write_specs)
+        if self._encrypted:
+            self._maybe_decrypt_data(write_specs)
 
         # At this point, the cursor is after the file header. We're due to
         # write the header size
@@ -4535,6 +4555,7 @@ class TensorSerializer:
 
     class _IterHolder():
         __slots__ = ['iter']
+
     @staticmethod
     def _prepare_with_filter(filter_fn: Callable[[_WriteSpec], bool]):
         """ Helper for functions that prep tensors but only act on certain tensors, based on a filter
@@ -4583,7 +4604,7 @@ class TensorSerializer:
             transferred,
             interrupt_transfer,
         ) = self._async_bulk_device_to_host_transfer(cuda_specs)
-        # TODO: interrupt_transfer
+        # BCHESS TODO: interrupt_transfer
         yield from transferred
 
     @_prepare_with_filter(lambda w: not w.tensor.is_contiguous())
@@ -4594,7 +4615,7 @@ class TensorSerializer:
             w.user_owns_tensor_data = False
             yield w
 
-    def _prepare_for_write_numpy_tensor(self, write_specs):
+    def _prepare_for_write_numpy_tensor(self, write_specs: Iterable[_WriteSpec]) -> Iterable[_WriteSpec]:
         for w in write_specs:
             w.numpy_tensor = _NumpyTensor.from_tensor(w.tensor)
             w.dtype = w.numpy_tensor.numpy_dtype
@@ -4629,11 +4650,11 @@ class TensorSerializer:
                 return
 
             tensor_memory: memoryview = w.numpy_tensor.data.data
-            chunks = _Chunked(
+            chunked = _Chunked(
                 total_size=tensor_memory.nbytes,
                 chunk_size=self._crypt_chunk_size,
             )
-            nonces = self._new_nonces(chunks.count)
+            nonces = self._new_nonces(chunked.count)
             w.encryptor = _crypt.ChunkedEncryption(
                 key=self._encryption.key,
                 buffer=tensor_memory,
@@ -4662,19 +4683,19 @@ class TensorSerializer:
         # TDOO
         yield from meta_specs
 
-    def _prepare_for_write_header_offsets(self, write_specs: Iterable[_WriteSpec]) -> Iterable[_WriteSpec]:
+    def _prepare_for_write_headers(self, write_specs: Iterable[_WriteSpec]) -> Iterable[_WriteSpec]:
         write_specs = list(write_specs)  # going to iterate multiple times
 
         file_offset = self._file.tell()
         for w in write_specs:
-            dtype_bytes = w.dtype.encode("utf-8")  # noqa
+            dtype_bytes = w.dtype.encode("utf-8")  # type: ignore
             if len(dtype_bytes) >= 256:
                 raise ValueError("dtype name length should be less than 256")
 
             w.header = _TensorHeaderSerializer(
                 w.module_index,
                 w.tensor_type,
-                w.name.encode('ut4-8'),  # name as bytes
+                w.name.encode('utf-8'),  # name as bytes
                 dtype_bytes,
                 w.shape,
                 w.data_length,
@@ -4688,55 +4709,133 @@ class TensorSerializer:
         
         # file_offset is now where we should start writing tensor data
         for w in write_specs:
-            w.header.build(file_offset)
+            w.header.build(file_offset)  # type: ignore
             file_offset += w.data_length
             yield w
 
     def _prepare_for_write_hashes(self, write_specs: Iterable[_WriteSpec]) -> Iterable[_WriteSpec]:
         def compute_crc32(write_spec):
-            crc32 = write_spec.header.compute_crc32()
-            return zlib.crc32(write_spec.tensor_memory, crc32)
+            header_crc32 = write_spec.header.compute_crc32()
+            crc32 = zlib.crc32(write_spec.tensor_memory, header_crc32)
+            write_spec.header.add_crc32(crc32)
 
         def compute_sha256(write_spec):
             sha256 = write_spec.header.compute_sha256()
             sha256.update(write_spec.tensor_memory)
-            return sha256.digest()
+            write_spec.header.add_sha256(sha256.digest())
 
-        w.hash_tasks = []
         for w in write_specs:
-            # TODO: account for tensor sharing memory with other tensors (w.user_owns_tensor_data)
+            # BCHESS TODO: account for tensor sharing memory with other tensors (w.user_owns_tensor_data)
             if w.include_crc32:
-                crc32_task = self._computation_pool.submit(compute_crc32)
+                crc32_task = self._computation_pool.submit(compute_crc32, w)
                 w.hash_tasks.append(crc32_task)
             if w.include_sha256:
-                sha256_task = self._computation_pool.submit(compute_sha256)
+                sha256_task = self._computation_pool.submit(compute_sha256, w)
                 w.hash_tasks.append(sha256_task)
             self._jobs.extend(w.hash_tasks)
             
         yield from write_specs
 
-    def _do_encryption(self, write_specs: Iterable[_WriteSpec]) -> Iterable(_WriteSpec):
-        def encrypt(encryptor, prerequisites: Iterable[concurrent.futures.Future]):
-            fs = concurrent.futures.wait(prerequisites, timeout=_TIMEOUT)
-            for f in fs.done:
-                f.result()
-            for f in fs.not_done:
-                f.result(0)
+    def _do_encryption(self, write_specs: Iterable[_WriteSpec]):
+        def encrypt(write_spec):
+            _future_wait_and_raise(write_spec.hash_tasks, timeout=_TIMEOUT)
             try:
-                encryptor.encrypt_all(
+                write_spec.encryptor.encrypt_all(
                     wait=True,
                     timeout=_TIMEOUT
                 )
             except _crypt.CryptographyError as e:
                 raise CryptographyError("Tensor encryption failed") from e
+            write_spec.header.update_crypt_info()
 
         for w in write_specs:
             # TODO: account for tensor sharing memory with other tensors (w.user_owns_tensor_data)
-            encrypt_task = self._encryption_pool.submit(encrypt, w.encryptor, w.hash_tasks)
-            self._jobs.append(encrypt_task)
-            yield w
+            w.encrypt_task = self._encryption_pool.submit(encrypt, w)
+            self._jobs.append(w.encrypt_task)
 
-    # TODO next: commit_header
+    def _do_commit_headers(self, write_specs: Iterable[_WriteSpec]):
+
+        def commit_header(write_spec):
+            dependent_tasks = write_spec.hash_tasks
+            maybe_encrypt_task = getattr(write_spec, 'encrypt_task', None)
+            if maybe_encrypt_task:
+                # do not use += because that will modify the original hash_tasks list object
+                dependent_tasks = dependent_tasks + maybe_encrypt_task
+            _future_wait_and_raise(dependent_tasks, timeout=_TIMEOUT)
+            self._pwrite(write_spec.header.buffer, write_spec.header.file_offset, verify=write_spec.header.size)
+
+        for w in write_specs:
+            commit_header_task = self._header_writer_pool.submit(commit_header, w)
+            self._jobs.append(commit_header_task)
+
+    def _do_commit_tensor_data(self, write_specs: Iterable[_WriteSpec]):
+        def commit_tensor_data(write_spec):
+            if write_spec.tensor.is_meta:
+                # TODO
+                return 0
+            maybe_encrypt_task = getattr(write_spec, 'encrypt_task', None)
+            if maybe_encrypt_task:
+                maybe_encrypt_task.result(_TIMEOUT)
+            bytes_written = self._pwrite(
+                write_spec.tensor_memory, write_spec.header.data_offset, verify=write_spec.header.data_length
+            )
+            with self._tensor_count_update_lock: # BCHESS TODO ???
+                self._file_header.tensor_count += 1
+                self._file_header.tensor_size += bytes_written
+            return bytes_written
+
+        for w in write_specs:
+            w.write_task = self._writer_pool.submit(
+                commit_tensor_data, w
+            )
+            self._jobs.append(w.write_task)
+            
+    def _maybe_decrypt_data(self, write_specs: Iterable[_WriteSpec]):
+        def decrypt(write_spec: _WriteSpec):
+            try:
+                write_spec.write_task.result(_TIMEOUT)
+            finally:
+                # Try to decrypt again even if writing to disk failed
+                # to avoid exiting with the tensor memory in a modified state
+                fs = w.encryptor.decrypt_all(wait=False)
+                try:
+                    _crypt.ChunkedEncryption.wait_or_raise(
+                        fs,
+                        timeout=_TIMEOUT,
+                        return_when=concurrent.futures.ALL_COMPLETED,
+                    )
+                except _crypt.CryptographyError as e:
+                    try:
+                        original_exc = write_spec.write_task.exception(timeout=0)
+                    except (
+                        concurrent.futures.TimeoutError,
+                        concurrent.futures.CancelledError,
+                    ):
+                        original_exc = None
+                    raise CryptographyError(
+                        "Restoring encrypted tensor data in memory failed"
+                    ) from (original_exc if original_exc is not None else e)
+
+        for w in write_specs:
+            if not w.user_owns_tensor_data:
+                continue
+            decrypt_task = self._decryption_pool.submit(decrypt, w)
+            self._jobs.append(decrypt_task)
+            # TODO: BCHESS
+            # assert mem_pointer is not None
+            # self._decryption_jobs[mem_pointer] = decrypt_task
+
+
+
+def _future_wait_and_raise(futures: Sequence[concurrent.futures.Future], timeout: int):
+    # Wait on a list of futures with a timeout, and raise exceptions
+    fs = concurrent.futures.wait(futures, timeout=timeout)
+    for f in fs.done:
+        # if the future has an exception, this will raise it
+        f.result()
+    for f in fs.not_done:
+        # force raise of TimeoutError
+        f.result(0)
 
 def _get_perf_stats():
     if _perf_stats is None:
