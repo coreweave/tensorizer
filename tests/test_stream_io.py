@@ -39,11 +39,39 @@ class TestCurlStream(unittest.TestCase):
         self.assertEqual(b"GPT Neo", stream.read(7))
 
     def test_curl_stream_end(self):
-        stream = stream_io.CURLStreamFile(NEO_URL, end=1)
+        stream = stream_io.CURLStreamFile(NEO_URL, end=2)
         self.assertEqual(b"# ", stream.read(5))
 
+    def test_curl_stream_begin_and_end(self):
+        stream = stream_io.CURLStreamFile(NEO_URL, begin=2, end=9)
+        self.assertEqual(b"GPT Neo", stream.read())
+        stream.close()
+
+        stream = stream_io.CURLStreamFile(NEO_URL, begin=2, end=9)
+        self.assertEqual(b"GPT Neo", stream.read(100))
+        stream.close()
+
+    def test_curl_stream_invalid_range(self):
+        test = self.subTest
+
+        def expect_err():
+            return self.assertRaises(ValueError)
+
+        with test("Invalid begin"), expect_err():
+            stream_io.CURLStreamFile(NEO_URL, begin=-1)
+        with test("Invalid end"), expect_err():
+            stream_io.CURLStreamFile(NEO_URL, end=-1)
+        with test("Invalid begin and end"), expect_err():
+            stream_io.CURLStreamFile(NEO_URL, begin=-2, end=-1)
+        with test("Backwards begin and end"), expect_err():
+            stream_io.CURLStreamFile(NEO_URL, begin=10, end=5)
+        with test("Equal begin and end"), expect_err():
+            stream_io.CURLStreamFile(NEO_URL, begin=5, end=5)
+        with test("End at zero (equals begin)"), expect_err():
+            stream_io.CURLStreamFile(NEO_URL, end=0)
+
     def test_curl_stream_buffer_end(self):
-        stream = stream_io.CURLStreamFile(NEO_URL, end=1)
+        stream = stream_io.CURLStreamFile(NEO_URL, end=2)
         ba = bytearray(5)
         self.assertEqual(2, stream.readinto(ba))
         self.assertEqual(b"# \x00\x00\x00", ba)

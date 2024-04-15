@@ -220,20 +220,26 @@ class CURLStreamFile(io.BufferedIOBase):
         certificate_handling: Optional[CAInfo] = None,
     ) -> None:
         # Note that range requests consider both `begin` and `end` inclusive
+        # But the `end` argument here is exclusive
         self._uri = uri
         if begin is None:
             begin = 0
         elif begin < 0:
-            raise ValueError("Invalid begin")
+            raise ValueError("Invalid begin, must be non-negative")
         self._begin = begin
         self._end = end
         self._headers = headers
         max_buffer_size: Optional[int] = None
         if buffer_size is None:
             buffer_size = 16 << 20  # 16 MiB
-        if end:
-            if end < begin:
-                raise ValueError("End marker cannot come before begin marker")
+        if end is not None:
+            if end <= begin:
+                # It isn't possible to request an empty range if begin == end
+                # Servers usually throw HTTP code 416, Range Not Satisfiable
+                raise ValueError(
+                    "End marker must come strictly after begin marker"
+                    f" (requested range: {begin} to {end})"
+                )
             # Don't use a buffer significantly larger than a requested range
             max_buffer_size: int = self._end - begin + 1
             # Round up to a multiple of the system page size
@@ -280,7 +286,9 @@ class CURLStreamFile(io.BufferedIOBase):
 
         uses_range_request: bool = begin != 0 or end is not None
         if uses_range_request:
-            cmd.extend(["--range", f"{begin}-{end or ''}"])
+            # Range requests are inclusive, the `end` parameter is exclusive
+            range_end: Union[int, str] = end - 1 if end is not None else ""
+            cmd.extend(["--range", f"{begin}-{range_end}"])
 
         if headers is not None:
             for k, v in headers.items():
@@ -328,7 +336,7 @@ class CURLStreamFile(io.BufferedIOBase):
         # noinspection PyTypeChecker
         self.response_headers = http.client.parse_headers(self._curl.stdout)
 
-        self._curr = 0 if begin is None else begin
+        self._curr = begin
         self._closed = False
 
     def _init_vars(self):
@@ -443,7 +451,7 @@ class CURLStreamFile(io.BufferedIOBase):
     ) -> Union[bytes, int]:
         self.read_operations += 1
         try:
-            eof = None if self._end is None else self._end + 1
+            eof = self._end
             if ba is None:
                 rq_sz = goal_position - self._curr
                 if eof is not None and self._curr + rq_sz > eof:
@@ -489,7 +497,9 @@ class CURLStreamFile(io.BufferedIOBase):
         if self._closed:
             raise IOError("CURLStreamFile closed.")
         if size is None:
-            return self._curl.stdout.read()
+            ret = self._curl.stdout.read()
+            self._curr += len(ret)
+            return ret
         goal_position = self._curr + size
         return self._read_until(goal_position)
 
@@ -507,7 +517,7 @@ class CURLStreamFile(io.BufferedIOBase):
 
     def close(self):
         self._closed = True
-        if self._curl is not None:
+        if getattr(self, "_curl", None) is not None:
             if self._curl.poll() is None:
                 self._curl.stdout.close()
                 self._curl.terminate()
@@ -516,7 +526,7 @@ class CURLStreamFile(io.BufferedIOBase):
                 # stdout is normally closed by the Popen.communicate() method,
                 # which we skip in favour of Popen.stdout.read()
                 self._curl.stdout.close()
-            self._curl = None
+        self._curl = None
 
     @property
     def closed(self):
@@ -566,7 +576,7 @@ class CURLStreamFile(io.BufferedIOBase):
         Args:
             begin: Starting byte of the new byte range, inclusive,
                 or None to start at the beginning of the file.
-            end: Ending byte of the new byte range, inclusive,
+            end: Ending byte of the new byte range, exclusive,
                 or None to include up to the end of the file.
 
         Returns:
@@ -1232,8 +1242,10 @@ def open_stream(
         begin: if specified, the file or request will begin at this byte offset.
             Uses seek() for files and Range for HTTP and S3. This has no effect
             on writes.
-        end: if specified, HTTP and S3 requests will use this as the end of the
+        end: if specified, HTTP and S3 requests will use this for the end of the
             Range header. This has no effect on files or on writes.
+            This offset is exclusive like Python slicing: 0-2 is two bytes
+            (in contrast to HTTP range headers, which treat 0-2 as three bytes).
         s3_region_name: S3 region name, corresponding to
             "region_name" in boto3 config.
             The object storage region used in instantiating the client.
