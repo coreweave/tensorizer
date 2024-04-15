@@ -45,6 +45,7 @@ from typing import (
 )
 
 import numpy
+import psutil
 import redis
 import torch
 
@@ -1444,6 +1445,8 @@ class TensorDeserializer(
         plaid_mode: left for backwards compatibility; has no effect
         plaid_mode_buffers: left for backwards compatibility; has no effect
         num_readers: Number of threads from which to read the file_obj.
+            The default (None) uses a dynamic number of threads.
+            Set this value to 1 to disable concurrent reading.
         verify_hash: If True, the hashes of each tensor will be verified
             against the hashes stored in the metadata. A `HashMismatchError`
             will be raised if any of the hashes do not match.
@@ -1519,7 +1522,7 @@ class TensorDeserializer(
         plaid_mode_buffers: Optional[
             int
         ] = None,  # pylint: disable=unused-argument
-        num_readers: int = 1,
+        num_readers: Optional[int] = None,
         verify_hash: bool = False,
         encryption: Optional[DecryptionParams] = None,
     ):
@@ -1681,30 +1684,64 @@ class TensorDeserializer(
                 structure.filter(self._metadata.__contains__)
             self._structure: Dict[Union[str, int], Any] = structure.dict()
 
-            if not isinstance(num_readers, int):
+            dynamic_num_readers: bool = num_readers is None
+            if not dynamic_num_readers and not isinstance(num_readers, int):
                 raise TypeError(
-                    "num_readers: expected int,"
+                    "num_readers: expected int or None,"
                     f" got {num_readers.__class__.__name__}"
                 )
-            elif num_readers < 1:
+
+            if dynamic_num_readers:
+                num_readers = self._choose_dynamic_num_readers(
+                    self._metadata.values()
+                )
+
+            if num_readers < 1:
                 raise ValueError("num_readers must be positive")
             elif num_readers > len(self._metadata):
                 num_readers = len(self._metadata)
+
             if num_readers > 1:
                 self._reopen = self._reopen_func()
                 if self._reopen is None:
-                    raise ValueError(
-                        "Cannot reopen this type of file to enable"
-                        " parallel reading with num_readers > 1."
-                        " File paths, URIs, and HTTP(S) or S3"
-                        " streams returned from"
-                        " tensorizer.stream_io.open_stream,"
-                        " plus some open files are capable of being reopened."
-                        " Other file-like objects and special files"
-                        " (e.g. BytesIO, pipes, sockets) are not supported."
-                    )
+                    if dynamic_num_readers:
+                        num_readers = 1
+                    else:
+                        raise ValueError(
+                            "Cannot reopen this type of file to enable parallel"
+                            " reading with num_readers > 1. File paths, URIs,"
+                            " and HTTP(S) or S3 streams returned from"
+                            " tensorizer.stream_io.open_stream, plus some"
+                            " open files are capable of being reopened."
+                            " Other file-like objects and special files"
+                            " (e.g. BytesIO, pipes, sockets) are not supported."
+                        )
             else:
                 self._reopen = None
+
+            response_headers = getattr(self._file, "response_headers", None)
+            if (
+                num_readers > 1
+                and response_headers is not None
+                and response_headers.get("accept-ranges") != "bytes"
+            ):
+                # The server does not indicate support for range requests
+                if dynamic_num_readers:
+                    num_readers = 1
+                else:
+                    raise RuntimeError(
+                        "The server streaming the file to deserialize does not"
+                        " support HTTP range requests, necessary for"
+                        " parallel reading with num_readers > 1."
+                        " Set num_readers = 1,"
+                        " or use a different HTTP(S) endpoint."
+                    )
+            self._etag = (
+                None
+                if response_headers is None
+                else response_headers.get("etag") or None
+            )
+
             self._num_readers = num_readers
             self._reader_pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=num_readers,
@@ -1857,6 +1894,29 @@ class TensorDeserializer(
 
             return reopen_file
         return None
+
+    def _choose_dynamic_num_readers(
+        self, tensors: Iterable[TensorEntry]
+    ) -> int:
+        if isinstance(getattr(self._file, "raw", self._file), io.FileIO):
+            num_readers = 8
+        elif self._verify_hash:
+            num_readers = 4
+        else:
+            num_readers = 2
+        if self._device.type == "cuda":
+            free_ram = psutil.virtual_memory().available
+            allowed_ram = free_ram - (10 << 20)
+            tensor_sizes = sorted(
+                (t.deserialized_length for t in tensors), reverse=True
+            )
+            num_readers = min(num_readers, len(tensor_sizes)) or 1
+            while (
+                num_readers > 1
+                and sum(tensor_sizes[:num_readers]) > allowed_ram
+            ):
+                num_readers -= 1
+        return num_readers
 
     def __del__(self):
         self.close()
@@ -2752,6 +2812,19 @@ class TensorDeserializer(
         try:
             if thread_idx != 0:
                 file_ = unsafe_self._reopen(begin=begin_offset, end=end_offset)
+
+                old_etag = unsafe_self._etag
+                if old_etag and hasattr(file_, "response_headers"):
+                    new_etag = file_.response_headers.get("etag") or None
+                    if new_etag is not None and new_etag != old_etag:
+                        # This might indicate that a different version of the
+                        # file was retrieved on the second attempt. ETag values
+                        # are not guaranteed to be stable for unchanged files,
+                        # though, so this isn't an error, just interesting info
+                        logger.info(
+                            "ETag in re-opened file doesn't match"
+                            f" (original: {old_etag}, new: {new_etag})"
+                        )
             else:
                 file_ = unsafe_self._file
                 file_.seek(begin_offset)
