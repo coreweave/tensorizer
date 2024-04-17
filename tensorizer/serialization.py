@@ -4,6 +4,7 @@
 ##############################################################################
 import abc
 import bisect
+import collections
 import collections.abc
 import concurrent.futures
 import contextlib
@@ -3787,6 +3788,9 @@ class TensorSerializer:
                 Where in the file to write the tensor entry. If not specified,
                 writes starting at the current file offset.
         """
+        if 1 == 1:
+            raise NotImplementedError("This method is not implemented") # BCHESS TODO
+
         self._path_registry.register_path(name)
 
         if False:  # build_numpy_tensor()
@@ -4136,6 +4140,7 @@ class TensorSerializer:
         write_specs = list(write_specs)
         next_pos = self._file.tell()
         
+        # TODO: make into a future
         self._maybe_fallocate(write_specs)
 
         cuda_executor = self._prepare_for_write_cuda(write_specs)
@@ -4460,54 +4465,6 @@ class TensorSerializer:
             )
         )
 
-
-    @staticmethod
-    def _prepare_with_filter(filter_fn: Callable[[_WriteSpec], bool]):
-        # BCHESS TODO: remove
-        """ Helper for functions that prep tensors but only act on certain tensors, based on a filter
-        The wrapped function only gets called with tensors that pass the filter
-        Any tensors that don't pass the filter are passed through directly by the wrapper
-        Ordering is maintained
-        """
-        class _IterHolder():
-            __slots__ = ['iter']
-
-        def decorator(fn):
-            @functools.wraps(fn)
-            def wrapper(self, write_specs):  # type: (TensorSerializer, Iterator[TensorSerializer._WriteSpec]) -> Iterator[TensorSerializer._WriteSpec]
-                results: List[_IterHolder] = []
-                filtered: List[_WriteSpec] = []
-                filtered_iter_holder = _IterHolder()
-                non_filtered: List[_WriteSpec] = []
-                non_filtered_iter_holder = _IterHolder()
-                for w in write_specs:
-                    if filter_fn(w):
-                        filtered.append(w)
-                        results.append(filtered_iter_holder)
-                    else:
-                        if not filtered:
-                            # So far we haven't hit any filtered tensors, so
-                            # safe to yield immediately
-                            yield w
-                        else:
-                            non_filtered.append(w)
-                            results.append(non_filtered_iter_holder)
-
-                if not filtered:
-                    assert not non_filtered and not results
-                    return
-                non_filtered_iter_holder.iter = iter(non_filtered)
-                filtered_iter_holder.iter = fn(self, filtered)
-                if not non_filtered:
-                    # Everything was filtered, so yield it directly
-                    yield from filtered_iter_holder.iter
-                    return
-                # yield from map(next, map(operator.itemgetter('iter'), results))
-                for holder in results:
-                    yield next(holder.iter)
-            return wrapper
-        return decorator
-
     def _prepare_for_write_cuda(self, write_specs: Sequence[_WriteSpec]) -> Optional[concurrent.futures.ThreadPoolExecutor]:
         cuda_specs = [w for w in write_specs if w.tensor.device.type == "cuda"]
         if not cuda_specs:
@@ -4525,7 +4482,7 @@ class TensorSerializer:
             def submit(self, write_spec) -> concurrent.futures.Future:
                 return self.executor.submit(self._transfer, write_spec)
 
-            def _allocate_staging_tensor(self, max_size):
+            def _allocate_staging_tensor(self, max_size: int):
                 self._stream = torch.cuda.Stream()
                 self._staging_tensor = torch.empty(
                     (max_size,),
@@ -4538,7 +4495,7 @@ class TensorSerializer:
                 nbytes = write_spec.tensor.element_size() * write_spec.tensor.nelement()
                 staging_tensor_view = (
                     self._staging_tensor.narrow(0, 0, nbytes)
-                    .view(write_spec.dtype)
+                    .view(write_spec.tensor.dtype)
                     .view(write_spec.shape)
                 )
                 with torch.cuda.stream(self._stream):
@@ -4546,7 +4503,7 @@ class TensorSerializer:
                 write_spec.user_owns_tensor_data = False
                 write_spec.tensor = staging_tensor_view.clone().detach()
 
-        max_tensor_size = [w.tensor.element_size() * w.tensor.nelement() for w in cuda_specs]
+        max_tensor_size = max([w.tensor.element_size() * w.tensor.nelement() for w in cuda_specs])
         cuda_transfer = CudaTransfer(max_tensor_size)
 
         for w in cuda_specs:
@@ -4564,7 +4521,8 @@ class TensorSerializer:
             write_spec.user_owns_tensor_data = False
 
         for w in write_specs:
-            if w.tensor.is_contiguous():
+            # if there is a tensor_data_task it is a cuda tensor
+            if w.tensor_data_task is not None or w.tensor.is_contiguous():
                 continue
             w.tensor_data_task = self._computation_pool.submit(make_contiguous, w, w.tensor_data_task)
 
@@ -4592,8 +4550,37 @@ class TensorSerializer:
             w.dtype += OPAQUE_DTYPE_SEP + w.numpy_tensor.torch_dtype  # type: ignore
             w.set_min_file_version_number(OPAQUE_TENSORIZER_VERSION)
 
+    @staticmethod
+    def _do_clone(write_spec, dependency: Optional[concurrent.futures.Future]):
+        if dependency is not None:
+            dependency.result(_TIMEOUT)
+        write_spec.tensor = write_spec.tensor.clone().detach()
+
     def _prepare_for_write_encryption(self, write_specs: Sequence[_WriteSpec]) -> None:
         assert self._encrypted and self._encryption is not None
+
+        # If any tensors are shared, so we need to clone all but one of them before encrypting
+        write_specs_by_addr: Dict[int, List[TensorSerializer._WriteSpec]] = collections.defaultdict(list)
+        for w in write_specs:
+            if w.tensor.device.type != 'cpu':
+                continue
+            address = w.tensor.untyped_storage().data_ptr()
+            write_specs_by_addr[address].append(w)
+        
+        for shared_write_specs in write_specs_by_addr.values():
+            if len(shared_write_specs) == 1:
+                continue
+
+            clone_dependencies = _MultiFuture([w.tensor_data_task for w in shared_write_specs if w.tensor_data_task is not None])
+
+            clone_tasks = []
+            for w in shared_write_specs[1:]:
+                clone_tasks.append(self._computation_pool.submit(self._do_clone, w, clone_dependencies))
+                w.user_owns_tensor_data = False
+
+            shared_write_specs[0].tensor_data_task = _MultiFuture(clone_tasks + clone_dependencies.futures)
+            for w in shared_write_specs[1:]:
+                w.tensor_data_task = _MultiFuture(clone_tasks)
 
         for w in write_specs:
             assert w.numpy_tensor is not None
