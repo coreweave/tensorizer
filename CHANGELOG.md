@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.9.0a0] & [2.9.0a1] - 2024-03-21–2024-04-10
+## [2.9.0] - 2024-04-17
 
 ### Added
 
@@ -67,9 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The `end` parameter to `stream_io.CURLStreamFile` now matches the semantics
-  of an HTTP range request
-  - The `end` marker is inclusive, not one-past-the-end
+- Fixed a bug where `stream_io.CURLStreamFile` objects constructed with an
+  `end` parameter would read one byte past their end when calling
+  `CURLStreamFile.read` with no argument
 
 ## [2.8.1] - 2024-02-15
 
@@ -400,8 +400,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
-[2.9.0a1]: https://github.com/coreweave/tensorizer/compare/v2.9.0a1...v2.9.0a0
-[2.9.0a0]: https://github.com/coreweave/tensorizer/compare/v2.8.1...v2.9.0a0
+[2.9.0]: https://github.com/coreweave/tensorizer/compare/v2.8.1...v2.9.0
 [2.8.1]: https://github.com/coreweave/tensorizer/compare/v2.8.0...v2.8.1
 [2.8.0]: https://github.com/coreweave/tensorizer/compare/v2.7.2...v2.8.0
 [2.7.2]: https://github.com/coreweave/tensorizer/compare/v2.7.1...v2.7.2
