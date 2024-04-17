@@ -1687,7 +1687,6 @@ class TensorDeserializer(
             if not self._metadata:
                 raise ValueError("Tensor index in the file is empty")
 
-            # TODO: IF version >= HEADERS_AT_TOP
             self._headers : Optional[Dict[_TensorPath, _TensorHeaderDeserializer]]
             if version_number >= HEADERS_AT_TOP_TENSORIZER_VERSION:
                 metadata_ordered = sorted(self._metadata.values(), key=operator.attrgetter('offset'))
@@ -3870,7 +3869,7 @@ class TensorSerializer:
 
         modules = tuple(m.named_modules())
 
-        def extract_tensors():  # type: () -> Generator[TensorizerSerializer._WriteSpec]
+        def extract_tensors() -> Iterator[TensorSerializer._WriteSpec]:
             chain = itertools.chain
             repeat = itertools.repeat
             for idx, (module_name, module) in enumerate(modules):
@@ -3926,7 +3925,7 @@ class TensorSerializer:
                 spec
                 for spec in all_tensors
                 if spec.tensor_type != TensorType.BUFFER
-                or spec.path in persistent
+                or str(spec.name) in persistent
             )
 
         self._bulk_write(all_tensors)
