@@ -3,6 +3,7 @@
 # Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
 ##############################################################################
 import abc
+import bisect
 import collections.abc
 import concurrent.futures
 import contextlib
@@ -10,6 +11,7 @@ import dataclasses
 import enum
 import functools
 import hashlib
+import heapq
 import io
 import itertools
 import logging
@@ -1907,15 +1909,16 @@ class TensorDeserializer(
         if self._device.type == "cuda":
             free_ram = psutil.virtual_memory().available
             allowed_ram = free_ram - (10 << 20)
-            tensor_sizes = sorted(
-                (t.deserialized_length for t in tensors), reverse=True
+            ram_cost = heapq.nlargest(
+                num_readers, (t.deserialized_length for t in tensors)
             )
-            num_readers = min(num_readers, len(tensor_sizes)) or 1
-            while (
-                num_readers > 1
-                and sum(tensor_sizes[:num_readers]) > allowed_ram
-            ):
-                num_readers -= 1
+            num_readers = len(ram_cost) or 1
+            if num_readers > 1:
+                # Get the total RAM cost for each potential value of num_readers
+                ram_cost[:] = itertools.accumulate(ram_cost)
+                # Find the index (reader count) for the amount of RAM
+                # closest to, but still below, allowed_ram
+                num_readers = bisect.bisect_left(ram_cost, allowed_ram) or 1
         return num_readers
 
     def __del__(self):
