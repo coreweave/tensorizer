@@ -816,8 +816,8 @@ class TestIncrementalSerialization(unittest.TestCase):
 
     def test_too_many_no_max_tensors(self):
         # Any attempt to call write_tensor() more than once will fail if you haven't specified max_tensors
-        with tempfile.NamedTemporaryFile(
-            "wb+", delete=True, delete_on_close=False
+        with NamedTemporaryFileCloseNoDelete(
+            "wb+", delete=True
         ) as temporary_file:
             serializer = TensorSerializer(temporary_file)
             serializer.write_tensor(
@@ -836,8 +836,8 @@ class TestIncrementalSerialization(unittest.TestCase):
 
     def test_too_many(self):
         # If you set max_tensors too low you'll eventually run out of header space
-        with tempfile.NamedTemporaryFile(
-            "wb+", delete=True, delete_on_close=False
+        with NamedTemporaryFileCloseNoDelete(
+            "wb+", delete=True
         ) as temporary_file:
             serializer = TensorSerializer(temporary_file, max_tensors=2)
             last_success = 0
@@ -854,8 +854,8 @@ class TestIncrementalSerialization(unittest.TestCase):
 
     def test_long_tensor_name(self):
         # Tensors with very long names could still cause space problems even if max_tensors is correct
-        with tempfile.NamedTemporaryFile(
-            "wb+", delete=True, delete_on_close=False
+        with NamedTemporaryFileCloseNoDelete(
+            "wb+", delete=True
         ) as temporary_file:
             serializer = TensorSerializer(temporary_file, max_tensors=2)
             serializer.write_tensor(
@@ -877,8 +877,8 @@ class TestIncrementalSerialization(unittest.TestCase):
         model = AutoModelForCausalLM.from_pretrained(model_name)
         tensors = model.state_dict()
 
-        with tempfile.NamedTemporaryFile(
-            "wb+", delete=True, delete_on_close=False
+        with NamedTemporaryFileCloseNoDelete(
+            "wb+", delete=True
         ) as temporary_file:
             serializer = TensorSerializer(
                 temporary_file, max_tensors=len(tensors), **ser_kwargs
@@ -1478,3 +1478,14 @@ class TestVerification(unittest.TestCase):
                         self.assertTrue(
                             status, f"Unexpected mismatch on {tensor_name}"
                         )
+
+
+def NamedTemporaryFileCloseNoDelete(*args, **kwargs):
+    # NamedTemporaryFile(delete_on_close=False) is not available until Python 3.12
+    if sys.version_info >= (3, 12):
+        kwargs["delete_on_close"] = False
+        return tempfile.NamedTemporaryFile(*args, **kwargs)
+
+    f = tempfile.NamedTemporaryFile(*args, **kwargs)
+    f.close = f.file.close
+    return f

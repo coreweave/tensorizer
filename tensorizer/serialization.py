@@ -3755,7 +3755,7 @@ class TensorSerializer:
         def __init__(
             self,
             module_index: int,
-            name: str | _TensorPath,
+            name: Union[str, _TensorPath],
             tensor_type: TensorType,
             tensor: torch.Tensor,
         ):
@@ -3859,12 +3859,14 @@ class TensorSerializer:
             self._synchronize_pools()
             self._sync_prologue_state()
         except Exception as e:
+            for j in self._jobs:
+                j.cancel()
             if cuda_executor is not None:
-                cuda_executor.shutdown(wait=False, cancel_futures=True)
+                cuda_executor.shutdown(wait=False)
             raise e
 
         if cuda_executor is not None:
-            cuda_executor.shutdown(wait=True, cancel_futures=False)
+            cuda_executor.shutdown(wait=True)
 
     def write_module(
         self,
@@ -4146,6 +4148,7 @@ class TensorSerializer:
         for w in cuda_specs:
             assert w.tensor_data_task is None
             w.tensor_data_task = cuda_transfer.submit(w)
+            self._jobs.append(w.tensor_data_task)
 
         return cuda_transfer.executor
 
