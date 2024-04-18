@@ -3462,8 +3462,10 @@ class TensorSerializer:
         self._metadata_end : Optional[int] = None
         self._header_end : Optional[int] = None
         if max_tensors:
+            # Estimate 256 bytes per metadata entry and 1024 bytes per header entry
             self._metadata_end = self._metadata_cur + max_tensors * 256
-            self._header_end = self._metadata_end + max_tensors * 1024
+            # this is less about header_end itself but ensuring that tensor_start is on a 4096-byte aligned boundary
+            self._header_end = ((self._metadata_end + max_tensors * 1024) + 4095) & ~4095
 
         self._header_cur = self._metadata_end  # is the start of where to write header data, or None
         self._tensor_cur = self._header_end  # is the start of where to write tensor data. or None
@@ -4279,10 +4281,14 @@ class TensorSerializer:
             raise RuntimeError("Header block is full. Increase max_tensors")
 
         ## tensors
-        if self._tensor_cur is not None:
+        if self._tensor_cur is None:
+            # The block of tensor data starts on a page-aligned boundary
+            self._tensor_cur = (file_offset + 4095) & ~4095
+        else:
             if self._tensor_cur < file_offset:
                 raise RuntimeError("Somehow wrote past header block")
-            file_offset = self._tensor_cur
+            # Each tensor itself begins on an 8-byte aligned boundary
+            file_offset = (self._tensor_cur + 7) & ~7
 
         # file_offset is now where we should start writing tensor data
         for w in write_specs:
