@@ -810,6 +810,65 @@ class TestSerialization(unittest.TestCase):
                     self.assertNotIn("-1", deserialized)
                     self.assertNotIn("11", deserialized)
 
+    
+class TestIncrementalSerialization(unittest.TestCase):
+    # Tests that involve multiple calls to write_tensor()
+    
+    def test_too_many_no_max_tensors(self):
+        # Any attempt to call write_tensor() more than once will fail if you haven't specified max_tensors
+        with tempfile.NamedTemporaryFile("wb+", delete=True, delete_on_close=False) as temporary_file:
+            serializer = TensorSerializer(temporary_file)
+            serializer.write_tensor(0, "a", TensorType.PARAM, torch.zeros((64, 64), dtype=torch.uint8))
+            with self.assertRaises(RuntimeError):
+                serializer.write_tensor(1, "b", TensorType.PARAM, torch.zeros((64, 64), dtype=torch.uint8))
+
+    def test_too_many(self):
+        # If you set max_tensors too low you'll eventually run out of header space
+        with tempfile.NamedTemporaryFile("wb+", delete=True, delete_on_close=False) as temporary_file:
+            serializer = TensorSerializer(temporary_file, max_tensors=2)
+            last_success = 0
+            with self.assertRaises(RuntimeError):
+                for x in range(100):
+                    serializer.write_tensor(x, f"t.{x}", TensorType.PARAM, torch.zeros((64, 64), dtype=torch.uint8))
+                    last_success = x
+            self.assertGreaterEqual(last_success, 2) 
+
+    def test_long_tensor_name(self):
+        # Tensors with very long names could still cause space problems even if max_tensors is correct
+        with tempfile.NamedTemporaryFile("wb+", delete=True, delete_on_close=False) as temporary_file:
+            serializer = TensorSerializer(temporary_file, max_tensors=2)
+            serializer.write_tensor(0, "a", TensorType.PARAM, torch.zeros((64, 64), dtype=torch.uint8))
+            with self.assertRaises(RuntimeError):
+                serializer.write_tensor(0, "b" * 8192, TensorType.PARAM, torch.zeros((64, 64), dtype=torch.uint8))
+
+    def _test_model(self, ser_kwargs, deser_kwargs):
+        # Successful test with all of the tensors in a model
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        tensors = model.state_dict()
+
+        with tempfile.NamedTemporaryFile("wb+", delete=True, delete_on_close=False) as temporary_file:
+            serializer = TensorSerializer(temporary_file, max_tensors=len(tensors), **ser_kwargs)
+            for idx, (name, tensor) in enumerate(tensors.items()):
+                serializer.write_tensor(idx, name, TensorType.PARAM, tensor)
+            serializer.close()
+            with TensorDeserializer(temporary_file.name, verify_hash=True, device='cpu', **deser_kwargs) as deserializer:
+                self.assertEqual(deserializer.keys(), tensors.keys())
+                for name in deserializer.keys():
+                    self.assertTrue(
+                        torch.equal(deserializer[name], tensors[name]),
+                        msg=(
+                            f"Contents of tensor {name!r}"
+                            " are different after deserialization"
+                        ),
+                    )
+
+    def test_model(self):
+        self._test_model({},{})
+
+    def test_model_encryption(self):
+        encryption_params = serialization.EncryptionParams.from_string(source="test")
+        decryption_params = serialization.DecryptionParams.from_string(source="test")
+        self._test_model(dict(encryption=encryption_params), dict(encryption=decryption_params))
 
 @unittest.skipUnless(
     encryption_available,

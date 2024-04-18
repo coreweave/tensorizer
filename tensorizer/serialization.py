@@ -3702,6 +3702,7 @@ class TensorSerializer:
 
         Serialization format:
 
+         in header block near top of file:
          { uint64                           header_sz,
            uint16                           module_idx,
            uint8                            type,
@@ -3718,14 +3719,19 @@ class TensorSerializer:
               uint8                         hash_sz,
               []char                        hash_str,
              }                              hashes,
-           uint64                           tensor_sz,
-           []byte                           tensor }
+           uint64                           tensor_sz}
+           .....
+           affer all headers, bottom of file:
+           {[]byte                           tensor }
         """
+        if isinstance(tensor, numpy.ndarray):
+            tensor = torch.from_numpy(tensor)
+
         write_spec = self._WriteSpec(
             module_index=idx,
             name=name,
             tensor_type=tensor_type,
-            tensor=tensor  # BCHESS TODO: handle ndarray
+            tensor=tensor
         )
         self._bulk_write([write_spec], incremental=True)
 
@@ -3802,8 +3808,8 @@ class TensorSerializer:
             # TODO: make into a future
             self._maybe_fallocate(write_specs)
 
-        # TODO
-        # self._path_registry.register_path(name)
+        for w in write_specs:
+            self._path_registry.register_path(w.name)
 
         cuda_executor = self._prepare_for_write_cuda(write_specs)
         try:
@@ -4251,7 +4257,9 @@ class TensorSerializer:
             file_offset += w.header.get_metadata_entry_segment().size
 
         self._metadata_cur = file_offset
-        if self._metadata_end is not None and file_offset > self._metadata_end:
+        if self._metadata_end is None:
+            self._metadata_end = self._metadata_cur
+        elif file_offset > self._metadata_end:
             raise RuntimeError("Metadata block is full. Increase max_tensors")
 
         ## headers
@@ -4265,7 +4273,9 @@ class TensorSerializer:
             file_offset += w.header.size
 
         self._header_cur = file_offset
-        if self._header_end is not None and self._header_cur > self._header_end:
+        if self._header_end is None:
+            self._header_end = self._header_cur
+        elif self._header_cur > self._header_end:
             raise RuntimeError("Header block is full. Increase max_tensors")
 
         ## tensors
