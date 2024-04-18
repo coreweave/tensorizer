@@ -462,7 +462,6 @@ class _TensorHeaderSerializer:
                 self.data_length_segment.size,
             )
         )
-        # BCHESS self.size = self.data_offset
 
     def build(self, tensor_data_offset: int):
         # tensor_data_offset: location of tensor data in file
@@ -534,12 +533,9 @@ class _TensorHeaderSerializer:
         )
 
     def _hashable_segment_views(self):
-        if self.crypt_info is None:
-            yield memoryview(self.buffer)
-        else:
-            yield memoryview(self.buffer)[: self.crypt_info_offset]
-            # Skip crypt_info
-            yield memoryview(self.buffer)[self.data_length_offset :]
+        # Skip areas where we store hashes and crypt_info
+        yield memoryview(self.buffer)[:self.hash_header_offset]
+        yield memoryview(self.buffer)[self.data_length_offset:]
 
     def compute_crc32(self) -> int:
         crc32 = 0
@@ -671,6 +667,7 @@ class _TensorHeaderDeserializer:
         self.shape, offset = self.read_shape(buffer, offset)
 
         # Read our hashes in.
+        hash_start = offset
         hashes_slice, offset = self.read_hash_block(buffer, offset)
         with hashes_slice:
             self.hashes = self._decode_hashes(hashes_slice)
@@ -678,13 +675,8 @@ class _TensorHeaderDeserializer:
                 self._zero_hashes(hashes_slice)
 
         if check_crypt_info:
-            crypt_info_start = offset
             crypt_info_slice, offset = self.read_crypt_info_block(
                 buffer, offset
-            )
-            self._hashable_segments = (
-                slice(None, crypt_info_start),
-                slice(offset, None),
             )
             with crypt_info_slice:
                 self.crypt_info = _crypt_info.CryptInfo.unpack_from(
@@ -695,10 +687,11 @@ class _TensorHeaderDeserializer:
             self._hashable_segments = (slice(None, None),)
 
         # Finally, get the tensor data length.
-        offset = len(buffer) - self.data_length_segment.size
+        data_length_start = offset = len(buffer) - self.data_length_segment.size
         self.data_length = self.data_length_segment.unpack_from(buffer, offset)[
             0
         ]
+        self._hashable_segments = (slice(None, hash_start), slice(data_length_start, None))
 
     def _hashable_segment_views(self):
         for segment_slice in self._hashable_segments:
@@ -2275,7 +2268,7 @@ class TensorDeserializer(
 
     def _verify_hashes(
         self,
-        name: str,
+        name: _TensorPath,
         hashes: Iterable[TensorHash],
         header_hashes: Dict[HashType, Any],
         mv: Union[memoryview, bytes],
@@ -3842,12 +3835,6 @@ class TensorSerializer:
         if cuda_executor is not None:
             cuda_executor.shutdown(wait=True, cancel_futures=False)
 
-        return
-        # BCHESS TODO
-        ########################################
-        self._synchronize_pools()
-        self._sync_prologue_state()
-
     def write_module(
         self,
         m: torch.nn.Module,
@@ -4393,7 +4380,7 @@ class TensorSerializer:
                     verify=write_spec.header.data_length  # type: ignore
                 )
 
-            with self._tensor_count_update_lock: # BCHESS TODO ???
+            with self._tensor_count_update_lock: # TODO: get rid of this?
                 self._file_header.tensor_count += 1
                 self._file_header.tensor_size += bytes_written
 
@@ -4435,9 +4422,6 @@ class TensorSerializer:
                 continue
             w.tensor_data_task = self._decryption_pool.submit(decrypt, w, w.tensor_data_task)
             self._jobs.append(w.tensor_data_task)
-            # TODO: BCHESS
-            # assert mem_pointer is not None
-            # self._decryption_jobs[mem_pointer] = decrypt_task
 
 def _get_perf_stats():
     if _perf_stats is None:
