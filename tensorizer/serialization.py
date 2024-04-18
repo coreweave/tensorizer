@@ -4390,7 +4390,11 @@ class TensorSerializer:
             if dependency is not None:
                 dependency.result(_TIMEOUT)
             sha256 = write_spec.header.compute_sha256()
+            if write_spec.name[0] == "lm_head.weight":
+                print("lm_head.weight (headers only)", sha256.digest().hex())
             sha256.update(write_spec.numpy_tensor.tensor_memory)
+            if write_spec.name[0] == "lm_head.weight":
+                print("lm_head.weight", sha256.digest().hex())
             write_spec.header.add_sha256(sha256.digest())
 
         for w in write_specs:
