@@ -84,6 +84,7 @@ _DECODE_MAPPING = {
 
 OPAQUE_DTYPE_SEP = "\0"
 
+
 class _NumpyTensor(NamedTuple):
     data: numpy.ndarray
     numpy_dtype: str
@@ -348,7 +349,7 @@ class _NumpyTensor(NamedTuple):
             raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}") from e
 
         return dtype
-    
+
     @property
     def tensor_memory(self):
         return self.data.data
