@@ -4201,6 +4201,7 @@ class TensorSerializer:
         if dependency is not None:
             dependency.result(_TIMEOUT)
         write_spec.tensor = write_spec.tensor.clone().detach()
+        write_spec.numpy_tensor = _NumpyTensor.from_tensor(write_spec.tensor)
 
     def _prepare_for_write_encryption(
         self, write_specs: Sequence[_WriteSpec]
