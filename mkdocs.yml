@@ -45,32 +45,16 @@ plugins:
       handlers:
         python:
           options: # These need review by ML team: (https://mkdocstrings.github.io/python/usage/configuration/general/)
-            allow_inspection: true
             show_bases: true
             show_source: false
-            # preload_modules: # See https://mkdocstrings.github.io/python/usage/configuration/general/#preload_modules
-            #   - some_module_foo
-            find_stubs_package: false
-            heading_level: 2
             load_external_modules: true
-            group_by_category: true
             docstring_options:
-              ignore_init_summary: false
-              trim_doctest_flags: false
-              allow_section_blank_lines: true
               returns_multiple_items: false
-            docstring_section_style: spacy
-            inherited_members: true
-            merge_init_into_class: false
+            docstring_section_style: list
+            merge_init_into_class: true
             separate_signature: true
-            show_root_heading: true
-            show_root_toc_entry: true
-            show_root_full_path: true
-            show_root_members_full_path: false
-            show_object_full_path: false
-            show_signature_annotations: true
+            show_root_toc_entry: false
             signature_crossrefs: true
-            summary: true
             unwrap_annotated: true
             docstring_style: google
 
