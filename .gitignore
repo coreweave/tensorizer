@@ -20,3 +20,6 @@ pybuild
 *.egg-info
 build/
 dist/
+
+# Sphinx
+/docs/build/
