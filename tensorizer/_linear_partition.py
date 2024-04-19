@@ -14,6 +14,7 @@ def partition(
     Partitions a sequence of weights into slices with balanced sums,
     without changing the ordering of elements.
     Balancing minimizes the largest sum of any resulting slice.
+
     Args:
         weights: Element weights to balance.
         partitions: The maximum number of slices to return.

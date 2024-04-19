@@ -63,6 +63,7 @@ del _get_fallocate
 def has_fallocate() -> bool:
     """
     Checks if the Linux ``fallocate(2)`` syscall is available.
+
     Returns: ``True`` if ``fallocate(2)`` is available, ``False`` otherwise.
     """
     return _fallocate is not None
@@ -83,6 +84,7 @@ def try_fallocate(
             Otherwise, only ignores ``EOPNOTSUPP``.
 
     Returns: ``True`` if fallocate ran successfully, ``False`` otherwise.
+
     Raises:
         OSError: If `suppress_all_errors` is ``False`` and the call failed
             due to an error other than ``EOPNOTSUPP``.

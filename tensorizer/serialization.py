@@ -886,7 +886,6 @@ class EncryptionParams:
     Do not use this with an insecure key.
 
     Examples:
-
         Using `EncryptionParams.from_string()` with
         an environment variable::
 
@@ -1079,6 +1078,7 @@ class EncryptionParams:
 
         Returns:
             The cryptographic salt used for key derivation.
+
         Raises:
             ValueError: If no salt is being used for key derivation.
         """
@@ -1258,7 +1258,6 @@ class DecryptionParams:
     `EncryptionParams.from_string()` or `EncryptionParams.random()`.
 
     Examples:
-
         Using `DecryptionParams.from_string()` with
         an environment variable::
 
@@ -1330,9 +1329,6 @@ class DecryptionParams:
             source: Source string to use for decryption.
             encoding: The encoding to use to convert `source` to ``bytes``
                 if provided as a ``str``. Defaults to UTF-8.
-
-        Returns:
-
         """
         if not source:
             raise ValueError("Source cannot be empty")
@@ -2470,8 +2466,10 @@ class TensorDeserializer(
                 A `HashMismatchError` will be raised if any of the hashes do
                 not match. If ``None``, the value of the `verify_hash` argument
                 passed to the `TensorDeserializer` constructor will be used.
+
         Yields:
-            Tuples of the form (module_idx, tensor_type, name, tensor).
+            (Tuple[int, int, str, torch.Tensor]):
+                Tuples of the form ``(module_idx, tensor_type, name, tensor)``.
 
         Raises:
             HashMismatchError: If `verify_hash` resolves to True and
@@ -2544,20 +2542,23 @@ class TensorDeserializer(
                 passed to the `TensorDeserializer` constructor will be used.
 
         Yields:
-            Tuples of the form:
-            (
-                module_idx,
-                tensor_type,
-                name,
-                arr,
-                is_opaque,
-                torch_dtype
-            )
-            If the `allow_raw_data` parameter is ``False`` (the default),
-            the final two elements are always ``False`` and ``None``,
-            respectively. Otherwise, ``is_opaque`` may be ``True``, and
-            ``torch_dtype`` will then be a string representing the actual
-            non-numpy datatype represented by the data in `arr`.
+            (Tuple[int, int, str, numpy.ndarray, bool, Optional[str]]):
+                Tuples of the form:
+
+                    (
+                        module_idx,
+                        tensor_type,
+                        name,
+                        arr,
+                        is_opaque,
+                        torch_dtype
+                    )
+
+                If the `allow_raw_data` parameter is ``False`` (the default),
+                the final two elements are always ``False`` and ``None``,
+                respectively. Otherwise, ``is_opaque`` may be ``True``, and
+                ``torch_dtype`` will then be a string representing the actual
+                non-numpy datatype represented by the data in `arr`.
 
         Raises:
             ValueError: If an opaque datatype is encountered in the file
@@ -3104,13 +3105,13 @@ class TensorDeserializer(
                 verification failed.
 
         Returns:
-             A 2-tuple ``(passed, results)`` where ``passed`` is a boolean
-             reporting if all checks passed, i.e. the overall result
-             of the verification, and ``results`` is a list of
-             ``(tensor_name, bool)`` tuples listing each tensor that was checked
-             and its individual verification result.
-             ``results`` can be used to tell which tensor failed verification
-             when ``passed`` is False.
+            A 2-tuple ``(passed, results)`` where ``passed`` is a boolean
+            reporting if all checks passed, i.e. the overall result
+            of the verification, and ``results`` is a list of
+            ``(tensor_name, bool)`` tuples listing each tensor
+            that was checked and its individual verification result.
+            ``results`` can be used to tell which tensor
+            failed verification when ``passed`` is False.
 
         Raises:
             RuntimeError: If this function is called before tensor data and
@@ -3497,6 +3498,7 @@ class TensorSerializer:
 
         Returns:
             The number of bytes written.
+
         Raises:
             OSError: ``verify=True`` and the number of bytes written
                 did not match the length of `data`.

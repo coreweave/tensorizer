@@ -58,6 +58,7 @@ plugins:
               ignore_init_summary: false
               trim_doctest_flags: false
               allow_section_blank_lines: true
+              returns_multiple_items: false
             docstring_section_style: spacy
             inherited_members: true
             merge_init_into_class: false
