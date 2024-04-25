@@ -919,7 +919,7 @@ def _new_s3_client(
     config = boto3.session.Config(**config_args)
 
     if s3_endpoint:
-        s3_endpoint =_ensure_https_endpoint(s3_endpoint)
+        s3_endpoint = _ensure_https_endpoint(s3_endpoint)
 
     return boto3.session.Session.client(
         boto3.session.Session(),
@@ -1061,8 +1061,8 @@ def _infer_credentials(
     by parsing the s3cmd config file if necessary.
 
     If no credentials are provided and the s3cmd config file is not
-    present or can't be parsed, attempt to use the EC2 metadata service
-    to retrieve short-term IAM credentials.
+    present or can't be parsed, assume we're using the IAM short-term
+    credentials.
 
     An empty string ("") is considered a specified credential,
     while None is an unspecified credential.
@@ -1359,8 +1359,7 @@ def open_stream(
 
                 # Not required to have been found,
                 # and doesn't overwrite an explicitly specified endpoint.
-                if s3_endpoint is None:
-                    s3_endpoint = s3.s3_endpoint
+                s3_endpoint = s3_endpoint or s3.s3_endpoint
         except (ValueError, FileNotFoundError) as e:
             # Uploads always require credentials here, but downloads may not
             if is_s3_upload:
