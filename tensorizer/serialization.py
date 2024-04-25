@@ -3808,9 +3808,12 @@ class TensorSerializer:
         def set_min_file_version_number(self, version_number):
             self.min_file_version = max(self.min_file_version, version_number)
 
-    def _maybe_fallocate(self, tensors: Sequence[_WriteSpec]):
+    def _maybe_fallocate(
+        self, tensors: Sequence[_WriteSpec]
+    ) -> Optional[concurrent.futures.Future]:
+        return None
         if not _syscalls.has_fallocate() or not self._fd:
-            return
+            return None
 
         next_pos = self._file.tell()
         size = sum(len(t.name.serialized_()) for t in tensors)
@@ -3823,16 +3826,21 @@ class TensorSerializer:
         # Rough underestimate of header size
         header_min_size = 24
         size += header_min_size * len(tensors)
-        _syscalls.try_fallocate(
-            self._fd, next_pos, size, suppress_all_errors=True
+
+        return self._header_writer_pool.submit(
+            _syscalls.try_fallocate,
+            self._fd,
+            next_pos,
+            size,
+            suppress_all_errors=True,
         )
 
     def _bulk_write(self, write_specs: Iterable[_WriteSpec], incremental=False):
         write_specs = list(write_specs)
 
+        write_dependency: Optional[concurrent.futures.Future] = None
         if not incremental:
-            # TODO: make into a future
-            self._maybe_fallocate(write_specs)
+            write_dependency = self._maybe_fallocate(write_specs)
 
         for w in write_specs:
             self._path_registry.register_path(w.name)
@@ -3850,6 +3858,9 @@ class TensorSerializer:
 
             if self._encrypted:
                 self._do_encryption(write_specs)
+            if write_dependency:
+                write_dependency.result(_TIMEOUT)
+
             self._do_commit_headers(write_specs)
             self._do_commit_tensor_data(write_specs)
             if self._encrypted:
@@ -4435,39 +4446,45 @@ class TensorSerializer:
             )
             self._jobs.append(w.tensor_data_task)
 
-    def _do_commit_headers(self, write_specs: Sequence[_WriteSpec]) -> None:
-        # TODO: this is lots of tiny writes. Buffer them for performance
-        def commit_header(write_spec, dependency: _Future):
-            if dependency is not None:
-                dependency.result(_TIMEOUT)
+    def _do_commit_headers(self, write_specs_: Sequence[_WriteSpec]) -> None:
+        def do_commit(
+            write_specs: Sequence[TensorSerializer._WriteSpec],
+            dependencies: Sequence[_Future],
+        ):
+
+            header_block_size = self._header_cur - self._metadata_start
+            header_buffer = bytearray(header_block_size)
+
+            metadata_start = self._metadata_start
+            metadata_size = (
+                self._metadata_cur - metadata_start - 8
+            )  # 8 bytes for metadata length field
+            struct.pack_into("<Q", header_buffer, 0, metadata_size)
+
+            _future_wait_and_raise(dependencies, _TIMEOUT)
+            for w in write_specs:
+                header_buffer[
+                    w.metadata_pos
+                    - metadata_start : w.metadata_pos
+                    + len(w.header.metadata_entry)
+                    - metadata_start
+                ] = w.header.metadata_entry
+                header_buffer[
+                    w.header.file_offset
+                    - metadata_start : w.header.file_offset
+                    + w.header.size
+                    - metadata_start
+                ] = w.header.buffer
+
             self._pwrite(
-                write_spec.header.metadata_entry,
-                write_spec.metadata_pos,
-                verify=len(write_spec.header.metadata_entry),
-            )
-            self._pwrite(
-                write_spec.header.buffer,
-                write_spec.header.file_offset,
-                verify=write_spec.header.size,
+                header_buffer, metadata_start, verify=header_block_size
             )
 
-        metadata_size = (
-            self._metadata_cur - self._metadata_start - 8
-        )  # 8 bytes for metadata length field
-        metadata_size_task = self._header_writer_pool.submit(
-            self._pwrite,
-            struct.pack("<Q", metadata_size),
-            self._metadata_start,
-            verify=8,
+        deps = [w.tensor_data_task for w in write_specs_ if w.tensor_data_task is not None]
+        commit_header_task = self._header_writer_pool.submit(
+            do_commit, list(write_specs_), deps
         )
-        self._jobs.append(metadata_size_task)
-
-        for w in write_specs:
-            commit_header_task = self._header_writer_pool.submit(
-                commit_header, w, w.tensor_data_task
-            )
-            # Note this does _not_ set w.tensor_data_task, as committing headers is safe
-            self._jobs.append(commit_header_task)
+        self._jobs.append(commit_header_task)
 
     def _do_commit_tensor_data(self, write_specs: Sequence[_WriteSpec]):
         def commit_tensor_data(
