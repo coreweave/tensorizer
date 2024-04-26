@@ -62,7 +62,11 @@ import tensorizer.utils as utils
 from tensorizer._crypt._cgroup_cpu_count import (
     effective_cpu_count as _effective_cpu_count,
 )
-from tensorizer._futuregroup import _future_wait_and_raise, _FutureGroup
+from tensorizer._futuregroup import (
+    _Future,
+    _future_wait_and_raise,
+    _FutureGroup,
+)
 from tensorizer._internal_utils import Chunked as _Chunked
 from tensorizer._internal_utils import _variable_read
 from tensorizer._NumpyTensor import OPAQUE_DTYPE_SEP, _NumpyTensor
@@ -3437,7 +3441,7 @@ class TensorSerializer:
         # to each pool in the same relative order.
 
         # Tracks work submitted to all pools to wait for pending work to finish.
-        self._jobs: List[concurrent.futures.Future] = []
+        self._jobs: List[_Future] = []
         # Tracks work submitted to the decryption pool to prevent conflicting,
         # overlapping in-place operations on tensors using shared storage.
         self._decryption_jobs: typing.MutableMapping[
@@ -3799,7 +3803,7 @@ class TensorSerializer:
             # self.tensor_data_task is a future for processing some contents of self.tensor
             # e.g. cuda transfer, make_contiguous, hashing, encryption, writing, or decryption.
             # They are often chained from one step of the process to the next
-            self.tensor_data_task: Optional[concurrent.futures.Future] = None
+            self.tensor_data_task: Optional[_Future] = None
 
         def set_min_file_version_number(self, version_number):
             self.min_file_version = max(self.min_file_version, version_number)
@@ -4374,7 +4378,7 @@ class TensorSerializer:
     ) -> None:
         def compute_crc32(
             write_spec: TensorSerializer._WriteSpec,
-            dependency: Optional[concurrent.futures.Future],
+            dependency: Optional[_Future],
         ):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
@@ -4386,7 +4390,7 @@ class TensorSerializer:
 
         def compute_sha256(
             write_spec: TensorSerializer._WriteSpec,
-            dependency: Optional[concurrent.futures.Future],
+            dependency: Optional[_Future],
         ):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
@@ -4414,7 +4418,7 @@ class TensorSerializer:
                 self._jobs.extend(hash_tasks)
 
     def _do_encryption(self, write_specs: Sequence[_WriteSpec]) -> None:
-        def encrypt(write_spec, dependency):
+        def encrypt(write_spec, dependency: _Future):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
             try:
@@ -4433,7 +4437,7 @@ class TensorSerializer:
 
     def _do_commit_headers(self, write_specs: Sequence[_WriteSpec]) -> None:
         # TODO: this is lots of tiny writes. Buffer them for performance
-        def commit_header(write_spec, dependency):
+        def commit_header(write_spec, dependency: _Future):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
             self._pwrite(
@@ -4468,7 +4472,7 @@ class TensorSerializer:
     def _do_commit_tensor_data(self, write_specs: Sequence[_WriteSpec]):
         def commit_tensor_data(
             write_spec: TensorSerializer._WriteSpec,
-            dependency: Optional[concurrent.futures.Future],
+            dependency: Optional[_Future],
         ):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
@@ -4494,7 +4498,7 @@ class TensorSerializer:
     def _maybe_decrypt_data(self, write_specs: Sequence[_WriteSpec]):
         def decrypt(
             write_spec: TensorSerializer._WriteSpec,
-            dependency: Optional[concurrent.futures.Future],
+            dependency: Optional[_Future],
         ):
             try:
                 if dependency is not None:

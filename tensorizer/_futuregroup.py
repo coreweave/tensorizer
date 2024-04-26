@@ -1,9 +1,8 @@
 import concurrent.futures
-from collections.abc import Callable
-from typing import Any, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Union
 
 
-class _FutureGroup(concurrent.futures.Future):
+class _FutureGroup:
     def __init__(self, futures: Sequence[concurrent.futures.Future]):
         self.futures = futures
 
@@ -22,8 +21,8 @@ class _FutureGroup(concurrent.futures.Future):
     def done(self) -> bool:
         return all(f.done() for f in self.futures)
 
-    def result(self, timeout=None) -> Sequence[Any]:
-        return _future_wait_and_raise(self.futures, timeout=timeout)
+    def result(self, timeout=None) -> None:
+        _future_wait_and_raise(self.futures, timeout=timeout)
 
     def exception(self, timeout=None) -> Optional[BaseException]:
         for f in self.futures:
@@ -32,36 +31,26 @@ class _FutureGroup(concurrent.futures.Future):
                 return exc
         return None
 
-    def add_done_callback(self, _):
-        raise NotImplementedError()
 
-    def set_running_or_notify_cancel(self) -> bool:
-        raise NotImplementedError()
-
-    def set_result(self, _) -> None:
-        raise NotImplementedError()
-
-    def set_exception(self, _) -> None:
-        raise NotImplementedError()
+_Future = Union[_FutureGroup, concurrent.futures.Future]
 
 
-def _future_wait_and_raise(
-    futures: Sequence[concurrent.futures.Future], timeout=None
-) -> Sequence[Any]:
+def _future_wait_and_raise(futures: Sequence[_Future], timeout=None) -> None:
     # Wait on a list of futures with a timeout. Raise any exceptions, including TimeoutErrors.
-    # otherwise return the list of results in the same order as the input futures.
-    results = []
-    flattened_futures = []
-    for f in futures:
+
+    flattened_futures: List[concurrent.futures.Future] = []
+    futures = list(futures)
+    while futures:
+        f = futures.pop()
         if isinstance(f, _FutureGroup):
-            flattened_futures.extend(f.futures)
+            futures.extend(f.futures)
         else:
             flattened_futures.append(f)
+
     fs = concurrent.futures.wait(flattened_futures, timeout=timeout)
     for f in fs.done:
         # if the future has an exception, this will raise it
-        results.append(f.result())
+        f.result()
     for f in fs.not_done:
         # force raise of TimeoutError
-        results.append(f.result(0))
-    return results
+        f.result(0)
