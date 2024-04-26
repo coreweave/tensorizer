@@ -4201,7 +4201,7 @@ class TensorSerializer:
             w.set_min_file_version_number(OPAQUE_TENSORIZER_VERSION)
 
     @staticmethod
-    def _do_clone(write_spec, dependency: Optional[concurrent.futures.Future]):
+    def _do_clone(write_spec, dependency: Optional[_Future]):
         if dependency is not None:
             dependency.result(_TIMEOUT)
         write_spec.tensor = write_spec.tensor.clone().detach()
@@ -4234,7 +4234,7 @@ class TensorSerializer:
                 ]
             )
 
-            clone_tasks = []
+            clone_tasks: List[_Future] = []
             for w in shared_write_specs[1:]:
                 clone_tasks.append(
                     self._computation_pool.submit(
@@ -4401,7 +4401,7 @@ class TensorSerializer:
         for w in write_specs:
             old_tensor_data_task = w.tensor_data_task
 
-            hash_tasks = []
+            hash_tasks: List[_Future] = []
             if w.include_crc32:
                 crc32_task = self._computation_pool.submit(
                     compute_crc32, w, old_tensor_data_task
@@ -4418,7 +4418,7 @@ class TensorSerializer:
                 self._jobs.extend(hash_tasks)
 
     def _do_encryption(self, write_specs: Sequence[_WriteSpec]) -> None:
-        def encrypt(write_spec, dependency: _Future):
+        def encrypt(write_spec, dependency: Optional[_Future]):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
             try:

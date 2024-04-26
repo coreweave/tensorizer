@@ -3,7 +3,7 @@ from typing import Any, List, Optional, Sequence, Union
 
 
 class _FutureGroup:
-    def __init__(self, futures: Sequence[concurrent.futures.Future]):
+    def __init__(self, futures):  # type: (Sequence[_Future]) -> None
         self.futures = futures
 
     def cancel(self) -> bool:
