@@ -3811,7 +3811,6 @@ class TensorSerializer:
     def _maybe_fallocate(
         self, tensors: Sequence[_WriteSpec]
     ) -> Optional[concurrent.futures.Future]:
-        return None
         if not _syscalls.has_fallocate() or not self._fd:
             return None
 
@@ -4480,7 +4479,11 @@ class TensorSerializer:
                 header_buffer, metadata_start, verify=header_block_size
             )
 
-        deps = [w.tensor_data_task for w in write_specs_ if w.tensor_data_task is not None]
+        deps = [
+            w.tensor_data_task
+            for w in write_specs_
+            if w.tensor_data_task is not None
+        ]
         commit_header_task = self._header_writer_pool.submit(
             do_commit, list(write_specs_), deps
         )
