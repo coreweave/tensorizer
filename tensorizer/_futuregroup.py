@@ -51,7 +51,13 @@ def _future_wait_and_raise(
     # Wait on a list of futures with a timeout. Raise any exceptions, including TimeoutErrors.
     # otherwise return the list of results in the same order as the input futures.
     results = []
-    fs = concurrent.futures.wait(futures, timeout=timeout)
+    flattened_futures = []
+    for f in futures:
+        if isinstance(f, _FutureGroup):
+            flattened_futures.extend(f.futures)
+        else:
+            flattened_futures.append(f)
+    fs = concurrent.futures.wait(flattened_futures, timeout=timeout)
     for f in fs.done:
         # if the future has an exception, this will raise it
         results.append(f.result())
