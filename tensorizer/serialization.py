@@ -4462,18 +4462,18 @@ class TensorSerializer:
 
             _future_wait_and_raise(dependencies, _TIMEOUT)
             for w in write_specs:
+                w_h = w.header
+                assert w_h is not None
+                # fmt: off
                 header_buffer[
-                    w.metadata_pos
-                    - metadata_start : w.metadata_pos
-                    + len(w.header.metadata_entry)
-                    - metadata_start
-                ] = w.header.metadata_entry
+                    w.metadata_pos - metadata_start :
+                    w.metadata_pos + len(w_h.metadata_entry) - metadata_start
+                ] = w_h.metadata_entry
                 header_buffer[
-                    w.header.file_offset
-                    - metadata_start : w.header.file_offset
-                    + w.header.size
-                    - metadata_start
-                ] = w.header.buffer
+                    w_h.file_offset - metadata_start :
+                    w_h.file_offset + w_h.size - metadata_start
+                ] = w_h.buffer
+                # fmt: on
 
             self._pwrite(
                 header_buffer, metadata_start, verify=header_block_size
