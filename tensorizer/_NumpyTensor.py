@@ -82,8 +82,6 @@ _DECODE_MAPPING = {
     k: v for k, v in _ALL_TYPES.items() if v not in _UNSUPPORTED_TYPES
 }
 
-OPAQUE_DTYPE_SEP = "\0"
-
 
 class _NumpyTensor(NamedTuple):
     data: numpy.ndarray
@@ -226,15 +224,6 @@ class _NumpyTensor(NamedTuple):
         """
         return self._is_opaque(self.numpy_dtype)
 
-    @property
-    def dtype_name(self):
-        if not self.is_opaque:
-            return self.numpy_dtype
-
-        # The datatype name needs to contain both the numpy dtype that the
-        # data is serialized as and the original torch dtype.
-        return self.numpy_dtype + OPAQUE_DTYPE_SEP + self.torch_dtype
-
     @staticmethod
     def _intermediate_type(size: int) -> torch.dtype:
         """
@@ -349,7 +338,3 @@ class _NumpyTensor(NamedTuple):
             raise ValueError(f"Invalid torch_dtype: {self.torch_dtype}") from e
 
         return dtype
-
-    @property
-    def tensor_memory(self):
-        return self.data.data

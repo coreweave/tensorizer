@@ -70,7 +70,7 @@ from tensorizer._futuregroup import (
 )
 from tensorizer._internal_utils import Chunked as _Chunked
 from tensorizer._internal_utils import _variable_read
-from tensorizer._NumpyTensor import OPAQUE_DTYPE_SEP, _NumpyTensor
+from tensorizer._NumpyTensor import _NumpyTensor
 from tensorizer._tensor_path import (
     _TensorPath,
     _TensorPathComponent,
@@ -168,6 +168,10 @@ TENSORIZER_VERSION = 5
 
 HEADERS_AT_TOP_TENSORIZER_VERSION = 5
 
+# The hashable_segment_views used to include the fields that include the hash results themselves.
+# These fields were zero when computing hash
+HEADER_HASHES_OMIT_HASH_FIELDS = 5
+
 # To serialize meta tensors into metadata-only tensors
 # that deserialize back into zeroed-out buffers, data version 4 is required.
 META_TENSOR_TENSORIZER_VERSION = 4
@@ -184,6 +188,8 @@ OPAQUE_TENSORIZER_VERSION = 2
 NON_OPAQUE_TENSORIZER_VERSION = 1
 
 TENSORIZER_MAGIC = b"|TZR|"
+
+OPAQUE_DTYPE_SEP = "\0"
 
 _TIMEOUT: typing.Final[int] = 3600
 
@@ -621,6 +627,7 @@ class _TensorHeaderDeserializer:
     @classmethod
     def from_io(
         cls,
+        file_version: int,
         reader: io.BufferedIOBase,
         zero_hashes: bool = True,
         check_crypt_info: bool = False,
@@ -638,15 +645,20 @@ class _TensorHeaderDeserializer:
         with memoryview(buffer) as mv:
             reader.readinto(mv[offset:])
         return cls(
-            buffer, zero_hashes=zero_hashes, check_crypt_info=check_crypt_info
+            file_version,
+            buffer,
+            zero_hashes=zero_hashes,
+            check_crypt_info=check_crypt_info,
         )
 
     def __init__(
         self,
+        file_version: int,
         buffer: bytearray,
         zero_hashes: bool = True,
         check_crypt_info: bool = False,
     ):
+        self.file_version = file_version
         self.buffer = buffer
         offset = self.header_len_segment.size
         self.module_idx, tensor_type = self.tensor_info_segment.unpack_from(
@@ -682,6 +694,7 @@ class _TensorHeaderDeserializer:
                 self._zero_hashes(hashes_slice)
 
         if check_crypt_info:
+            crypt_info_start = offset
             crypt_info_slice, offset = self.read_crypt_info_block(
                 buffer, offset
             )
@@ -689,19 +702,27 @@ class _TensorHeaderDeserializer:
                 self.crypt_info = _crypt_info.CryptInfo.unpack_from(
                     crypt_info_slice
                 )
+            if self.file_version < HEADER_HASHES_OMIT_HASH_FIELDS:
+                self._hashable_segments = (
+                    slice(None, crypt_info_start),
+                    slice(offset, None),
+                )
         else:
             self.crypt_info = None
-            self._hashable_segments = (slice(None, None),)
 
         # Finally, get the tensor data length.
         data_length_start = offset = len(buffer) - self.data_length_segment.size
         self.data_length = self.data_length_segment.unpack_from(buffer, offset)[
             0
         ]
-        self._hashable_segments = (
-            slice(None, hash_start),
-            slice(data_length_start, None),
-        )
+        if self.file_version < HEADER_HASHES_OMIT_HASH_FIELDS:
+            if not check_crypt_info:
+                self._hashable_segments = (slice(None, None),)
+        else:
+            self._hashable_segments = (
+                slice(None, hash_start),
+                slice(data_length_start, None),
+            )
 
     def _hashable_segment_views(self):
         for segment_slice in self._hashable_segments:
@@ -1703,6 +1724,7 @@ class TensorDeserializer(
                         raise ValueError("Header offsets overlap or are wrong")
                     self._file.seek(entry.offset)
                     header = _TensorHeaderDeserializer.from_io(
+                        version_number,
                         self._file,
                         zero_hashes=True,
                         check_crypt_info=self._has_crypt_info,
@@ -2899,6 +2921,7 @@ class TensorDeserializer(
 
                 if unsafe_self._headers is None:
                     header = _TensorHeaderDeserializer.from_io(
+                        unsafe_self._file_header.version_number,
                         file_,
                         zero_hashes=True,
                         check_crypt_info=unsafe_self._has_crypt_info,
