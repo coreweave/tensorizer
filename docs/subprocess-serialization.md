@@ -35,7 +35,7 @@ Presuming your tensors are in CUDA memory, there are a couple different options.
 ### Option 1: Communicate the CUDA tensors directly
 CUDA tensors can be "shared" to a subprocess very efficiently since it's only communicating a pointer to device memory.
 
-Basically send the CUDA tensors over a `multiprocessing.Queue` to a subprocess that does the serialization. Ensure that the CUDA tensors remain in device memory until the serialization process finishes.
+Basically send the CUDA tensors over a `multiprocessing.Queue` to a subprocess that does the serialization. Ensure that the CUDA tensors remain **unmodified** in device memory until the serialization process finishes. Note if using encryption, the tensors may be encrypted-in-place so they must also not read again until serialization finishes.
 
 ```python
 import torch
@@ -82,7 +82,7 @@ if __name__ == '__main__':
 Once the tensors are in CPU memory, they no longer need to occupy CUDA memory. But the tensors
 will now need to occupy CPU memory until they are fully serialized.
 
-Do this by calling `model.to('cpu')` immediately after sending to serializer.
+Do this by calling `model.to("cpu")` immediately after sending to serializer.
 
 If you like, you can also use some sort of IPC object to communicate back to the
 host process when the snapshotting has finished so you know when the CUDA memory
@@ -143,11 +143,17 @@ if __name__ == '__main__':
 
 ## If starting from CPU memory
 
-Tensors in CPU memory need to moved to shared memory to be communicated with a subprocess. PyTorch `multiprocessing` will do this transparently, but be aware
-that a memcpy occurs. You'll also need additional "surge" CPU memory during the duration of the copy of each tensor. PyTorch copies tensors serially, so you need additional memory equal to the size of your largest tensor. This is only used during the memcpy itself. The original non-shared memory is immediately freed (unless it is also in use by some other tensor)
+Tensors in CPU memory need to moved to shared memory to be communicated with a subprocess. PyTorch `multiprocessing` will do this automatically, but be aware
+that a memcpy occurs. You'll also need additional "surge" CPU memory during the duration of the copy of each tensor. PyTorch copies tensors serially, so you need additional memory equal to the size of your largest tensor. This is only used during the memcpy itself. The original non-shared memory is immediately freed thereafter (unless it is also in use by some other tensor)
 
 Depending on how you are constructing your CPU tensor, you may be able to preemptively `tensor.share_memory()` ahead of time, thus saving a memcpy when
 passing to the subprocess.
+
+[!WARNING]
+
+The main process should avoid modifying tensors while they are being serialized from shared memory, to avoid corrupting the written file. If serializing *with encryption* from shared memory, tensors should additionally not be read again until serialization has finished, as encryption temporarily modifies tensors in-place.
+
+If concurrent modification or access is necessary, move the tensors out of shared memory and into a copy in the subprocess before serialization. This can be done in the same style shown for snapshotting CUDA tensors in a previous example.
 
 ```python
 import torch

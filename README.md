@@ -555,4 +555,4 @@ python -m unittest discover tests/ --verbose
 
 ## Serialization in a subprocess
 You may want to do Serialization in a separate process so that your main process can continue executing and not get bogged down by GIL contention.
-See [README-subprocess-serialization.md](README-subprocess-serialization.md) for more details.
+See [docs/subprocess-serialization.md](docs/subprocess-serialization.md) for more details.
