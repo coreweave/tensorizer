@@ -35,7 +35,7 @@ Presuming your tensors are in CUDA memory, there are a couple different options.
 ### Option 1: Communicate the CUDA tensors directly
 CUDA tensors can be "shared" to a subprocess very efficiently since it's only communicating a pointer to device memory.
 
-Basically send the CUDA tensors over a `multiprocessing.Queue` to a subprocess that does the serialization. Ensure that the CUDA tensors remain **unmodified** in device memory until the serialization process finishes. Note if using encryption, the tensors may be encrypted-in-place so they must also not read again until serialization finishes.
+Basically send the CUDA tensors over a `multiprocessing.Queue` to a subprocess that does the serialization. Ensure that the CUDA tensors remain **unmodified** in device memory until the serialization process finishes.
 
 ```python
 import torch
