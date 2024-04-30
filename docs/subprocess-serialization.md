@@ -149,11 +149,11 @@ that a memcpy occurs. You'll also need additional "surge" CPU memory during the 
 Depending on how you are constructing your CPU tensor, you may be able to preemptively `tensor.share_memory()` ahead of time, thus saving a memcpy when
 passing to the subprocess.
 
-[!WARNING]
-
-The main process should avoid modifying tensors while they are being serialized from shared memory, to avoid corrupting the written file. If serializing *with encryption* from shared memory, tensors should additionally not be read again until serialization has finished, as encryption temporarily modifies tensors in-place.
-
-If concurrent modification or access is necessary, move the tensors out of shared memory and into a copy in the subprocess before serialization. This can be done in the same style shown for snapshotting CUDA tensors in a previous example.
+> [!WARNING]
+> 
+> The main process should avoid modifying tensors while they are being serialized from shared memory, to avoid corrupting the written file. If serializing *with encryption* from shared memory, tensors should additionally not be read again until serialization has finished, as encryption temporarily modifies tensors in-place.
+> 
+> If concurrent modification or access is necessary, move the tensors out of shared memory and into a copy in the subprocess before serialization. This can be done in the same style shown for snapshotting CUDA tensors in a previous example.
 
 ```python
 import torch
