@@ -82,7 +82,7 @@ if __name__ == '__main__':
 Once the tensors are in CPU memory, they no longer need to occupy CUDA memory. But the tensors
 will now need to occupy CPU memory until they are fully serialized.
 
-Do this by calling `model.to("cpu")` immediately after sending to serializer.
+Do this by calling `model.to("cpu")` immediately after sending to the serializer.
 
 If you like, you can also use some sort of IPC object to communicate back to the
 host process when the snapshotting has finished so you know when the CUDA memory
