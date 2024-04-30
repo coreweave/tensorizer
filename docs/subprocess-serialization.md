@@ -18,7 +18,7 @@ details about using PyTorch across processes
 
 
 ## Warning about fork() and threads
-Be aware that Python `os.fork()` is often not a viable option, as it can be known to cause deadlocks if you have multiple threads. Python 3.12 and above
+Be aware that Python `os.fork()` is often not a viable option, as it can cause deadlocks if you have multiple threads. Python 3.12 and above
 will [issue a deprecation warning](https://github.com/python/cpython/pull/100229) if you attempt this. Some 3rd-party packages that rely on sockets or file descriptors may also not behave correctly when a process unexpectedly forks. 
 
 A subprocess (fork + exec) is generally safer, but you do not inherently get
