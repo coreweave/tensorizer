@@ -900,13 +900,6 @@ def _new_s3_client(
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
 ):
-    if s3_secret_access_key is None:
-        raise TypeError("No secret key provided")
-    if s3_access_key_id is None:
-        raise TypeError("No access key provided")
-    if s3_endpoint is None:
-        raise TypeError("No S3 endpoint provided")
-
     config_args = dict(user_agent=_BOTO_USER_AGENT)
     auth_args = {}
 
@@ -925,9 +918,12 @@ def _new_s3_client(
 
     config = boto3.session.Config(**config_args)
 
+    if s3_endpoint:
+        s3_endpoint = _ensure_https_endpoint(s3_endpoint)
+
     return boto3.session.Session.client(
         boto3.session.Session(),
-        endpoint_url=_ensure_https_endpoint(s3_endpoint),
+        endpoint_url=s3_endpoint,
         service_name="s3",
         config=config,
         **auth_args,
@@ -1059,10 +1055,15 @@ def _infer_credentials(
     s3_access_key_id: Optional[str],
     s3_secret_access_key: Optional[str],
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
-) -> _ParsedCredentials:
+) -> _ParsedCredentials | None:
     """
     Fill in a potentially incomplete S3 credential pair
     by parsing the s3cmd config file if necessary.
+
+    If no credentials are provided and the s3cmd config file is not
+    present or can't be parsed, assume we're using the IAM short-term
+    credentials.
+
     An empty string ("") is considered a specified credential,
     while None is an unspecified credential.
     Use "" for public buckets.
@@ -1080,7 +1081,9 @@ def _infer_credentials(
 
     Returns:
         A `_ParsedCredentials` object with both the
-        `s3_access_key` and `s3_secret_key` fields guaranteed to not be None.
+        `s3_access_key` and `s3_secret_key` guaranteed not to
+        be None. Otherwise, returns None and the caller should
+        assume that short-term IAM credentials are being used.
 
     Raises:
         ValueError: If the credential pair is incomplete and the
@@ -1112,12 +1115,10 @@ def _infer_credentials(
             " and the fallback .s3cfg file could not be parsed."
         ) from parse_error
 
+    # no credentials provided and no default config file found
+    # assume we're using short-term IAM credentials
     if parsed.config_file is None:
-        raise ValueError(
-            "Attempted to access an S3 bucket,"
-            " but credentials were not provided,"
-            " and no default .s3cfg file could be found."
-        )
+        return None
 
     # Don't override a specified credential
     if s3_access_key_id is None:
@@ -1352,12 +1353,13 @@ def open_stream(
             s3 = _infer_credentials(
                 s3_access_key_id, s3_secret_access_key, s3_config_path
             )
-            s3_access_key_id = s3.s3_access_key
-            s3_secret_access_key = s3.s3_secret_key
+            if s3:
+                s3_access_key_id = s3.s3_access_key
+                s3_secret_access_key = s3.s3_secret_key
 
-            # Not required to have been found,
-            # and doesn't overwrite an explicitly specified endpoint.
-            s3_endpoint = s3_endpoint or s3.s3_endpoint
+                # Not required to have been found,
+                # and doesn't overwrite an explicitly specified endpoint.
+                s3_endpoint = s3_endpoint or s3.s3_endpoint
         except (ValueError, FileNotFoundError) as e:
             # Uploads always require credentials here, but downloads may not
             if is_s3_upload:
@@ -1380,11 +1382,16 @@ def open_stream(
                 s3_access_key_id = s3_access_key_id or ""
                 s3_secret_access_key = s3_access_key_id or ""
 
-        # Regardless of whether the config needed to be parsed,
-        # the endpoint gets a default value based on the operation.
+        # if the output from _infer_credentials is not None, we should set the
+        # endpoint to the default endpoint if it is not set
+        # If the output from _infer_credentials is None, it means
+        # that the short-term IAM credentials from the metadata service
+        # should be used implicitly by boto3.
 
         if is_s3_upload:
-            s3_endpoint = s3_endpoint or default_s3_write_endpoint
+            if s3:
+                # assumes we aren't using S3 if s3 is None and s3_endpoint is None
+                s3_endpoint = s3_endpoint or default_s3_write_endpoint
 
             # delete must be False or the file will be deleted by the OS
             # as soon as it closes, before it can be uploaded on platforms
@@ -1437,7 +1444,9 @@ def open_stream(
 
             return temp_file
         else:
-            s3_endpoint = s3_endpoint or default_s3_read_endpoint
+            if s3:
+                # assumes we aren't using S3 if s3 is None and s3_endpoint is None
+                s3_endpoint = s3_endpoint or default_s3_read_endpoint
             curl_stream_file = s3_download(
                 path_uri,
                 s3_access_key_id,
