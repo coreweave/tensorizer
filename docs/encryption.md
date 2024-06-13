@@ -1,10 +1,11 @@
-# Tensor Encryption
-
+---
+title: Tensor Encryption
+---
 `tensorizer` supports fast tensor weight encryption and decryption during
 serialization and deserialization, respectively.
 
 > [!NOTE]
-> 
+>
 > To use `tensorizer` encryption, a recent version of `libsodium` must be
 > installed. Install `libsodium` with `apt-get install libsodium23`
 > on Ubuntu or Debian, or follow
@@ -37,18 +38,18 @@ security beyond that is beyond the scope of `tensorizer`'s encryption as
 currently available.
 
 > [!WARNING]
-> 
+>
 > This does not include encryption for anything except for tensor weights.
 > Metadata such as a tensor's name, dtype, shape, size, and non-keyed hashes
 > are neither encrypted nor authenticated.
 
 > [!WARNING]
-> 
+>
 > This level of encryption does not provide message authentication for metadata
 > and does not protect against reordering or truncation of chunks.
 
 > [!NOTE]
-> 
+>
 > Unencrypted/unauthenticated tensor data is rejected during deserialization
 > if decryption is requested, and vice versa.
 
@@ -128,7 +129,7 @@ with open("tensor.key", "wb") as key_file:
 # Load the randomly-generated key from where it was saved
 with open("tensor.key", "rb") as key_file:
     key: bytes = key_file.read()
- 
+
 decryption_params = DecryptionParams.from_key(key)
 
 deserializer = TensorDeserializer("model.tensors", encryption=decryption_params)

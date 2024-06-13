@@ -84,6 +84,7 @@ logger = setup_logger()
 def set_logger_verbosity(verbosity: int = 2):
     """
     Configure the verbosity of the global logger.
+
     Args:
         verbosity: Verbosity level. Clamped to [0, 3].
     """
@@ -113,6 +114,7 @@ def assert_module_equal(
 ) -> None:
     """
     Check that the state dicts of two modules are equal.
+
     Args:
         before: The original module to compare against.
         after: The secondary module to compare.
