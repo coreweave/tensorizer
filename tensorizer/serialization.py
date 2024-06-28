@@ -3832,6 +3832,9 @@ class TensorSerializer:
             # They are often chained from one step of the process to the next
             self.tensor_data_task: Optional[_Future] = None
 
+            # only used for tracking decryption during error handling
+            self.decrypt_task: Optional[_Future] = None
+
         @property
         def tensor_memoryview(self) -> memoryview:
             if not self.tensor.is_contiguous():
@@ -3912,6 +3915,18 @@ class TensorSerializer:
             self._synchronize_pools()
             self._sync_prologue_state()
         except Exception as e:
+            # Ensure that encrypted data gets decrypted
+            if self._encrypted:
+                self._maybe_decrypt_data(write_specs)
+            for w in write_specs:
+                if w.decrypt_task is None:
+                    continue
+                try:
+                    w.decrypt_task.result()
+                except Exception as e2:
+                    logger.error(f"Error during decryption task: {e2}")
+
+            # Now cancel everything else
             for j in self._jobs:
                 j.cancel()
             if cuda_executor is not None:
@@ -4624,11 +4639,12 @@ class TensorSerializer:
                     ) from (original_exc if original_exc is not None else e)
 
         for w in write_specs:
-            if not w.user_owns_tensor_data:
+            if not w.user_owns_tensor_data or w.decrypt_task is not None:
                 continue
             w.tensor_data_task = self._decryption_pool.submit(
                 decrypt, w, w.tensor_data_task
             )
+            w.decrypt_task = w.tensor_data_task
             self._jobs.append(w.tensor_data_task)
 
 

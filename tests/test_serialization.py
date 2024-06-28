@@ -266,6 +266,14 @@ def temporary_file(*args, **kwargs):
         os.unlink(f.name)
 
 
+class MockException(Exception):
+    pass
+
+
+def raise_mock_exception(*args, **kwargs):
+    raise MockException("Mocked exception")
+
+
 class TestSerialization(unittest.TestCase):
     def test_serialization(self):
         for device, method in itertools.product(
@@ -1113,6 +1121,37 @@ class TestEncryption(unittest.TestCase):
                 self._test_first_key_negative(deserialized)
                 del deserialized
             gc.collect()
+
+    def _test_exception_decrypts(self):
+        # ensure that model data is properly decrypted even in the event of an exception
+        encryption = EncryptionParams.random()
+        model = AutoModelForCausalLM.from_pretrained(model_name).to("cpu")
+
+        model_clone = model.state_dict()
+        for k in model_clone:
+            model_clone[k] = model_clone[k].detach().clone()
+
+        with tempfile.NamedTemporaryFile("wb+") as out_file:
+            try:
+                serializer = TensorSerializer(out_file, encryption=encryption)
+                serializer.write_module(model)
+                serializer.close()
+            except MockException as e:
+                # verify tensors are decrypted
+                for k in model_clone:
+                    self.assertTrue(
+                        torch.equal(model.state_dict()[k], model_clone[k])
+                    )
+            else:
+                raise RuntimeError("Expected exception did not occur")
+
+    @patch.object(TensorSerializer, "_do_commit_headers", raise_mock_exception)
+    def test_exception_decrypts_in_main_write(self):
+        self._test_exception_decrypts()
+
+    @patch.object(TensorSerializer, "_pwrite_syscall", raise_mock_exception)
+    def test_exception_decrypts_in_pwrite(self):
+        self._test_exception_decrypts()
 
 
 class TestDeserialization(unittest.TestCase):
