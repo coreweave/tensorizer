@@ -3918,21 +3918,34 @@ class TensorSerializer:
         except Exception as e:
             # Ensure that encrypted data gets decrypted
             if self._encrypted:
-                self._maybe_decrypt_data(write_specs)
+                # This will probably get an exception from its dependency,
+                # since something already failed, so don't repeat it
+                self._maybe_decrypt_data(
+                    write_specs, pass_through_dependency_exceptions=False
+                )
+            decrypt_exception = None
+            # Errors during decryption are very important, so save those
+            # and make those the primary exception if they arise
             for w in write_specs:
                 if w.decrypt_task is None:
                     continue
-                try:
-                    w.decrypt_task.result()
-                except Exception as e2:
-                    logger.error(f"Error during decryption task: {e2}")
+                exc = w.decrypt_task.exception(_TIMEOUT)
+                if isinstance(
+                    decrypt_exception,
+                    (CryptographyError, _crypt.CryptographyError),
+                ):
+                    decrypt_exception = decrypt_exception or exc
+                del exc
 
             # Now cancel everything else
             for j in self._jobs:
                 j.cancel()
             if cuda_executor is not None:
                 cuda_executor.shutdown(wait=False)
-            raise e
+            if decrypt_exception is not None:
+                raise decrypt_exception from e
+            else:
+                raise
 
         if cuda_executor is not None:
             cuda_executor.shutdown(wait=True)
