@@ -1150,7 +1150,26 @@ class TestEncryption(unittest.TestCase):
         self._test_exception_decrypts()
 
     @patch.object(TensorSerializer, "_pwrite_syscall", raise_mock_exception)
+    @patch.object(TensorSerializer, "_pwrite_fallback", raise_mock_exception)
     def test_exception_decrypts_in_pwrite(self):
+        self._test_exception_decrypts()
+
+    @patch.object(TensorSerializer, "_do_encryption", raise_mock_exception)
+    def test_exception_decrypts_before_encryption(self):
+        self._test_exception_decrypts()
+
+    @patch.object(
+        TensorSerializer, "_prepare_for_write_encryption", raise_mock_exception
+    )
+    def test_exception_decrypts_way_before_encryption(self):
+        self._test_exception_decrypts()
+
+    @patch.object(
+        serialization._TensorHeaderSerializer,
+        "update_crypt_info",
+        raise_mock_exception,
+    )
+    def test_exception_decrypts_during_encryption(self):
         self._test_exception_decrypts()
 
 
