@@ -1127,9 +1127,8 @@ class TestEncryption(unittest.TestCase):
         # even in the event of an exception
         encryption = EncryptionParams.random()
         with torch.device("cpu"):
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name, device_map="cpu"
-            )
+            model = AutoModelForCausalLM.from_pretrained(model_name)
+        self.assertEqual(model.device.type, "cpu")
 
         model_sd = model.state_dict()
         model_clone = {k: v.detach().clone() for k, v in model_sd.items()}
