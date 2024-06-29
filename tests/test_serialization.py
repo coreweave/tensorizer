@@ -1123,27 +1123,26 @@ class TestEncryption(unittest.TestCase):
             gc.collect()
 
     def _test_exception_decrypts(self):
-        # ensure that model data is properly decrypted even in the event of an exception
+        # Ensure that model data is properly decrypted
+        # even in the event of an exception
         encryption = EncryptionParams.random()
-        model = AutoModelForCausalLM.from_pretrained(model_name).to("cpu")
+        with torch.device("cpu"):
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, device_map="cpu"
+            )
 
-        model_clone = model.state_dict()
-        for k in model_clone:
-            model_clone[k] = model_clone[k].detach().clone()
+        model_sd = model.state_dict()
+        model_clone = {k: v.detach().clone() for k, v in model_sd.items()}
 
-        with tempfile.NamedTemporaryFile("wb+") as out_file:
-            try:
+        with temporary_file("wb+") as out_file:
+            with self.assertRaises(MockException):
                 serializer = TensorSerializer(out_file, encryption=encryption)
-                serializer.write_module(model)
+                serializer.write_state_dict(model_sd)
                 serializer.close()
-            except MockException as e:
-                # verify tensors are decrypted
-                for k in model_clone:
-                    self.assertTrue(
-                        torch.equal(model.state_dict()[k], model_clone[k])
-                    )
-            else:
-                raise RuntimeError("Expected exception did not occur")
+            # Verify tensors are decrypted
+            self.assertSetEqual(set(model_sd), set(model_clone))
+            for k in model_clone:
+                self.assertTrue(torch.equal(model_sd[k], model_clone[k]))
 
     @patch.object(TensorSerializer, "_do_commit_headers", raise_mock_exception)
     def test_exception_decrypts_in_main_write(self):
