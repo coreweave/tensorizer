@@ -3832,6 +3832,10 @@ class TensorSerializer:
             # They are often chained from one step of the process to the next
             self.tensor_data_task: Optional[_Future] = None
 
+            # only used for tracking decryption during error handling
+            self.decrypt_task: Optional[_Future] = None
+            self.is_currently_encrypted: bool = False
+
         @property
         def tensor_memoryview(self) -> memoryview:
             if not self.tensor.is_contiguous():
@@ -3912,11 +3916,36 @@ class TensorSerializer:
             self._synchronize_pools()
             self._sync_prologue_state()
         except Exception as e:
+            # Ensure that encrypted data gets decrypted
+            if self._encrypted:
+                # This will probably get an exception from its dependency,
+                # since something already failed, so don't repeat it
+                self._maybe_decrypt_data(
+                    write_specs, pass_through_dependency_exceptions=False
+                )
+            decrypt_exception = None
+            # Errors during decryption are very important, so save those
+            # and make those the primary exception if they arise
+            for w in write_specs:
+                if w.decrypt_task is None:
+                    continue
+                exc = w.decrypt_task.exception(_TIMEOUT)
+                if isinstance(
+                    decrypt_exception,
+                    (CryptographyError, _crypt.CryptographyError),
+                ):
+                    decrypt_exception = decrypt_exception or exc
+                del exc
+
+            # Now cancel everything else
             for j in self._jobs:
                 j.cancel()
             if cuda_executor is not None:
                 cuda_executor.shutdown(wait=False)
-            raise e
+            if decrypt_exception is not None:
+                raise decrypt_exception from e
+            else:
+                raise
 
         if cuda_executor is not None:
             cuda_executor.shutdown(wait=True)
@@ -4467,12 +4496,32 @@ class TensorSerializer:
                 self._jobs.extend(hash_tasks)
 
     def _do_encryption(self, write_specs: Sequence[_WriteSpec]) -> None:
-        def encrypt(write_spec, dependency: Optional[_Future]):
+        def encrypt(
+            write_spec: TensorSerializer._WriteSpec,
+            dependency: Optional[_Future],
+        ):
             if dependency is not None:
                 dependency.result(_TIMEOUT)
+            if write_spec.is_currently_encrypted:
+                raise CryptographyError("Tried to encrypt a tensor twice")
             try:
+                write_spec.is_currently_encrypted = True
                 write_spec.encryptor.encrypt_all(wait=True, timeout=_TIMEOUT)
             except _crypt.CryptographyError as e:
+                if write_spec.encryptor.num_chunks <= 1:
+                    write_spec.is_currently_encrypted = False
+                # If there were multiple chunks, the tensor is in an unclear
+                # state, since some chunks could have been encrypted while
+                # others failed.
+                # Encryption shouldn't normally be able to throw an error
+                # unless something is extremely wrong, which would presumably
+                # apply to more than just one chunk of data, so we could
+                # assume that it did not succeed for any chunks,
+                # but attempting to decrypt it anyway will skip decrypting any
+                # unencrypted chunks due to their MACs not being correct,
+                # so that is the safest option.
+                # In the future, it would be good to update `_crypt` to make
+                # `encrypt_all` report partial successes in its exception info.
                 raise CryptographyError("Tensor encryption failed") from e
             write_spec.header.update_crypt_info()
 
@@ -4589,7 +4638,11 @@ class TensorSerializer:
             )
             self._jobs.append(w.tensor_data_task)
 
-    def _maybe_decrypt_data(self, write_specs: Sequence[_WriteSpec]):
+    def _maybe_decrypt_data(
+        self,
+        write_specs: Sequence[_WriteSpec],
+        pass_through_dependency_exceptions: bool = True,
+    ):
         def decrypt(
             write_spec: TensorSerializer._WriteSpec,
             dependency: Optional[_Future],
@@ -4597,38 +4650,49 @@ class TensorSerializer:
             try:
                 if dependency is not None:
                     dependency.result(_TIMEOUT)
+            except Exception:
+                if pass_through_dependency_exceptions:
+                    raise
             finally:
-                # Try to decrypt again even if writing to disk failed
-                # to avoid exiting with the tensor memory in a modified state
-                fs = write_spec.encryptor.decrypt_all(wait=False)  # type: ignore
-                try:
-                    _crypt.ChunkedEncryption.wait_or_raise(
-                        fs,
-                        timeout=_TIMEOUT,
-                        return_when=concurrent.futures.ALL_COMPLETED,
-                    )
-                except _crypt.CryptographyError as e:
+                if write_spec.is_currently_encrypted:
+                    # Try to decrypt again even if writing to disk failed
+                    # to avoid exiting with the tensor memory still in a
+                    # modified state
+                    fs = write_spec.encryptor.decrypt_all(wait=False)
                     try:
-                        original_exc = (
-                            dependency.exception(timeout=0)
-                            if dependency is not None
-                            else None
+                        _crypt.ChunkedEncryption.wait_or_raise(
+                            fs,
+                            timeout=_TIMEOUT,
+                            return_when=concurrent.futures.ALL_COMPLETED,
                         )
-                    except (
-                        concurrent.futures.TimeoutError,
-                        concurrent.futures.CancelledError,
-                    ):
-                        original_exc = None
-                    raise CryptographyError(
-                        "Restoring encrypted tensor data in memory failed"
-                    ) from (original_exc if original_exc is not None else e)
+                        write_spec.is_currently_encrypted = False
+                    except _crypt.CryptographyError as e:
+                        try:
+                            original_exc = (
+                                dependency.exception(timeout=0)
+                                if dependency is not None
+                                else None
+                            )
+                        except (
+                            concurrent.futures.TimeoutError,
+                            concurrent.futures.CancelledError,
+                        ):
+                            original_exc = None
+                        raise CryptographyError(
+                            "Restoring encrypted tensor data in memory failed"
+                        ) from (original_exc if original_exc is not None else e)
 
         for w in write_specs:
-            if not w.user_owns_tensor_data:
+            if (
+                not w.user_owns_tensor_data
+                or w.decrypt_task is not None
+                and not w.decrypt_task.cancelled()
+            ):
                 continue
             w.tensor_data_task = self._decryption_pool.submit(
                 decrypt, w, w.tensor_data_task
             )
+            w.decrypt_task = w.tensor_data_task
             self._jobs.append(w.tensor_data_task)
 
 
