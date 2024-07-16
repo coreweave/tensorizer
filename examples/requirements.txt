@@ -3,5 +3,5 @@ diffusers==0.14.0
 scipy~=1.10.0
 accelerate==0.20.3 # Needed to serialize Mistral-7B
 pillow>=10.2.0 # not directly required, pinned to avoid a vulnerability
-setuptools>=65.5.1 # not directly required, pinned by Snyk to avoid a vulnerability
+setuptools>=70.0.0 # not directly required, pinned by Snyk to avoid a vulnerability
 wheel>=0.38.0 # not directly required, pinned by Snyk to avoid a vulnerability
