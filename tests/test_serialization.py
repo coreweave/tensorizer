@@ -823,24 +823,31 @@ class TestIncrementalSerialization(unittest.TestCase):
     # Tests that involve multiple calls to write_tensor()
 
     def test_too_many_no_max_tensors(self):
-        # Any attempt to call write_tensor() more than once will fail if you haven't specified max_tensors
+        # Not specifying `max_tensors` allows metadata of any size for the
+        # first write, but with minimal space left after it (< 4096 bytes).
+        # Thus, calling `write_tensor()` too many times without specifying
+        # `max_tensors` is an error.
         with NamedTemporaryFileCloseNoDelete(
             "wb+", delete=True
         ) as temporary_file:
             serializer = TensorSerializer(temporary_file)
             serializer.write_tensor(
                 0,
-                "a",
+                "good",
                 TensorType.PARAM,
                 torch.zeros((64, 64), dtype=torch.uint8),
             )
+            long_name_stem = "bad" * 80  # At least 250 bytes per header
             with self.assertRaises(RuntimeError):
-                serializer.write_tensor(
-                    1,
-                    "b",
-                    TensorType.PARAM,
-                    torch.zeros((64, 64), dtype=torch.uint8),
-                )
+                for i in range(25):
+                    # > 4096 bytes total from repeating it 25 times
+                    serializer.write_tensor(
+                        i,
+                        f"{long_name_stem}_{i:02d}",
+                        TensorType.PARAM,
+                        torch.zeros((4, 4), dtype=torch.uint8),
+                    )
+            serializer.close()
 
     def test_too_many(self):
         # If you set max_tensors too low you'll eventually run out of header space
