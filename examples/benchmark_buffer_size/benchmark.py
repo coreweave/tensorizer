@@ -135,7 +135,7 @@ args = parser.parse_args()
 
 model_name: str = args.model
 
-http_uri = f"http://{args.bucket}.{args.s3_endpoint}/{model_name}/model.tensors"
+http_uri = f"http://{args.s3_endpoint}/{args.bucket}/{model_name}/model.tensors"
 
 https_uri = http_uri.replace("http://", "https://")
 s3_uri = f"s3://{args.bucket}/{model_name}/model.tensors"
@@ -453,6 +453,7 @@ def test_read_performance():
 
 
 def prep_local():
+    logging.info(f"{http_uri} http uri")
     # Store on Redis
     start = time.monotonic()
     test_dict = TensorDeserializer(http_uri)
