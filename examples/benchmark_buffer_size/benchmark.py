@@ -29,6 +29,9 @@ kibibyte = 1 << 10
 mebibyte = 1 << 20
 gibibyte = 1 << 30
 
+access_key = os.getenv("S3_ACCESS_KEY")
+secret_key = os.getenv("S3_SECRET_KEY")
+
 # Read in model name from command line, or env var, or default to gpt-neo-2.7B
 model_name_default = os.getenv("MODEL_NAME") or "EleutherAI/pythia-12b/fp16"
 parser = argparse.ArgumentParser(
@@ -381,6 +384,8 @@ def io_test(
 def deserialize_test(
     source=http_uri,
     s3_endpoint=s3_endpoint,
+    access_key=access_key,
+    secret_key=secret_key,
     plaid_mode=False,
     verify_hash=False,
     lazy_load=False,
@@ -393,6 +398,8 @@ def deserialize_test(
     stream = open_stream(
         source,
         s3_endpoint=s3_endpoint,
+        s3_access_key_id=access_key,
+        s3_secret_access_key=secret_key,
         buffer_size=buffer_size,
         force_http=force_http,
     )
