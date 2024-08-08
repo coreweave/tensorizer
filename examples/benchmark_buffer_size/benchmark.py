@@ -135,7 +135,7 @@ args = parser.parse_args()
 
 model_name: str = args.model
 
-http_uri = f"http://{args.bucket}.{args.s3_url}/{model_name}/model.tensors"
+http_uri = f"http://{args.bucket}.{args.s3_endpoint}/{model_name}/model.tensors"
 
 https_uri = http_uri.replace("http://", "https://")
 s3_uri = f"s3://{args.bucket}/{model_name}/model.tensors"
@@ -143,8 +143,8 @@ sanitized_model_file = model_name.replace("/", "_")
 file_uri = f"{args.file_prefix}{sanitized_model_file}.tensors"
 local_uri = f"http://localhost:3000/{sanitized_model_file}.tensors"
 
-s3_endpoint = f"http://{args.s3_url}"
-if args.test_http:
+s3_endpoint = f"http://{args.s3_endpoint}"
+if args.test_https:
     s3_endpoint = s3_endpoint.replace("http://", "https://")
 
 # Get nodename from environment, or default to os.uname().nodename
