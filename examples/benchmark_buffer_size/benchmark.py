@@ -128,11 +128,20 @@ parser.add_argument(
     help="The bucket where the models are located (default: tensorized)",
     default="tensorized"
 )
+parser.add_argument(
+    "--path-based",
+    action="store_true",
+    default=False,
+    help="Use path based buckets"
+)
 args = parser.parse_args()
 
 model_name: str = args.model
 
-http_uri = f"http://{args.bucket}.{args.s3_endpoint}/{model_name}/model.tensors"
+if args.path_based:
+    http_uri = f"http://{args.s3_endpoint}/{args.bucket}/{model_name}/model.tensors"
+else:
+    http_uri = f"http://{args.bucket}.{args.s3_endpoint}/{model_name}/model.tensors"
 
 https_uri = http_uri.replace("http://", "https://")
 s3_uri = f"s3://{args.bucket}/{model_name}/model.tensors"
