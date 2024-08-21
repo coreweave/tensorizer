@@ -141,7 +141,7 @@ file_uri = f"{args.file_prefix}{sanitized_model_file}.tensors"
 local_uri = f"http://localhost:3000/{sanitized_model_file}.tensors"
 
 s3_endpoint = f"http://{args.s3_endpoint}"
-if args.test_http:
+if args.test_https:
     s3_endpoint = s3_endpoint.replace("http://", "https://")
 
 # Get nodename from environment, or default to os.uname().nodename
