@@ -843,12 +843,16 @@ class RedisStreamFile(io.BufferedIOBase):
         goal_position = self._curr + size
         return self._read_until(goal_position)
 
-    @staticmethod
-    def writable() -> bool:
+    def writable(self) -> bool:
         return False
 
-    @staticmethod
-    def fileno() -> int:
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
         return -1
 
     def __enter__(self):
@@ -878,7 +882,7 @@ class RedisStreamFile(io.BufferedIOBase):
             self._redis_tcp = None
         super(RedisStreamFile, self).close()  # will set self.closed to True
 
-    def readline(self):
+    def readline(self, size=-1, /):
         raise io.UnsupportedOperation("readline")
 
 
