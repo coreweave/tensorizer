@@ -1,3 +1,4 @@
 grpcio==1.48.1
 grpcio-tools==1.48.1
 protobuf==3.19.5
+setuptools>=70.0.0 # not directly required, pinned by Snyk to avoid a vulnerability
