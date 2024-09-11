@@ -11,7 +11,7 @@ import typing
 import unittest
 from subprocess import Popen
 from typing import List
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import boto3
 import moto
@@ -352,20 +352,43 @@ class TestS3(unittest.TestCase):
         obj = s3.Object(self.BUCKET_NAME, key)
         obj.put(Body=content)
 
-    @patch.object(stream_io, "_s3_default_config_paths", ())
-    def test_upload(self):
+
+    def _test_upload(self, credentials_kwargs):
         key = "model.tensors"
         s = stream_io.open_stream(
             f"s3://{self.BUCKET_NAME}/{key}",
             mode="wb",
-            s3_access_key_id=self.ACCESS_KEY,
-            s3_secret_access_key=self.SECRET_KEY,
+            **credentials_kwargs,
             s3_endpoint=self.endpoint,
         )
         long_string = b"Hello" * 1024
         s.write(long_string)
         s.close()
         self.assert_bucket_contents(key, long_string)
+
+
+    @patch.object(stream_io, "_s3_default_config_paths", ())
+    def test_upload(self):
+        credentials_kwargs = {
+            "s3_access_key_id": self.ACCESS_KEY,
+            "s3_secret_access_key": self.SECRET_KEY,
+        }
+        self._test_upload(credentials_kwargs)
+
+
+    @patch.object(stream_io, "_s3_default_config_paths", ())
+    def test_upload_with_s3_session(self):
+        s3_session = Mock()
+        client = stream_io._new_s3_client(s3_access_key_id=self.ACCESS_KEY,
+                                          s3_secret_access_key=self.SECRET_KEY,
+                                          s3_endpoint=self.endpoint,
+                                        )
+        s3_session.client.return_value = client
+        credentials_kwargs = {
+            "s3_session": s3_session,
+        }
+        self._test_upload(credentials_kwargs)
+
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_download_url(self):
@@ -409,8 +432,8 @@ class TestS3(unittest.TestCase):
             for r in regex_absent:
                 self.assertNotRegex(url, r)
 
-    @patch.object(stream_io, "_s3_default_config_paths", ())
-    def test_download(self):
+
+    def _test_download(self, credentials_kwargs):
         # CURLStreamFiles ignore moto's normal mocks, since moto still
         # generates a real URL when a real endpoint is used, so instead
         # we create an entire mock S3 server.
@@ -422,11 +445,35 @@ class TestS3(unittest.TestCase):
             with stream_io.open_stream(
                 f"s3://{self.BUCKET_NAME}/{key}",
                 mode="rb",
-                s3_access_key_id="X",
-                s3_secret_access_key="X",
+                **credentials_kwargs,
                 s3_endpoint=endpoint,
             ) as s:
                 self.assertEqual(s.read(), long_string)
+
+
+    @patch.object(stream_io, "_s3_default_config_paths", ())
+    def test_download(self):
+        credentials_kwargs = {
+            "s3_access_key_id": "X",
+            "s3_secret_access_key": "X",
+        }
+        self._test_download(credentials_kwargs)
+
+    @patch.object(stream_io, "_s3_default_config_paths", ())
+    def test_download_with_s3_session(self):
+        s3_session = Mock()
+        old_ensure_https_endpoint = stream_io._ensure_https_endpoint
+        stream_io._ensure_https_endpoint = lambda x: x
+        client = stream_io._new_s3_client(s3_access_key_id="X",
+                                        s3_secret_access_key="X",
+                                        s3_endpoint="http://127.0.0.1:5000",
+                                        )
+        stream_io._ensure_https_endpoint = old_ensure_https_endpoint
+        s3_session.client.return_value = client
+        credentials_kwargs = {
+            "s3_session": s3_session,
+        }
+        self._test_download(credentials_kwargs)
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
     def test_download_certificate_handling(self):

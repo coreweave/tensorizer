@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 import boto3
 import botocore
 import redis
+import boto3.session
 
 import tensorizer._version as _version
 import tensorizer._wide_pipes as _wide_pipes
@@ -957,15 +958,19 @@ def s3_upload(
     s3_endpoint: str = default_s3_write_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
+    s3_session: Optional[boto3.session.Session] = None,
 ):
     bucket, key = _parse_s3_uri(target_uri)
-    client = _new_s3_client(
-        s3_access_key_id,
-        s3_secret_access_key,
-        s3_endpoint,
-        s3_region_name=s3_region_name,
-        s3_signature_version=s3_signature_version,
-    )
+    if s3_session is None:
+        client = _new_s3_client(
+            s3_access_key_id,
+            s3_secret_access_key,
+            s3_endpoint,
+            s3_region_name=s3_region_name,
+            s3_signature_version=s3_signature_version,
+        )
+    else:
+        client = s3_session.client("s3")
     client.upload_file(path, bucket, key)
 
 
@@ -976,6 +981,7 @@ def _s3_download_url(
     s3_endpoint: str = default_s3_read_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
+    s3_session: Optional[boto3.session.Session] = None,
 ) -> str:
     bucket, key = _parse_s3_uri(path_uri)
     # v2 signature is important to easily align the presigned URL expiry
@@ -990,13 +996,16 @@ def _s3_download_url(
     #
     if not s3_signature_version:
         s3_signature_version = "s3"
-    client = _new_s3_client(
-        s3_access_key_id,
-        s3_secret_access_key,
-        s3_endpoint,
-        s3_region_name=s3_region_name,
-        s3_signature_version=s3_signature_version,
-    )
+    if s3_session is None:
+        client = _new_s3_client(
+            s3_access_key_id,
+            s3_secret_access_key,
+            s3_endpoint,
+            s3_region_name=s3_region_name,
+            s3_signature_version=s3_signature_version,
+        )
+    else:
+        client = s3_session.client("s3")
 
     # Explanation with SIG_GRANULARITY=1h
     # compute an expiry that is aligned to the hour, at least 1 hour
@@ -1039,6 +1048,7 @@ def s3_download(
     begin: Optional[int] = None,
     end: Optional[int] = None,
     certificate_handling: Optional[CAInfo] = None,
+    s3_session: Optional[boto3.session.Session] = None,
 ) -> CURLStreamFile:
     url = _s3_download_url(
         path_uri=path_uri,
@@ -1047,6 +1057,7 @@ def s3_download(
         s3_endpoint=s3_endpoint,
         s3_region_name=s3_region_name,
         s3_signature_version=s3_signature_version,
+        s3_session=s3_session,
     )
     if force_http and url.lower().startswith("https://"):
         url = "http://" + url[8:]
@@ -1202,6 +1213,7 @@ def open_stream(
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
     certificate_handling: Optional[CAInfo] = None,
+    s3_session: Optional[boto3.session.Session] = None,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
     Open a file path, http(s):// URL, or s3:// URI.
@@ -1262,7 +1274,10 @@ def open_stream(
             `tensorizer.stream_io.CAInfo` to use a different CA bundle
             or to disable certificate verification entirely.
             This option is useful when working with self-signed certificates.
-
+        s3_session: AWS boto3 Session object used to instantiate a
+            s3 client handling the authentication with s3. When passing a session
+            object it has priority over the `~/.s3cfg` config file credentials or
+            `s3_access_key_id`  and `s3_secret_access_key` arguments.
     Returns:
         An opened file-like object representing the target resource.
 
@@ -1353,11 +1368,12 @@ def open_stream(
         is_s3_upload = "w" in mode or "a" in mode
         error_context = None
         try:
-            s3 = _infer_credentials(
-                s3_access_key_id, s3_secret_access_key, s3_config_path
-            )
-            s3_access_key_id = s3.s3_access_key
-            s3_secret_access_key = s3.s3_secret_key
+            if s3_session is None:
+                s3 = _infer_credentials(
+                    s3_access_key_id, s3_secret_access_key, s3_config_path
+                )
+                s3_access_key_id = s3.s3_access_key
+                s3_secret_access_key = s3.s3_secret_key
 
             # Not required to have been found,
             # and doesn't overwrite an explicitly specified endpoint.
@@ -1409,6 +1425,7 @@ def open_stream(
                 s3_endpoint,
                 s3_region_name,
                 s3_signature_version,
+                s3_session,
             )
 
             # Always run the close + upload procedure
@@ -1454,6 +1471,7 @@ def open_stream(
                 begin=begin,
                 end=end,
                 certificate_handling=certificate_handling,
+                s3_session=s3_session,
             )
             if error_context:
                 curl_stream_file.register_error_context(error_context)
