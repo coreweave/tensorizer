@@ -377,15 +377,13 @@ class TestS3(unittest.TestCase):
 
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
-    def test_upload_with_s3_session(self):
-        s3_session = Mock()
+    def test_upload_with_s3_client(self):
         client = stream_io._new_s3_client(s3_access_key_id=self.ACCESS_KEY,
                                           s3_secret_access_key=self.SECRET_KEY,
                                           s3_endpoint=self.endpoint,
                                         )
-        s3_session.client.return_value = client
         credentials_kwargs = {
-            "s3_session": s3_session,
+            "s3_client": client,
         }
         self._test_upload(credentials_kwargs)
 
@@ -460,8 +458,7 @@ class TestS3(unittest.TestCase):
         self._test_download(credentials_kwargs)
 
     @patch.object(stream_io, "_s3_default_config_paths", ())
-    def test_download_with_s3_session(self):
-        s3_session = Mock()
+    def test_download_with_s3_client(self):
         old_ensure_https_endpoint = stream_io._ensure_https_endpoint
         stream_io._ensure_https_endpoint = lambda x: x
         client = stream_io._new_s3_client(s3_access_key_id="X",
@@ -469,9 +466,8 @@ class TestS3(unittest.TestCase):
                                         s3_endpoint="http://127.0.0.1:5000",
                                         )
         stream_io._ensure_https_endpoint = old_ensure_https_endpoint
-        s3_session.client.return_value = client
         credentials_kwargs = {
-            "s3_session": s3_session,
+            "s3_client": client,
         }
         self._test_download(credentials_kwargs)
 

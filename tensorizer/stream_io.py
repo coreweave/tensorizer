@@ -958,10 +958,10 @@ def s3_upload(
     s3_endpoint: str = default_s3_write_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
-    s3_session: Optional[boto3.session.Session] = None,
+    s3_client: Any = None,
 ):
     bucket, key = _parse_s3_uri(target_uri)
-    if s3_session is None:
+    if s3_client is None:
         client = _new_s3_client(
             s3_access_key_id,
             s3_secret_access_key,
@@ -970,7 +970,7 @@ def s3_upload(
             s3_signature_version=s3_signature_version,
         )
     else:
-        client = s3_session.client("s3")
+        client = s3_client
     client.upload_file(path, bucket, key)
 
 
@@ -981,7 +981,7 @@ def _s3_download_url(
     s3_endpoint: str = default_s3_read_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
-    s3_session: Optional[boto3.session.Session] = None,
+    s3_client: Any = None,
 ) -> str:
     bucket, key = _parse_s3_uri(path_uri)
     # v2 signature is important to easily align the presigned URL expiry
@@ -996,7 +996,7 @@ def _s3_download_url(
     #
     if not s3_signature_version:
         s3_signature_version = "s3"
-    if s3_session is None:
+    if s3_client is None:
         client = _new_s3_client(
             s3_access_key_id,
             s3_secret_access_key,
@@ -1005,7 +1005,7 @@ def _s3_download_url(
             s3_signature_version=s3_signature_version,
         )
     else:
-        client = s3_session.client("s3")
+        client = s3_client
 
     # Explanation with SIG_GRANULARITY=1h
     # compute an expiry that is aligned to the hour, at least 1 hour
@@ -1048,7 +1048,7 @@ def s3_download(
     begin: Optional[int] = None,
     end: Optional[int] = None,
     certificate_handling: Optional[CAInfo] = None,
-    s3_session: Optional[boto3.session.Session] = None,
+    s3_client: Any = None,
 ) -> CURLStreamFile:
     url = _s3_download_url(
         path_uri=path_uri,
@@ -1057,7 +1057,7 @@ def s3_download(
         s3_endpoint=s3_endpoint,
         s3_region_name=s3_region_name,
         s3_signature_version=s3_signature_version,
-        s3_session=s3_session,
+        s3_client=s3_client,
     )
     if force_http and url.lower().startswith("https://"):
         url = "http://" + url[8:]
@@ -1213,7 +1213,7 @@ def open_stream(
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
     certificate_handling: Optional[CAInfo] = None,
-    s3_session: Optional[boto3.session.Session] = None,
+    s3_client: Any = None,
 ) -> Union[CURLStreamFile, RedisStreamFile, typing.BinaryIO]:
     """
     Open a file path, http(s):// URL, or s3:// URI.
@@ -1274,10 +1274,9 @@ def open_stream(
             `tensorizer.stream_io.CAInfo` to use a different CA bundle
             or to disable certificate verification entirely.
             This option is useful when working with self-signed certificates.
-        s3_session: AWS boto3 Session object used to instantiate a
-            s3 client handling the authentication with s3. When passing a session
-            object it has priority over the `~/.s3cfg` config file credentials or
-            `s3_access_key_id`  and `s3_secret_access_key` arguments.
+        s3_client: AWS boto3 client object used to handle authentication with s3.
+            When passing a client object it has priority over the `~/.s3cfg`
+            config or `s3_access_key_id`  and `s3_secret_access_key` arguments.
     Returns:
         An opened file-like object representing the target resource.
 
@@ -1368,7 +1367,7 @@ def open_stream(
         is_s3_upload = "w" in mode or "a" in mode
         error_context = None
         try:
-            if s3_session is None:
+            if s3_client is None:
                 s3 = _infer_credentials(
                     s3_access_key_id, s3_secret_access_key, s3_config_path
                 )
@@ -1425,7 +1424,7 @@ def open_stream(
                 s3_endpoint,
                 s3_region_name,
                 s3_signature_version,
-                s3_session,
+                s3_client,
             )
 
             # Always run the close + upload procedure
@@ -1471,7 +1470,7 @@ def open_stream(
                 begin=begin,
                 end=end,
                 certificate_handling=certificate_handling,
-                s3_session=s3_session,
+                s3_client=s3_client,
             )
             if error_context:
                 curl_stream_file.register_error_context(error_context)
