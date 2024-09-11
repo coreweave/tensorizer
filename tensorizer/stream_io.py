@@ -18,9 +18,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import boto3
+import boto3.session
 import botocore
 import redis
-import boto3.session
 
 import tensorizer._version as _version
 import tensorizer._wide_pipes as _wide_pipes
