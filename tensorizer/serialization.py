@@ -3510,7 +3510,7 @@ class TensorSerializer:
         if not isinstance(data, memoryview):
             data = memoryview(data)
         try:
-            if data.ndim != 1:
+            if data.ndim != 1 or data.format != "B":
                 data = data.cast("B")
             return data[start:]
         finally:
