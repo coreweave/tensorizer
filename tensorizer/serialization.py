@@ -3526,41 +3526,40 @@ class TensorSerializer:
             verify if isinstance(verify, int) else self._buffer_size(data)
         )
         bytes_just_written: int = os.pwrite(self._fd, data, offset)
-        bytes_written += bytes_just_written
+        requested_write_size: int = self._buffer_size(data)
+        if bytes_just_written > 0:
+            bytes_written += bytes_just_written
         attempts: int = 0
         while bytes_written < expected_bytes_written and attempts < 3:
             # Writes larger than ~2 GiB may not complete in a single pwrite call
-            offset += bytes_just_written
-            with self._mv_suffix(data, bytes_written) as mv:
-                mv_size: int = mv.nbytes
-                bytes_just_written = os.pwrite(self._fd, mv, offset)
             if bytes_just_written > 0:
-                bytes_written += bytes_just_written
+                offset += bytes_just_written
             else:
                 # In case pwrite returns something strange
                 (logger.error if bytes_just_written < 0 else logger.info)(
                     (
-                        "pwrite: Supplementary write of %d bytes returned %d"
+                        "pwrite: Write of %d bytes returned %d"
                         " with %d/%d bytes written (offset: %d)"
                     ),
-                    mv_size,
+                    requested_write_size,
                     bytes_just_written,
                     bytes_written,
                     expected_bytes_written,
                     offset,
                 )
                 if bytes_just_written == 0:
-                    if mv_size == 0:
+                    if requested_write_size == 0:
                         logger.error("pwrite: Attempted to write 0 bytes")
                         break
                     attempts += 1
-                    logger.debug(
-                        "pwrite: %s (attempt %d/3)",
-                        "Retrying" if attempts < 3 else "Not retrying",
-                        attempts,
-                    )
+                    logger.debug("pwrite: Retrying (attempt %d/3)", attempts)
                     if attempts > 1:
                         time.sleep(0.2)
+            with self._mv_suffix(data, bytes_written) as mv:
+                requested_write_size = mv.nbytes
+                bytes_just_written = os.pwrite(self._fd, mv, offset)
+            if bytes_just_written > 0:
+                bytes_written += bytes_just_written
         if isinstance(verify, int) or verify:
             self._verify_bytes_written(bytes_written, expected_bytes_written)
         return bytes_written
