@@ -3549,7 +3549,15 @@ class TensorSerializer:
                 )
                 if bytes_just_written == 0:
                     if requested_write_size == 0:
-                        logger.error("pwrite: Attempted to write 0 bytes")
+                        if logger.isEnabledFor(logging.ERROR):
+                            logger.error(
+                                (
+                                    "pwrite: Attempted to write 0 bytes,"
+                                    " original size: %d, original type: %s"
+                                ),
+                                self._buffer_size(data),
+                                repr(data.__class__.__name__),
+                            )
                         break
                     attempts += 1
                     logger.debug("pwrite: Retrying (attempt %d/3)", attempts)
