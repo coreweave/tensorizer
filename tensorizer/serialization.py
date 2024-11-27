@@ -3526,13 +3526,15 @@ class TensorSerializer:
             verify if isinstance(verify, int) else self._buffer_size(data)
         )
         bytes_just_written: int = os.pwrite(self._fd, data, offset)
-        bytes_written += bytes_just_written
+        if bytes_just_written > 0:
+            bytes_written += bytes_just_written
         while bytes_written < expected_bytes_written and bytes_just_written > 0:
             # Writes larger than ~2 GiB may not complete in a single pwrite call
             offset += bytes_just_written
             with self._mv_suffix(data, bytes_written) as mv:
                 bytes_just_written = os.pwrite(self._fd, mv, offset)
-            bytes_written += bytes_just_written
+            if bytes_just_written > 0:
+                bytes_written += bytes_just_written
         if isinstance(verify, int) or verify:
             self._verify_bytes_written(bytes_written, expected_bytes_written)
         return bytes_written
