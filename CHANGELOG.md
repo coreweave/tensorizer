@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `TensorSerializer` no longer sometimes fails to serialize very large
+  1-dimensional tensors with multibyte `dtype`s
 - `RedisStreamFile.readable()` and `RedisStreamFile.seekable()` now correctly
   return `True`
 
