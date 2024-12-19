@@ -1367,12 +1367,11 @@ def open_stream(
         is_s3_upload = "w" in mode or "a" in mode
         error_context = None
         try:
-            if s3_client is None:
-                s3 = _infer_credentials(
-                    s3_access_key_id, s3_secret_access_key, s3_config_path
-                )
-                s3_access_key_id = s3.s3_access_key
-                s3_secret_access_key = s3.s3_secret_key
+            s3 = _infer_credentials(
+                s3_access_key_id, s3_secret_access_key, s3_config_path
+            )
+            s3_access_key_id = s3.s3_access_key
+            s3_secret_access_key = s3.s3_secret_key
 
             # Not required to have been found,
             # and doesn't overwrite an explicitly specified endpoint.
