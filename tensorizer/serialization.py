@@ -2615,6 +2615,7 @@ class TensorDeserializer(
             self._dtype is not None
             and tensor.dtype != torch.bool
             and tensor.dtype != self._dtype
+            and tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]
         ):
             target_dtype = self._dtype
         else:
@@ -4135,6 +4136,7 @@ class TensorSerializer:
         callback: Optional[Callable]
 
     def _bulk_write(self, tensors: Iterable[_WriteSpec]):
+        tensors = [t for t in tensors if t.tensor.view(-1).shape[0] > 0]
         tensors = collections.deque(tensors)
         next_pos = self._file.tell()
         if _syscalls.has_fallocate() and self._fd:
