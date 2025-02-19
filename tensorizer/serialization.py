@@ -221,7 +221,7 @@ class TensorEntry:
         if self.data_length > 0:
             return self.data_length
         element_size: int = numpy.dtype(self.dtype).itemsize
-        num_elements: int = numpy.product(self.shape)
+        num_elements: int = numpy.prod(self.shape)
         return element_size * num_elements
 
 
