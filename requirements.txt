@@ -1,4 +1,4 @@
-torch>=1.9.0
+torch>=2.2.0
 numpy>=1.22.2
 protobuf>=3.19.5
 psutil>=5.9.4
@@ -6,5 +6,6 @@ boto3>=1.26.0
 redis>=4.5.5
 hiredis
 libnacl>=2.1.0
-setuptools>=65.5.1 # not directly required, pinned by Snyk to avoid a vulnerability
+setuptools>=70.0.0 # not directly required, pinned by Snyk to avoid a vulnerability
 wheel>=0.38.0 # not directly required, pinned by Snyk to avoid a vulnerability
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
