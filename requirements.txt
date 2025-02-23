@@ -1,4 +1,4 @@
-torch>=1.9.0
+torch>=2.2.0
 numpy>=1.22.2
 protobuf>=3.19.5
 psutil>=5.9.4
