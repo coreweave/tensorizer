@@ -898,18 +898,47 @@ def _ensure_https_endpoint(endpoint: str):
 
 
 def _new_s3_client(
-    s3_access_key_id: str,
-    s3_secret_access_key: str,
-    s3_endpoint: str,
+    s3_access_key_id: Optional[str] = None,
+    s3_secret_access_key: Optional[str] = None,
+    s3_endpoint: Optional[str] = None,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
 ):
-    if s3_secret_access_key is None:
-        raise TypeError("No secret key provided")
-    if s3_access_key_id is None:
-        raise TypeError("No access key provided")
-    if s3_endpoint is None:
-        raise TypeError("No S3 endpoint provided")
+    """
+    Create a new S3 client using credentials from various sources in order of precedence.
+
+    Credentials are resolved in the following order:
+    1. Explicitly provided credentials via parameters
+    2. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+    3. Shared credential file (~/.aws/credentials)
+    4. AWS config file (~/.aws/config)
+    5. Assume Role provider
+    6. Boto2 config file (/etc/boto.cfg and ~/.boto)
+    7. Instance metadata service on EC2 instances
+
+    Args:
+        s3_access_key_id: AWS access key ID. If provided along with
+            s3_secret_access_key, these credentials will be used directly.
+            If both are set to empty strings (""), configures the client
+            to make unsigned requests. Defaults to None.
+        s3_secret_access_key: AWS secret access key. Must be provided with
+            s3_access_key_id if using explicit credentials. Defaults to None.
+        s3_endpoint: Custom endpoint URL for S3-compatible storage.
+            If None, uses standard AWS endpoints. Defaults to None.
+        s3_region_name: AWS region name to configure the client for.
+            Defaults to None (uses default region detection).
+        s3_signature_version: Signature version to use for request signing.
+            Overrides automatic detection. Defaults to None.
+
+    Returns:
+        botocore.client.S3: A configured boto3 S3 client instance.
+
+    Note:
+        When both s3_access_key_id and s3_secret_access_key are explicitly set
+        to empty strings (""), the client will be configured with unsigned
+        requests. This is typically used for accessing public buckets without
+        credentials.
+    """
 
     config_args = dict(user_agent=_BOTO_USER_AGENT)
     auth_args = {}
@@ -917,25 +946,33 @@ def _new_s3_client(
     if s3_region_name is not None:
         config_args["region_name"] = s3_region_name
 
-    if s3_access_key_id == s3_secret_access_key == "":
-        config_args["signature_version"] = botocore.UNSIGNED
-    else:
-        auth_args = dict(
-            aws_access_key_id=s3_access_key_id,
-            aws_secret_access_key=s3_secret_access_key,
-        )
-        if s3_signature_version is not None:
-            config_args["signature_version"] = s3_signature_version
+    if s3_access_key_id is not None and s3_secret_access_key is not None:
+        if s3_access_key_id == s3_secret_access_key == "":
+            config_args["signature_version"] = botocore.UNSIGNED
+        else:
+            auth_args = dict(
+                aws_access_key_id=s3_access_key_id,
+                aws_secret_access_key=s3_secret_access_key,
+            )
+
+    if s3_signature_version is not None:
+        config_args["signature_version"] = s3_signature_version
 
     config = boto3.session.Config(**config_args)
 
-    return boto3.session.Session.client(
-        boto3.session.Session(),
-        endpoint_url=_ensure_https_endpoint(s3_endpoint),
-        service_name="s3",
-        config=config,
-        **auth_args,
-    )
+    session = boto3.session.Session()
+
+    kwargs = {
+        "service_name": "s3",
+        "config": config,
+    }
+
+    if s3_endpoint is not None:
+        kwargs["endpoint_url"] = _ensure_https_endpoint(s3_endpoint)
+
+    kwargs.update(auth_args)
+
+    return session.client(**kwargs)
 
 
 def _parse_s3_uri(uri: str) -> Tuple[str, str]:
