@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+[2.9.3] - 2025-05-09
+
+### Changed
+
+- `stream_io.open_stream()` now defaults to authenticating with signature
+  version 4 rather than signature version 2 when no `s3_signature_version`
+  is specified for reads from most object storage endpoints
+
 [2.9.2] - 2025-02-20
 
 ### Fixed
@@ -416,6 +424,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[2.9.3]: https://github.com/coreweave/tensorizer/compare/v2.9.2...v2.9.3
 [2.9.2]: https://github.com/coreweave/tensorizer/compare/v2.9.1...v2.9.2
 [2.9.1]: https://github.com/coreweave/tensorizer/compare/v2.9.0...v2.9.1
 [2.9.0]: https://github.com/coreweave/tensorizer/compare/v2.8.1...v2.9.0
