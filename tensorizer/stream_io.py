@@ -978,8 +978,9 @@ def _s3_download_url(
     s3_signature_version: Optional[str] = None,
 ) -> str:
     bucket, key = _parse_s3_uri(path_uri)
-    # v2 signature is important to easily align the presigned URL expiry
-    # times. This allows multiple clients to generate the exact same
+    # v2 signature is important with accel-object
+    # to easily align the presigned URL expiry times.
+    # This allows multiple clients to generate the exact same
     # presigned URL, and get hits on a HTTP caching proxy.
     #
     # why v2 signature?
@@ -989,7 +990,8 @@ def _s3_download_url(
     # See upstream bug https://github.com/boto/botocore/issues/2230
     #
     if not s3_signature_version:
-        s3_signature_version = "s3"
+        is_accel: bool = "accel-object" in s3_endpoint.lower().split(".")
+        s3_signature_version = "s3" if is_accel else "v4"
     client = _new_s3_client(
         s3_access_key_id,
         s3_secret_access_key,
