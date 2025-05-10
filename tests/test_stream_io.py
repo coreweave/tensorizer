@@ -389,7 +389,7 @@ class TestS3(unittest.TestCase):
                 r"X-Amz-Credential=[A-Z]+",
             ]
             V2_regex = [
-                r"Expires=1[0-9]+",
+                r"(?<!X-Amz-)Expires=1[0-9]+",
                 r"AWSAccessKeyId=[A-Z]+",
             ]
 
