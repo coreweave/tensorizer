@@ -897,6 +897,11 @@ def _ensure_https_endpoint(endpoint: str):
         raise ValueError("Non-HTTPS endpoint URLs are not allowed.")
 
 
+def _is_caios(endpoint: str) -> bool:
+    host = urlparse(endpoint if "//" in endpoint else "//" + endpoint).netloc
+    return host.lower() in {"cwobject.com", "cwlota.com"}
+
+
 def _new_s3_client(
     s3_access_key_id: str,
     s3_secret_access_key: str,
@@ -914,6 +919,9 @@ def _new_s3_client(
     config_args = dict(user_agent=_BOTO_USER_AGENT)
     auth_args = {}
 
+    if _is_caios(s3_endpoint):
+        # These endpoints don't support path-style addressing
+        config_args["s3"] = {"addressing_style": "virtual"}
     if s3_region_name is not None:
         config_args["region_name"] = s3_region_name
 
