@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+[Unreleased]
+
+### Fixed
+
+- `stream_io.open_stream()` now uses virtual-hosted-style
+  bucket addressing for the `cwobject.com` and `cwlota.com` endpoints
+
 [2.9.3] - 2025-05-09
 
 ### Changed
@@ -424,6 +431,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.9.3...HEAD
 [2.9.3]: https://github.com/coreweave/tensorizer/compare/v2.9.2...v2.9.3
 [2.9.2]: https://github.com/coreweave/tensorizer/compare/v2.9.1...v2.9.2
 [2.9.1]: https://github.com/coreweave/tensorizer/compare/v2.9.0...v2.9.1
