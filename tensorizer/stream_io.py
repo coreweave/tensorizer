@@ -58,6 +58,7 @@ class _ParsedCredentials(typing.NamedTuple):
     s3_endpoint: Optional[str]
     s3_access_key: Optional[str]
     s3_secret_key: Optional[str]
+    use_https: Optional[bool]
 
 
 @functools.lru_cache(maxsize=None)
@@ -106,16 +107,24 @@ def _get_s3cfg_values(
         if config.read((config_path,)):
             break
     else:
-        return _ParsedCredentials(None, None, None, None)
+        return _ParsedCredentials(None, None, None, None, None)
 
     if "default" not in config:
         raise ValueError(f"No default section in {config_path}")
 
+    use_https = config["default"].get("use_https")
+    if use_https == "True":
+        use_https = True
+    elif use_https == "False":
+        use_https = False
+    else:
+        use_https = None
     return _ParsedCredentials(
         config_file=os.fsdecode(config_path),
         s3_endpoint=config["default"].get("host_base"),
         s3_access_key=config["default"].get("access_key"),
         s3_secret_key=config["default"].get("secret_key"),
+        use_https=use_https,
     )
 
 
@@ -1124,6 +1133,7 @@ def _infer_credentials(
             s3_endpoint=None,
             s3_access_key=s3_access_key_id,
             s3_secret_key=s3_secret_access_key,
+            use_https=None,
         )
 
     # Try to find default credentials if at least one is not specified
@@ -1172,6 +1182,7 @@ def _infer_credentials(
         s3_endpoint=parsed.s3_endpoint,
         s3_access_key=s3_access_key_id,
         s3_secret_key=s3_secret_access_key,
+        use_https=parsed.use_https,
     )
 
 
@@ -1220,7 +1231,7 @@ def open_stream(
     s3_endpoint: Optional[str] = None,
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
-    force_http: bool = False,
+    force_http: Optional[bool] = None,
     *,
     begin: Optional[int] = None,
     end: Optional[int] = None,
@@ -1387,6 +1398,9 @@ def open_stream(
             # Not required to have been found,
             # and doesn't overwrite an explicitly specified endpoint.
             s3_endpoint = s3_endpoint or s3.s3_endpoint
+
+            if force_http is None and s3.use_https is not None:
+                force_http = not s3.use_https
         except (ValueError, FileNotFoundError):
             # TODO: Reimplement this logic somewhere in s3_download
             #
@@ -1406,6 +1420,9 @@ def open_stream(
             #     " function."
             # )
             pass
+
+        if force_http is None:
+            force_http = False
 
         # Regardless of whether the config needed to be parsed,
         # the endpoint gets a default value based on the operation.
