@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `stream_io.open_stream()` now uses virtual-hosted-style
   bucket addressing for the `cwobject.com` and `cwlota.com` endpoints
+- `stream_io.open_stream()` now allows the `use_https` entry of `.s3cfg`
+  configuration files to fill in its `force_http` parameter if `force_http` is
+  not explicitly specified as `True` or `False`
 
 [2.9.3] - 2025-05-09
 
