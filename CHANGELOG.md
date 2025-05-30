@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [Unreleased]
 
+### Added
+
+- `stream_io.open_stream()` now respects Boto3's configuration files
+  and environment variables when searching for object storage credentials to use
+
 ### Fixed
 
 - `stream_io.open_stream()` now uses virtual-hosted-style

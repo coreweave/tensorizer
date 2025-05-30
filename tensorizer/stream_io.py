@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 import boto3
 import botocore
+import botocore.exceptions
 import redis
 
 import tensorizer._version as _version
@@ -903,19 +904,12 @@ def _is_caios(endpoint: str) -> bool:
 
 
 def _new_s3_client(
-    s3_access_key_id: str,
-    s3_secret_access_key: str,
-    s3_endpoint: str,
+    s3_access_key_id: Optional[str],
+    s3_secret_access_key: Optional[str],
+    s3_endpoint: Optional[str],
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
 ):
-    if s3_secret_access_key is None:
-        raise TypeError("No secret key provided")
-    if s3_access_key_id is None:
-        raise TypeError("No access key provided")
-    if s3_endpoint is None:
-        raise TypeError("No S3 endpoint provided")
-
     config_args = dict(user_agent=_BOTO_USER_AGENT)
     auth_args = {}
 
@@ -960,9 +954,9 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
 def s3_upload(
     path: str,
     target_uri: str,
-    s3_access_key_id: str,
-    s3_secret_access_key: str,
-    s3_endpoint: str = default_s3_write_endpoint,
+    s3_access_key_id: Optional[str],
+    s3_secret_access_key: Optional[str],
+    s3_endpoint: Optional[str] = default_s3_write_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
 ):
@@ -979,9 +973,9 @@ def s3_upload(
 
 def _s3_download_url(
     path_uri: str,
-    s3_access_key_id: str,
-    s3_secret_access_key: str,
-    s3_endpoint: str = default_s3_read_endpoint,
+    s3_access_key_id: Optional[str],
+    s3_secret_access_key: Optional[str],
+    s3_endpoint: Optional[str] = default_s3_read_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
 ) -> str:
@@ -1029,19 +1023,40 @@ def _s3_download_url(
     expiry = t - (t % SIG_GRANULARITY) + (SIG_GRANULARITY * 2)
     seconds_to_expiry = expiry - t
 
-    url = client.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=seconds_to_expiry,
-    )
+    try:
+        # This is the first point at which an error may be raised by boto3
+        # for missing credentials
+        url = client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=seconds_to_expiry,
+        )
+    except botocore.exceptions.NoCredentialsError:
+        if s3_access_key_id is None and s3_secret_access_key is None:
+            # Credentials may be absent because a public read
+            # bucket is being used, so try blank credentials
+            try:
+                return _s3_download_url(
+                    path_uri,
+                    "",
+                    "",
+                    s3_endpoint,
+                    s3_region_name,
+                    s3_signature_version,
+                )
+            except botocore.exceptions.NoCredentialsError:
+                # If this has the same error for some reason,
+                # just ignore it, and raise the original error
+                pass
+        raise
     return url
 
 
 def s3_download(
     path_uri: str,
-    s3_access_key_id: str,
-    s3_secret_access_key: str,
-    s3_endpoint: str = default_s3_read_endpoint,
+    s3_access_key_id: Optional[str],
+    s3_secret_access_key: Optional[str],
+    s3_endpoint: Optional[str] = default_s3_read_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
     buffer_size: Optional[int] = None,
@@ -1372,27 +1387,25 @@ def open_stream(
             # Not required to have been found,
             # and doesn't overwrite an explicitly specified endpoint.
             s3_endpoint = s3_endpoint or s3.s3_endpoint
-        except (ValueError, FileNotFoundError) as e:
-            # Uploads always require credentials here, but downloads may not
-            if is_s3_upload:
-                raise
-            else:
-                # Credentials may be absent because a public read
-                # bucket is being used, so try blank credentials,
-                # but provide a descriptive warning for future errors
-                # that may occur due to this exception being suppressed.
-                # Don't save the whole exception object since it holds
-                # a stack trace, which can interfere with garbage collection.
-                error_context = (
-                    "Warning: empty credentials were used for S3."
-                    f"\nReason: {e}"
-                    "\nIf the connection failed due to missing permissions"
-                    " (e.g. HTTP error 403), try providing credentials"
-                    " directly with the tensorizer.stream_io.open_stream()"
-                    " function."
-                )
-                s3_access_key_id = s3_access_key_id or ""
-                s3_secret_access_key = s3_access_key_id or ""
+        except (ValueError, FileNotFoundError):
+            # TODO: Reimplement this logic somewhere in s3_download
+            #
+            # Credentials may be absent because a public read
+            # bucket is being used, so try blank credentials,
+            # but provide a descriptive warning for future errors
+            # that may occur due to this exception being suppressed.
+            # Don't save the whole exception object since it holds
+            # a stack trace, which can interfere with garbage collection.
+            #
+            # error_context = (
+            #     "Warning: empty credentials were used for S3."
+            #     f"\nReason: {e}"
+            #     "\nIf the connection failed due to missing permissions"
+            #     " (e.g. HTTP error 403), try providing credentials"
+            #     " directly with the tensorizer.stream_io.open_stream()"
+            #     " function."
+            # )
+            pass
 
         # Regardless of whether the config needed to be parsed,
         # the endpoint gets a default value based on the operation.
