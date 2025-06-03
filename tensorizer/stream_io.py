@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 import boto3
 import botocore
 import botocore.exceptions
+import botocore.session
 import redis
 
 import tensorizer._version as _version
@@ -1426,6 +1427,20 @@ def open_stream(
 
         # Regardless of whether the config needed to be parsed,
         # the endpoint gets a default value based on the operation.
+        # First, check for the AWS_ENDPOINT_URL environment variables,
+        # otherwise, check if botocore can resolve credentials,
+        # otherwise, use default_s3_write_endpoint and default_s3_read_endpoint.
+        if not s3_endpoint:
+            s3_endpoint = os.environ.get("AWS_ENDPOINT_URL_S3") or None
+            if not s3_endpoint:
+                s3_endpoint = os.environ.get("AWS_ENDPOINT_URL") or None
+            if not s3_endpoint:
+                scoped_config = botocore.session.Session().get_scoped_config()
+                s3_config = scoped_config.get("s3")
+                if s3_config:
+                    s3_endpoint = s3_config.get("endpoint_url") or None
+                if not s3_endpoint:
+                    s3_endpoint = scoped_config.get("endpoint_url") or None
 
         if is_s3_upload:
             s3_endpoint = s3_endpoint or default_s3_write_endpoint
