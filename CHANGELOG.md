@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `stream_io.open_stream()` now allows the `use_https` entry of `.s3cfg`
   configuration files to fill in its `force_http` parameter if `force_http` is
   not explicitly specified as `True` or `False`
+- `TensorSerializer` no longer throws an error when attempting to serialize
+  very large tensors on some non-Linux platforms
 
 [2.9.3] - 2025-05-09
 
