@@ -1466,33 +1466,33 @@ def open_stream(
                 s3_signature_version,
             )
 
-            # Always run the close + upload procedure
-            # before any code from Python's NamedTemporaryFile wrapper.
-            # It isn't safe to call a bound method from a weakref finalizer,
-            # but calling a weakref finalizer alongside a bound method
-            # creates no problems, other than that the code outside the
-            # finalizer is not guaranteed to be run at any point.
-            # In this case, the weakref finalizer performs all necessary
-            # cleanup itself, but the original NamedTemporaryFile methods
-            # are invoked as well, just in case.
-            wrapped_close = temp_file.close
+            # Create a class dynamically to wrap methods, as __exit__ is always
+            # looked up on the class of an object even if a function with the
+            # same name exists in the instance dictionary.
+            # noinspection PyAbstractClass
+            class S3TemporaryFileWrapper(temp_file.__class__):
+                # Always run the close + upload procedure
+                # before any code from Python's NamedTemporaryFile wrapper.
+                # It isn't safe to call a bound method from a weakref finalizer,
+                # but calling a weakref finalizer alongside a bound method
+                # creates no problems, other than that the code outside the
+                # finalizer is not guaranteed to be run at any point.
+                # In this case, the weakref finalizer performs all necessary
+                # cleanup itself, but the original NamedTemporaryFile methods
+                # are invoked as well, just in case.
+                def close(self):
+                    guaranteed_closer()
+                    return super().close()
 
-            def close_wrapper():
-                guaranteed_closer()
-                return wrapped_close()
+                # Python 3.12+ doesn't call NamedTemporaryFile.close() during
+                # .__exit__(), so it must be wrapped separately.
+                # Since guaranteed_closer is idempotent, it's fine to call it in
+                # both methods, even if both are called back-to-back.
+                def __exit__(self, exc, value, tb):
+                    guaranteed_closer()
+                    return super().__exit__(exc, value, tb)
 
-            # Python 3.12+ doesn't call NamedTemporaryFile.close() during
-            # .__exit__(), so it must be wrapped separately.
-            # Since guaranteed_closer is idempotent, it's fine to call it in
-            # both methods, even if both are called back-to-back.
-            wrapped_exit = temp_file.__exit__
-
-            def exit_wrapper(exc, value, tb):
-                guaranteed_closer()
-                return wrapped_exit(exc, value, tb)
-
-            temp_file.close = close_wrapper
-            temp_file.__exit__ = exit_wrapper
+            temp_file.__class__ = S3TemporaryFileWrapper
 
             return temp_file
         else:
