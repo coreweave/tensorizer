@@ -3522,13 +3522,13 @@ class TensorSerializer:
     else:
 
         @staticmethod
-        def _pwrite_compat(_fd, _str, _offset, /):
+        def _pwrite_compat(_fd: int, _str, _offset: int, /) -> int:
             # Some systems error on single I/O calls larger than the maximum
             # value of a signed 32-bit integer, so limit os.pwrite calls
             # to a maximum size of about one memory page less than that
             MAX_LEN: typing.Final[int] = 2147479552
 
-            if len(_str) > MAX_LEN:
+            if TensorSerializer._buffer_size(_str) > MAX_LEN:
                 with TensorSerializer._mv_slice(_str, slice(MAX_LEN)) as mv:
                     return os.pwrite(_fd, mv, _offset)
 
