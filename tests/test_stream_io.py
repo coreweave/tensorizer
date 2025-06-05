@@ -161,15 +161,15 @@ def mock_server(
     server_thread.start()
 
     # Disable https validation on endpoints
-    ensure_https_endpoint, stream_io._ensure_https_endpoint = (
-        stream_io._ensure_https_endpoint,
-        lambda endpoint: endpoint,
+    enforce_scheme, stream_io._enforce_scheme = (
+        stream_io._enforce_scheme,
+        lambda endpoint, *_: endpoint,
     )
     try:
         scheme = "https" if ssl_context is not None else "http"
         yield f"{scheme}://{host}:{port:d}"
     finally:
-        stream_io._ensure_https_endpoint = ensure_https_endpoint
+        stream_io._enforce_scheme = enforce_scheme
         server.shutdown()
         server_thread.join(timeout=30)
         werkzeug_logger.setLevel(old_log_level)
@@ -341,14 +341,14 @@ class TestS3(unittest.TestCase):
 
     def assert_bucket_contents(self, key, content):
         # Not a test case
-        s3 = boto3.resource("s3")
+        s3 = boto3.resource("s3", endpoint_url=self.endpoint)
         obj = s3.Object(self.BUCKET_NAME, key)
         actual = obj.get()["Body"].read()
         self.assertEqual(actual, content)
 
     def put_bucket_contents(self, key, content):
         # Not a test case
-        s3 = boto3.resource("s3")
+        s3 = boto3.resource("s3", endpoint_url=self.endpoint)
         obj = s3.Object(self.BUCKET_NAME, key)
         obj.put(Body=content)
 

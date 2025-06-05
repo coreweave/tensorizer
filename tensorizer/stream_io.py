@@ -897,12 +897,19 @@ class RedisStreamFile(io.BufferedIOBase):
         raise io.UnsupportedOperation("readline")
 
 
-def _ensure_https_endpoint(endpoint: str):
+def _enforce_scheme(
+    endpoint: str, allow_http: bool = False, force_http: bool = False
+):
     scheme, *location = endpoint.split("://", maxsplit=1)
     scheme = scheme.lower() if location else None
     if scheme is None:
-        return "https://" + endpoint
+        return ("http://" if force_http else "https://") + endpoint
     elif scheme == "https":
+        if force_http:
+            return "http://" + endpoint[8:]
+        else:
+            return endpoint
+    elif (force_http or allow_http) and scheme == "http":
         return endpoint
     else:
         raise ValueError("Non-HTTPS endpoint URLs are not allowed.")
@@ -943,7 +950,7 @@ def _new_s3_client(
 
     return boto3.session.Session.client(
         boto3.session.Session(),
-        endpoint_url=_ensure_https_endpoint(s3_endpoint),
+        endpoint_url=s3_endpoint,
         service_name="s3",
         config=config,
         **auth_args,
@@ -1070,7 +1077,6 @@ def s3_download(
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
     buffer_size: Optional[int] = None,
-    force_http: bool = False,
     begin: Optional[int] = None,
     end: Optional[int] = None,
     certificate_handling: Optional[CAInfo] = None,
@@ -1083,8 +1089,6 @@ def s3_download(
         s3_region_name=s3_region_name,
         s3_signature_version=s3_signature_version,
     )
-    if force_http and url.lower().startswith("https://"):
-        url = "http://" + url[8:]
     return CURLStreamFile(
         url,
         buffer_size=buffer_size,
@@ -1422,11 +1426,10 @@ def open_stream(
             # )
             pass
 
-        if force_http is None:
-            force_http = False
-
-        # Regardless of whether the config needed to be parsed,
-        # the endpoint gets a default value based on the operation.
+        allow_http = False
+        # Try to match boto3's endpoint resolution if an endpoint
+        # hasn't been located yet.
+        #
         # First, check for the AWS_ENDPOINT_URL environment variables,
         # otherwise, check if botocore can resolve credentials,
         # otherwise, use default_s3_write_endpoint and default_s3_read_endpoint.
@@ -1441,10 +1444,29 @@ def open_stream(
                     s3_endpoint = s3_config.get("endpoint_url") or None
                 if not s3_endpoint:
                     s3_endpoint = scoped_config.get("endpoint_url") or None
+            if s3_endpoint:
+                # If an endpoint was resolved in this block, don't force its
+                # scheme to HTTPS (to match boto3's default HTTP(S) handling)
+                allow_http = True
+
+        if force_http is None:
+            force_http = False
+
+        # If no endpoint was found in any configs, nor as a parameter,
+        # use a default value based on the operation.
+        if not s3_endpoint:
+            if is_s3_upload:
+                s3_endpoint = default_s3_write_endpoint
+            else:
+                s3_endpoint = default_s3_read_endpoint
+
+        s3_endpoint = _enforce_scheme(
+            s3_endpoint,
+            allow_http,
+            force_http,
+        )
 
         if is_s3_upload:
-            s3_endpoint = s3_endpoint or default_s3_write_endpoint
-
             # delete must be False or the file will be deleted by the OS
             # as soon as it closes, before it can be uploaded on platforms
             # with primitive temporary file support (e.g. Windows)
@@ -1494,9 +1516,8 @@ def open_stream(
 
             temp_file.__class__ = S3TemporaryFileWrapper
 
-            return temp_file
+            return typing.cast(typing.BinaryIO, temp_file)
         else:
-            s3_endpoint = s3_endpoint or default_s3_read_endpoint
             curl_stream_file = s3_download(
                 path_uri,
                 s3_access_key_id,
@@ -1505,7 +1526,6 @@ def open_stream(
                 s3_region_name=s3_region_name,
                 s3_signature_version=s3_signature_version,
                 buffer_size=buffer_size,
-                force_http=force_http,
                 begin=begin,
                 end=end,
                 certificate_handling=certificate_handling,
@@ -1526,6 +1546,8 @@ def open_stream(
                 os.makedirs(os.path.dirname(path_uri), exist_ok=True)
         if buffer_size is None:
             buffer_size = io.DEFAULT_BUFFER_SIZE
-        handle: typing.BinaryIO = open(path_uri, mode, buffering=buffer_size)
+        handle: typing.BinaryIO = typing.cast(
+            typing.BinaryIO, open(path_uri, mode, buffering=buffer_size)
+        )
         handle.seek(begin or 0)
         return handle
