@@ -104,9 +104,15 @@ def set_up_moto(*endpoints):
             "AWS_SECURITY_TOKEN",
             "AWS_SESSION_TOKEN",
             "AWS_DEFAULT_REGION",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
         )
         if key in os.environ
     }
+
+    # Disable these two entirely
+    os.environ["AWS_CONFIG_FILE"] = ""
+    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = ""
 
     for key in old_environment:
         test_value = "us-east-1" if key == "AWS_DEFAULT_REGION" else "TEST"
@@ -119,6 +125,8 @@ def set_up_moto(*endpoints):
 
 
 def tear_down_moto(old_environment):
+    del os.environ["AWS_CONFIG_FILE"]
+    del os.environ["AWS_SHARED_CREDENTIALS_FILE"]
     for key, value in old_environment:
         os.environ[key] = value
 
