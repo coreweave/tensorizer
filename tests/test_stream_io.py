@@ -104,9 +104,15 @@ def set_up_moto(*endpoints):
             "AWS_SECURITY_TOKEN",
             "AWS_SESSION_TOKEN",
             "AWS_DEFAULT_REGION",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
         )
         if key in os.environ
     }
+
+    # Disable these two entirely
+    os.environ["AWS_CONFIG_FILE"] = ""
+    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = ""
 
     for key in old_environment:
         test_value = "us-east-1" if key == "AWS_DEFAULT_REGION" else "TEST"
@@ -119,6 +125,8 @@ def set_up_moto(*endpoints):
 
 
 def tear_down_moto(old_environment):
+    del os.environ["AWS_CONFIG_FILE"]
+    del os.environ["AWS_SHARED_CREDENTIALS_FILE"]
     for key, value in old_environment:
         os.environ[key] = value
 
@@ -161,15 +169,15 @@ def mock_server(
     server_thread.start()
 
     # Disable https validation on endpoints
-    ensure_https_endpoint, stream_io._ensure_https_endpoint = (
-        stream_io._ensure_https_endpoint,
-        lambda endpoint: endpoint,
+    enforce_scheme, stream_io._enforce_scheme = (
+        stream_io._enforce_scheme,
+        lambda endpoint, *_: endpoint,
     )
     try:
         scheme = "https" if ssl_context is not None else "http"
         yield f"{scheme}://{host}:{port:d}"
     finally:
-        stream_io._ensure_https_endpoint = ensure_https_endpoint
+        stream_io._enforce_scheme = enforce_scheme
         server.shutdown()
         server_thread.join(timeout=30)
         werkzeug_logger.setLevel(old_log_level)
@@ -326,8 +334,20 @@ class TestS3(unittest.TestCase):
         # This is in setUp/tearDown rather than setUpClass/tearDownClass
         # so that mock bucket state is not shared between test runs
         self.mock_s3.start()
-        s3 = boto3.resource("s3", endpoint_url=self.endpoint)
-        bucket = s3.Bucket(self.BUCKET_NAME)
+        session = boto3.Session(
+            aws_access_key_id=self.ACCESS_KEY,
+            aws_secret_access_key=self.SECRET_KEY,
+            region_name=self.region,
+        )
+        self.s3_client = session.resource(
+            "s3",
+            endpoint_url=self.endpoint,
+            aws_access_key_id=self.ACCESS_KEY,
+            aws_secret_access_key=self.SECRET_KEY,
+            region_name=self.region,
+            config=boto3.session.Config(s3={"addressing_style": "path"}),
+        )
+        bucket = self.s3_client.Bucket(self.BUCKET_NAME)
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/bucket/create.html
         bucket.create(
             CreateBucketConfiguration={
@@ -337,19 +357,18 @@ class TestS3(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.s3_client = None
         self.mock_s3.stop()
 
     def assert_bucket_contents(self, key, content):
         # Not a test case
-        s3 = boto3.resource("s3")
-        obj = s3.Object(self.BUCKET_NAME, key)
+        obj = self.s3_client.Object(self.BUCKET_NAME, key)
         actual = obj.get()["Body"].read()
         self.assertEqual(actual, content)
 
     def put_bucket_contents(self, key, content):
         # Not a test case
-        s3 = boto3.resource("s3")
-        obj = s3.Object(self.BUCKET_NAME, key)
+        obj = self.s3_client.Object(self.BUCKET_NAME, key)
         obj.put(Body=content)
 
     @patch.object(stream_io, "_s3_default_config_paths", ())

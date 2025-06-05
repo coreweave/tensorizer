@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 
 import boto3
 import botocore
+import botocore.exceptions
+import botocore.session
 import redis
 
 import tensorizer._version as _version
@@ -57,6 +59,7 @@ class _ParsedCredentials(typing.NamedTuple):
     s3_endpoint: Optional[str]
     s3_access_key: Optional[str]
     s3_secret_key: Optional[str]
+    use_https: Optional[bool]
 
 
 @functools.lru_cache(maxsize=None)
@@ -105,16 +108,24 @@ def _get_s3cfg_values(
         if config.read((config_path,)):
             break
     else:
-        return _ParsedCredentials(None, None, None, None)
+        return _ParsedCredentials(None, None, None, None, None)
 
     if "default" not in config:
         raise ValueError(f"No default section in {config_path}")
 
+    use_https = config["default"].get("use_https")
+    if use_https == "True":
+        use_https = True
+    elif use_https == "False":
+        use_https = False
+    else:
+        use_https = None
     return _ParsedCredentials(
         config_file=os.fsdecode(config_path),
         s3_endpoint=config["default"].get("host_base"),
         s3_access_key=config["default"].get("access_key"),
         s3_secret_key=config["default"].get("secret_key"),
+        use_https=use_https,
     )
 
 
@@ -886,34 +897,42 @@ class RedisStreamFile(io.BufferedIOBase):
         raise io.UnsupportedOperation("readline")
 
 
-def _ensure_https_endpoint(endpoint: str):
+def _enforce_scheme(
+    endpoint: str, allow_http: bool = False, force_http: bool = False
+):
     scheme, *location = endpoint.split("://", maxsplit=1)
     scheme = scheme.lower() if location else None
     if scheme is None:
-        return "https://" + endpoint
+        return ("http://" if force_http else "https://") + endpoint
     elif scheme == "https":
+        if force_http:
+            return "http://" + endpoint[8:]
+        else:
+            return endpoint
+    elif (force_http or allow_http) and scheme == "http":
         return endpoint
     else:
         raise ValueError("Non-HTTPS endpoint URLs are not allowed.")
 
 
+def _is_caios(endpoint: str) -> bool:
+    host = urlparse(endpoint if "//" in endpoint else "//" + endpoint).netloc
+    return host.lower() in {"cwobject.com", "cwlota.com"}
+
+
 def _new_s3_client(
-    s3_access_key_id: str,
-    s3_secret_access_key: str,
-    s3_endpoint: str,
+    s3_access_key_id: Optional[str],
+    s3_secret_access_key: Optional[str],
+    s3_endpoint: Optional[str],
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
 ):
-    if s3_secret_access_key is None:
-        raise TypeError("No secret key provided")
-    if s3_access_key_id is None:
-        raise TypeError("No access key provided")
-    if s3_endpoint is None:
-        raise TypeError("No S3 endpoint provided")
-
     config_args = dict(user_agent=_BOTO_USER_AGENT)
     auth_args = {}
 
+    if _is_caios(s3_endpoint):
+        # These endpoints don't support path-style addressing
+        config_args["s3"] = {"addressing_style": "virtual"}
     if s3_region_name is not None:
         config_args["region_name"] = s3_region_name
 
@@ -931,7 +950,7 @@ def _new_s3_client(
 
     return boto3.session.Session.client(
         boto3.session.Session(),
-        endpoint_url=_ensure_https_endpoint(s3_endpoint),
+        endpoint_url=s3_endpoint,
         service_name="s3",
         config=config,
         **auth_args,
@@ -952,9 +971,9 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
 def s3_upload(
     path: str,
     target_uri: str,
-    s3_access_key_id: str,
-    s3_secret_access_key: str,
-    s3_endpoint: str = default_s3_write_endpoint,
+    s3_access_key_id: Optional[str],
+    s3_secret_access_key: Optional[str],
+    s3_endpoint: Optional[str] = default_s3_write_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
 ):
@@ -971,9 +990,9 @@ def s3_upload(
 
 def _s3_download_url(
     path_uri: str,
-    s3_access_key_id: str,
-    s3_secret_access_key: str,
-    s3_endpoint: str = default_s3_read_endpoint,
+    s3_access_key_id: Optional[str],
+    s3_secret_access_key: Optional[str],
+    s3_endpoint: Optional[str] = default_s3_read_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
 ) -> str:
@@ -1021,23 +1040,43 @@ def _s3_download_url(
     expiry = t - (t % SIG_GRANULARITY) + (SIG_GRANULARITY * 2)
     seconds_to_expiry = expiry - t
 
-    url = client.generate_presigned_url(
-        ClientMethod="get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=seconds_to_expiry,
-    )
+    try:
+        # This is the first point at which an error may be raised by boto3
+        # for missing credentials
+        url = client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=seconds_to_expiry,
+        )
+    except botocore.exceptions.NoCredentialsError:
+        if s3_access_key_id is None and s3_secret_access_key is None:
+            # Credentials may be absent because a public read
+            # bucket is being used, so try blank credentials
+            try:
+                return _s3_download_url(
+                    path_uri,
+                    "",
+                    "",
+                    s3_endpoint,
+                    s3_region_name,
+                    s3_signature_version,
+                )
+            except botocore.exceptions.NoCredentialsError:
+                # If this has the same error for some reason,
+                # just ignore it, and raise the original error
+                pass
+        raise
     return url
 
 
 def s3_download(
     path_uri: str,
-    s3_access_key_id: str,
-    s3_secret_access_key: str,
-    s3_endpoint: str = default_s3_read_endpoint,
+    s3_access_key_id: Optional[str],
+    s3_secret_access_key: Optional[str],
+    s3_endpoint: Optional[str] = default_s3_read_endpoint,
     s3_region_name: Optional[str] = None,
     s3_signature_version: Optional[str] = None,
     buffer_size: Optional[int] = None,
-    force_http: bool = False,
     begin: Optional[int] = None,
     end: Optional[int] = None,
     certificate_handling: Optional[CAInfo] = None,
@@ -1050,8 +1089,6 @@ def s3_download(
         s3_region_name=s3_region_name,
         s3_signature_version=s3_signature_version,
     )
-    if force_http and url.lower().startswith("https://"):
-        url = "http://" + url[8:]
     return CURLStreamFile(
         url,
         buffer_size=buffer_size,
@@ -1101,6 +1138,7 @@ def _infer_credentials(
             s3_endpoint=None,
             s3_access_key=s3_access_key_id,
             s3_secret_key=s3_secret_access_key,
+            use_https=None,
         )
 
     # Try to find default credentials if at least one is not specified
@@ -1149,6 +1187,7 @@ def _infer_credentials(
         s3_endpoint=parsed.s3_endpoint,
         s3_access_key=s3_access_key_id,
         s3_secret_key=s3_secret_access_key,
+        use_https=parsed.use_https,
     )
 
 
@@ -1197,7 +1236,7 @@ def open_stream(
     s3_endpoint: Optional[str] = None,
     s3_config_path: Optional[Union[str, bytes, os.PathLike]] = None,
     buffer_size: Optional[int] = None,
-    force_http: bool = False,
+    force_http: Optional[bool] = None,
     *,
     begin: Optional[int] = None,
     end: Optional[int] = None,
@@ -1364,34 +1403,70 @@ def open_stream(
             # Not required to have been found,
             # and doesn't overwrite an explicitly specified endpoint.
             s3_endpoint = s3_endpoint or s3.s3_endpoint
-        except (ValueError, FileNotFoundError) as e:
-            # Uploads always require credentials here, but downloads may not
-            if is_s3_upload:
-                raise
-            else:
-                # Credentials may be absent because a public read
-                # bucket is being used, so try blank credentials,
-                # but provide a descriptive warning for future errors
-                # that may occur due to this exception being suppressed.
-                # Don't save the whole exception object since it holds
-                # a stack trace, which can interfere with garbage collection.
-                error_context = (
-                    "Warning: empty credentials were used for S3."
-                    f"\nReason: {e}"
-                    "\nIf the connection failed due to missing permissions"
-                    " (e.g. HTTP error 403), try providing credentials"
-                    " directly with the tensorizer.stream_io.open_stream()"
-                    " function."
-                )
-                s3_access_key_id = s3_access_key_id or ""
-                s3_secret_access_key = s3_access_key_id or ""
 
-        # Regardless of whether the config needed to be parsed,
-        # the endpoint gets a default value based on the operation.
+            if force_http is None and s3.use_https is not None:
+                force_http = not s3.use_https
+        except (ValueError, FileNotFoundError):
+            # TODO: Reimplement this logic somewhere in s3_download
+            #
+            # Credentials may be absent because a public read
+            # bucket is being used, so try blank credentials,
+            # but provide a descriptive warning for future errors
+            # that may occur due to this exception being suppressed.
+            # Don't save the whole exception object since it holds
+            # a stack trace, which can interfere with garbage collection.
+            #
+            # error_context = (
+            #     "Warning: empty credentials were used for S3."
+            #     f"\nReason: {e}"
+            #     "\nIf the connection failed due to missing permissions"
+            #     " (e.g. HTTP error 403), try providing credentials"
+            #     " directly with the tensorizer.stream_io.open_stream()"
+            #     " function."
+            # )
+            pass
+
+        allow_http = False
+        # Try to match boto3's endpoint resolution if an endpoint
+        # hasn't been located yet.
+        #
+        # First, check for the AWS_ENDPOINT_URL environment variables,
+        # otherwise, check if botocore can resolve credentials,
+        # otherwise, use default_s3_write_endpoint and default_s3_read_endpoint.
+        if not s3_endpoint:
+            s3_endpoint = os.environ.get("AWS_ENDPOINT_URL_S3") or None
+            if not s3_endpoint:
+                s3_endpoint = os.environ.get("AWS_ENDPOINT_URL") or None
+            if not s3_endpoint:
+                scoped_config = botocore.session.Session().get_scoped_config()
+                s3_config = scoped_config.get("s3")
+                if s3_config:
+                    s3_endpoint = s3_config.get("endpoint_url") or None
+                if not s3_endpoint:
+                    s3_endpoint = scoped_config.get("endpoint_url") or None
+            if s3_endpoint:
+                # If an endpoint was resolved in this block, don't force its
+                # scheme to HTTPS (to match boto3's default HTTP(S) handling)
+                allow_http = True
+
+        if force_http is None:
+            force_http = False
+
+        # If no endpoint was found in any configs, nor as a parameter,
+        # use a default value based on the operation.
+        if not s3_endpoint:
+            if is_s3_upload:
+                s3_endpoint = default_s3_write_endpoint
+            else:
+                s3_endpoint = default_s3_read_endpoint
+
+        s3_endpoint = _enforce_scheme(
+            s3_endpoint,
+            allow_http,
+            force_http,
+        )
 
         if is_s3_upload:
-            s3_endpoint = s3_endpoint or default_s3_write_endpoint
-
             # delete must be False or the file will be deleted by the OS
             # as soon as it closes, before it can be uploaded on platforms
             # with primitive temporary file support (e.g. Windows)
@@ -1413,37 +1488,36 @@ def open_stream(
                 s3_signature_version,
             )
 
-            # Always run the close + upload procedure
-            # before any code from Python's NamedTemporaryFile wrapper.
-            # It isn't safe to call a bound method from a weakref finalizer,
-            # but calling a weakref finalizer alongside a bound method
-            # creates no problems, other than that the code outside the
-            # finalizer is not guaranteed to be run at any point.
-            # In this case, the weakref finalizer performs all necessary
-            # cleanup itself, but the original NamedTemporaryFile methods
-            # are invoked as well, just in case.
-            wrapped_close = temp_file.close
+            # Create a class dynamically to wrap methods, as __exit__ is always
+            # looked up on the class of an object even if a function with the
+            # same name exists in the instance dictionary.
+            # noinspection PyAbstractClass
+            class S3TemporaryFileWrapper(temp_file.__class__):
+                # Always run the close + upload procedure
+                # before any code from Python's NamedTemporaryFile wrapper.
+                # It isn't safe to call a bound method from a weakref finalizer,
+                # but calling a weakref finalizer alongside a bound method
+                # creates no problems, other than that the code outside the
+                # finalizer is not guaranteed to be run at any point.
+                # In this case, the weakref finalizer performs all necessary
+                # cleanup itself, but the original NamedTemporaryFile methods
+                # are invoked as well, just in case.
+                def close(self):
+                    guaranteed_closer()
+                    return super().close()
 
-            def close_wrapper():
-                guaranteed_closer()
-                return wrapped_close()
+                # Python 3.12+ doesn't call NamedTemporaryFile.close() during
+                # .__exit__(), so it must be wrapped separately.
+                # Since guaranteed_closer is idempotent, it's fine to call it in
+                # both methods, even if both are called back-to-back.
+                def __exit__(self, exc, value, tb):
+                    guaranteed_closer()
+                    return super().__exit__(exc, value, tb)
 
-            # Python 3.12+ doesn't call NamedTemporaryFile.close() during
-            # .__exit__(), so it must be wrapped separately.
-            # Since guaranteed_closer is idempotent, it's fine to call it in
-            # both methods, even if both are called back-to-back.
-            wrapped_exit = temp_file.__exit__
+            temp_file.__class__ = S3TemporaryFileWrapper
 
-            def exit_wrapper(exc, value, tb):
-                guaranteed_closer()
-                return wrapped_exit(exc, value, tb)
-
-            temp_file.close = close_wrapper
-            temp_file.__exit__ = exit_wrapper
-
-            return temp_file
+            return typing.cast(typing.BinaryIO, temp_file)
         else:
-            s3_endpoint = s3_endpoint or default_s3_read_endpoint
             curl_stream_file = s3_download(
                 path_uri,
                 s3_access_key_id,
@@ -1452,7 +1526,6 @@ def open_stream(
                 s3_region_name=s3_region_name,
                 s3_signature_version=s3_signature_version,
                 buffer_size=buffer_size,
-                force_http=force_http,
                 begin=begin,
                 end=end,
                 certificate_handling=certificate_handling,
@@ -1473,6 +1546,8 @@ def open_stream(
                 os.makedirs(os.path.dirname(path_uri), exist_ok=True)
         if buffer_size is None:
             buffer_size = io.DEFAULT_BUFFER_SIZE
-        handle: typing.BinaryIO = open(path_uri, mode, buffering=buffer_size)
+        handle: typing.BinaryIO = typing.cast(
+            typing.BinaryIO, open(path_uri, mode, buffering=buffer_size)
+        )
         handle.seek(begin or 0)
         return handle

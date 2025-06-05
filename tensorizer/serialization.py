@@ -21,6 +21,7 @@ import pathlib
 import queue
 import stat
 import struct
+import sys
 import threading
 import time
 import types
@@ -3506,15 +3507,32 @@ class TensorSerializer:
         raise RuntimeError("pwrite was called before being initialized")
 
     @staticmethod
-    def _mv_suffix(data: "collections.abc.Buffer", start: int):
+    def _mv_slice(data: "collections.abc.Buffer", s: slice):
         if not isinstance(data, memoryview):
             data = memoryview(data)
         try:
             if data.ndim != 1 or data.format != "B":
                 data = data.cast("B")
-            return data[start:]
+            return data[s]
         finally:
             del data
+
+    if sys.platform == "linux":
+        _pwrite_compat = staticmethod(os.pwrite)
+    else:
+
+        @staticmethod
+        def _pwrite_compat(_fd: int, _str, _offset: int, /) -> int:
+            # Some systems error on single I/O calls larger than the maximum
+            # value of a signed 32-bit integer, so limit os.pwrite calls
+            # to a maximum size of about one memory page less than that
+            MAX_LEN: typing.Final[int] = 2147479552
+
+            if TensorSerializer._buffer_size(_str) > MAX_LEN:
+                with TensorSerializer._mv_slice(_str, slice(MAX_LEN)) as mv:
+                    return os.pwrite(_fd, mv, _offset)
+
+            return os.pwrite(_fd, _str, _offset)
 
     def _pwrite_syscall(
         self, data, offset: int, verify: Union[bool, int] = True
@@ -3525,14 +3543,14 @@ class TensorSerializer:
         expected_bytes_written: int = (
             verify if isinstance(verify, int) else self._buffer_size(data)
         )
-        bytes_just_written: int = os.pwrite(self._fd, data, offset)
+        bytes_just_written: int = self._pwrite_compat(self._fd, data, offset)
         if bytes_just_written > 0:
             bytes_written += bytes_just_written
         while bytes_written < expected_bytes_written and bytes_just_written > 0:
             # Writes larger than ~2 GiB may not complete in a single pwrite call
             offset += bytes_just_written
-            with self._mv_suffix(data, bytes_written) as mv:
-                bytes_just_written = os.pwrite(self._fd, mv, offset)
+            with self._mv_slice(data, slice(bytes_written, None)) as mv:
+                bytes_just_written = self._pwrite_compat(self._fd, mv, offset)
             if bytes_just_written > 0:
                 bytes_written += bytes_just_written
         if isinstance(verify, int) or verify:
@@ -3553,7 +3571,7 @@ class TensorSerializer:
         if bytes_just_written > expected_bytes_written:
             raise ValueError("Wrote more data than expected")
         while bytes_written < expected_bytes_written and bytes_just_written > 0:
-            with self._mv_suffix(data, bytes_written) as mv:
+            with self._mv_slice(data, slice(bytes_written, None)) as mv:
                 bytes_just_written = self._file.write(mv)
             bytes_written += bytes_just_written
         return bytes_written

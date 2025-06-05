@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+[Unreleased]
+
+### Added
+
+- `stream_io.open_stream()` now respects Boto3's configuration files
+  and environment variables when searching for object storage credentials to use
+
+### Fixed
+
+- `stream_io.open_stream()` now uses virtual-hosted-style
+  bucket addressing for the `cwobject.com` and `cwlota.com` endpoints
+- `stream_io.open_stream()` now allows the `use_https` entry of `.s3cfg`
+  configuration files to fill in its `force_http` parameter if `force_http` is
+  not explicitly specified as `True` or `False`
+- `TensorSerializer` no longer throws an error when attempting to serialize
+  very large tensors on some non-Linux platforms
+- Object storage uploads managed by `stream_io.open_stream()` now finalize
+  correctly on Python 3.12+ even without an explicit call to their `close()`
+  method
+  - A fix for this was originally implemented in release 2.7.2,
+    but it only worked for Python versions below 3.12
+
 [2.9.3] - 2025-05-09
 
 ### Changed
@@ -424,6 +446,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.9.3...HEAD
 [2.9.3]: https://github.com/coreweave/tensorizer/compare/v2.9.2...v2.9.3
 [2.9.2]: https://github.com/coreweave/tensorizer/compare/v2.9.1...v2.9.2
 [2.9.1]: https://github.com/coreweave/tensorizer/compare/v2.9.0...v2.9.1
