@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not explicitly specified as `True` or `False`
 - `TensorSerializer` no longer throws an error when attempting to serialize
   very large tensors on some non-Linux platforms
+- Object storage uploads managed by `stream_io.open_stream()` now finalize
+  correctly on Python 3.12+ even without an explicit call to their `close()`
+  method
+  - A fix for this was originally implemented in release 2.7.2,
+    but it only worked for Python versions below 3.12
 
 [2.9.3] - 2025-05-09
 
