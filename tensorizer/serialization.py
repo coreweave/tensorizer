@@ -1928,9 +1928,13 @@ class TensorDeserializer(
         fd: Optional[int] = None
         if hasattr(self._file, "fileno"):
             # This should cover any case where _file_spec is an int, as well
-            fd = self._file.fileno()
-            if not isinstance(fd, int) or fd < 0:
-                fd = None
+            try:
+                fd = self._file.fileno()
+            except io.UnsupportedOperation:
+                pass
+            else:
+                if not isinstance(fd, int) or fd < 0:
+                    fd = None
         if fd is not None:
             # If it is a regular file, we can try to re-open it
             true_stat = os.stat(fd)
@@ -3393,7 +3397,10 @@ class TensorSerializer:
 
         # Get information about the file object's capabilities
         _fd_getter = getattr(self._file, "fileno", None)
-        self._fd = _fd_getter() if callable(_fd_getter) else None
+        try:
+            self._fd = _fd_getter() if callable(_fd_getter) else None
+        except io.UnsupportedOperation:
+            self._fd = None
         _seekable_getter = getattr(self._file, "seekable", None)
         self._seekable = (
             _seekable_getter() if callable(_seekable_getter) else True
