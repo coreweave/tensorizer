@@ -4,6 +4,7 @@ import enum
 import functools
 import gc
 import hashlib
+import io
 import itertools
 import logging
 import os
@@ -1270,6 +1271,136 @@ class TestDeserialization(unittest.TestCase):
                 self, deserialized, model_name, allow_subset=True
             )
             deserialized.close()
+
+    @unittest.skipUnless(
+        torch.cuda.device_count() >= 2, reason="Requires multiple devices"
+    )
+    def test_cuda_non_default_device(self):
+        # This test is written based on this assumption
+        self.assertEqual(torch.cuda.current_device(), 0)
+        d0 = torch.device("cuda", 0)
+        d1 = torch.device("cuda", 1)
+        cd0 = torch.cuda.device(0)
+        cd1 = torch.cuda.device(1)
+        sd_cpu = [torch.zeros(1, device="cpu"), torch.ones(1, device="cpu")]
+        sd_0 = [t.to(d0) for t in sd_cpu]
+        sd_1 = [t.to(d1) for t in sd_cpu]
+
+        with io.BytesIO() as file:
+            serializer = TensorSerializer(file)
+            serializer.write_state_dict(sd_cpu)
+            serializer.close()
+            file.seek(0)
+
+            def enter(contexts: typing.Any):
+                if not isinstance(contexts, tuple):
+                    return contexts
+                stack = contextlib.ExitStack()
+                for c in contexts:
+                    stack.enter_context(c)
+                return stack
+
+            default = contextlib.nullcontext()
+            cpu = torch.device("cpu")
+            generic = torch.device("cuda")
+            # All these contexts should be equivalent to default behaviour
+            for ctx in (default, cpu, generic, d0, cd0, (d0, cd1), (cd1, d0)):
+                with self.subTest(ctx=ctx), enter(ctx):
+                    with TensorDeserializer(file, device=None) as sd:
+                        self.assertListEqual(sd.tree(), sd_0)
+                    with TensorDeserializer(file, device="cuda") as sd:
+                        self.assertListEqual(sd.tree(), sd_0)
+                    with TensorDeserializer(file, device=d0) as sd:
+                        self.assertListEqual(sd.tree(), sd_0)
+                    with TensorDeserializer(file, device=d1) as sd:
+                        self.assertListEqual(sd.tree(), sd_1)
+                    with TensorDeserializer(file, device="cpu") as sd:
+                        self.assertListEqual(sd.tree(), sd_cpu)
+            # All these contexts should resolve to device 1
+            # if and only if no device index is specified
+            for ctx in (
+                d1,
+                cd1,
+                (d1, cd0),
+                (cd0, d1),
+                (generic, cd1),
+                (cd1, generic),
+            ):
+                with self.subTest(ctx=ctx), enter(ctx):
+                    with TensorDeserializer(file, device=None) as sd:
+                        self.assertListEqual(sd.tree(), sd_1)
+                    with TensorDeserializer(file, device="cuda") as sd:
+                        self.assertListEqual(sd.tree(), sd_1)
+                    with TensorDeserializer(file, device=d0) as sd:
+                        self.assertListEqual(sd.tree(), sd_0)
+                    with TensorDeserializer(file, device=d1) as sd:
+                        self.assertListEqual(sd.tree(), sd_1)
+                    with TensorDeserializer(file, device="cpu") as sd:
+                        self.assertListEqual(sd.tree(), sd_cpu)
+
+    @unittest.skipUnless(is_cuda_available, reason="Requires CUDA")
+    def test_cuda_device_selection(self):
+        device = serialization._resolve_cuda_device
+        self.assertEqual(device(), torch.device("cuda", 0))
+
+        with self.subTest("Testing multiple-device selection"):
+            if torch.cuda.device_count() < 2:
+                self.skipTest(
+                    "Testing multiple-device selection"
+                    " requires multiple devices"
+                )
+            # torch.device() contexts
+            d0 = torch.device("cuda", 0)
+            d1 = torch.device("cuda", 1)
+            # Single contexts
+            with d0:
+                self.assertEqual(device(), d0)
+            with d1:
+                self.assertEqual(device(), d1)
+            # Nested contexts
+            with d0, d1:
+                self.assertEqual(device(), d1)
+            with d1, d0:
+                self.assertEqual(device(), d0)
+
+            # torch.cuda.device() contexts
+            cd0 = torch.cuda.device(0)
+            cd1 = torch.cuda.device(1)
+            # Single contexts
+            with cd0:
+                self.assertEqual(device(), d0)
+            with cd1:
+                self.assertEqual(device(), d1)
+            # Nested contexts
+            with cd0, cd1:
+                self.assertEqual(device(), d1)
+            with cd1, cd0:
+                self.assertEqual(device(), d0)
+
+            # Mixed torch.device() and torch.cuda.device() contexts
+            # torch.device("cuda") should defer to torch.cuda.device(),
+            # as should any non-CUDA device
+            for dev in (torch.device("cuda"), torch.device("cpu")):
+                with dev, cd0:
+                    self.assertEqual(device(), d0)
+                with dev, cd1:
+                    self.assertEqual(device(), d1)
+                # Order shouldn't matter
+                with cd0, dev:
+                    self.assertEqual(device(), d0)
+                with cd1, dev:
+                    self.assertEqual(device(), d1)
+            # torch.device("cuda:X") with an index should take priority
+            # over torch.cuda.device()
+            with d0, cd1:
+                self.assertEqual(device(), d0)
+            with d1, cd0:
+                self.assertEqual(device(), d1)
+            # Order shouldn't matter
+            with cd1, d0:
+                self.assertEqual(device(), d0)
+            with cd0, d1:
+                self.assertEqual(device(), d1)
 
 
 def mock_invalid_tensor_hash(*args, **kwargs):
