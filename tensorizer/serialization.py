@@ -1631,11 +1631,15 @@ class TensorDeserializer(
                 )
             if is_cuda:
                 self._preload_cuda()
-            if is_cuda and device.index is None:
+            underspecified_device: bool = is_cuda and device.index is None
+            if underspecified_device:
                 # The device context is lost to new worker threads, so if the
                 # device is "cuda" with no index, find the correct device index
                 # in advance from this thread.
                 self._device = _resolve_cuda_device()
+            # Underspecified CUDA device selections will be reëvaluated
+            # right before load-time when lazy-loading
+            self._device_is_dynamic: bool = underspecified_device and lazy_load
 
             self._verify_hash = verify_hash
             if encryption is not None and not isinstance(
@@ -2802,6 +2806,11 @@ class TensorDeserializer(
         keys = sorted(keys, key=self._keys_enumerated.__getitem__)
         if any(itertools.starmap(operator.eq, zip(keys, keys[1:]))):
             raise ValueError("Keys must not have any duplicates")
+
+        if self._device_is_dynamic:
+            # Update the active device if it was originally
+            # specified without an index
+            self._device = _resolve_cuda_device()
 
         if verify_hash is None:
             verify_hash = self._verify_hash

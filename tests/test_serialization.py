@@ -1294,12 +1294,17 @@ class TestDeserialization(unittest.TestCase):
             del buffer.close
             file_bytes: bytes = buffer.getvalue()
 
-        def deserialize(*args, **kwargs):
+        @contextlib.contextmanager
+        def deserializer(*args, **kwargs):
             with io.BytesIO(file_bytes) as file:
                 with TensorDeserializer(
                     file, *args, num_readers=1, **kwargs
                 ) as deserialized:
-                    return deserialized.tree()
+                    yield deserialized
+
+        def deserialize(*args, **kwargs):
+            with deserializer(*args, **kwargs) as _deserializer:
+                return _deserializer.tree()
 
         def enter(contexts: typing.Any):
             if not isinstance(contexts, tuple):
@@ -1336,6 +1341,29 @@ class TestDeserialization(unittest.TestCase):
                 self.assertListEqual(deserialize(device=d0), sd_0)
                 self.assertListEqual(deserialize(device=d1), sd_1)
                 self.assertListEqual(deserialize(device="cpu"), sd_cpu)
+
+        with self.subTest("Testing lazy-loaded device selection"):
+            # These should load to the correct device as long as
+            # it is selected before loading actually takes place
+            with deserializer(device=None, lazy_load=True) as de, d0:
+                self.assertListEqual(de.tree(), sd_0)
+            with d0, deserializer(device=None, lazy_load=True) as de:
+                self.assertListEqual(de.tree(), sd_0)
+
+            with deserializer(device=None, lazy_load=True) as de, d1:
+                self.assertListEqual(de.tree(), sd_1)
+            with d1, deserializer(device=None, lazy_load=True) as de:
+                self.assertListEqual(de.tree(), sd_1)
+
+            # It should be possible to load a single file
+            # across multiple devices
+            with deserializer(device=None, lazy_load=True) as de:
+                with d0:
+                    t0 = de[0]
+                with d1:
+                    t1 = de[1]
+            self.assertTupleEqual((t0.device, t1.device), (d0, d1))
+            self.assertListEqual([t0.to("cpu"), t1.to("cpu")], sd_cpu)
 
     @unittest.skipUnless(is_cuda_available, reason="Requires CUDA")
     def test_cuda_device_selection(self):
