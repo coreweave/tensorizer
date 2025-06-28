@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.1] - 2025-06-27
+
+### Fixed
+
+- `TensorDeserializer` objects now respect CUDA devices chosen with the
+  `torch.device()` and `torch.cuda.device()` context managers
+  - Previously, the `device` parameter to the `TensorDeserializer` constructor
+    was the only way to choose between multiple CUDA devices
+    (e.g. `cuda:0`, `cuda:1`)
+  - Now, when a device with no index is specified, such as
+    `device=torch.device("cuda")`, `device="cuda"`, or even `device=None`,
+    the local device context is used to select the device
+  - `torch.cuda.set_device()` and `torch.set_default_device()`
+    are also supported
+  - This doesn't add support for detecting CPU contexts such as
+    `torch.device("cpu")` without explicitly specifying `device="cpu"`
+    - This is for backwards compatibility, as the `TensorDeserializer`
+      default device has always been mandated to be CUDA whenever CUDA
+      is available, and `torch` does not provide a public interface to
+      reliably disambiguate an intentional `torch.device("cpu")` context
+      from the global default
+  - Lazy-loaded tensors will use the active device as of the time
+    they are actually loaded
+- `TensorDeserializer` objects no longer fail to open file-like objects
+  whose `fileno()` methods raise `io.UnsupportedOperation`
+
 ## [2.10.0] - 2025-06-09
 
 ### Added
@@ -446,6 +472,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[2.10.1]: https://github.com/coreweave/tensorizer/compare/v2.10.0...v2.10.1
 [2.10.0]: https://github.com/coreweave/tensorizer/compare/v2.9.3...v2.10.0
 [2.9.3]: https://github.com/coreweave/tensorizer/compare/v2.9.2...v2.9.3
 [2.9.2]: https://github.com/coreweave/tensorizer/compare/v2.9.1...v2.9.2

@@ -1,6 +1,6 @@
 ##############################################################################
-# serialization.py                                                   Wes Brown
-# Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
+# serialization.py                                         Wes Brown, Eta Syra
+# Fast torch module/model serialization/deserialization     (c) 2025 Coreweave
 ##############################################################################
 import abc
 import bisect
@@ -1416,6 +1416,86 @@ class _KeyDerivation:
         self._cache.clear()
 
 
+def _resolve_device_by_context() -> Optional[torch.device]:
+    # Resolve the device set by context managers like torch.device.
+    # This may instead return the global default device if it was
+    # configured and there is no other context-local device active.
+    try:
+        # This logic works from torch v1.13.0 through at least v2.7.1
+        # noinspection PyProtectedMember
+        get_mode = torch.overrides._get_current_function_mode
+        local_mode = get_mode()
+        if local_mode is not None:
+            return local_mode.device
+        else:
+            return None
+    except (TypeError, AttributeError):
+        # If the above logic isn't available (since it relies on
+        # implementation details), create a test tensor to find
+        # the current device.
+        # Warning: if CUDA is not initialized, but this is in
+        # a CUDA context, this code path will be slow.
+        return torch.empty(0).device
+
+
+def _resolve_cuda_device() -> torch.device:
+    """
+    Resolve the contextually active CUDA device.
+
+    The precedence for CUDA device contexts here is:
+
+    #. ``torch.device()`` context managers
+    #. ``torch.set_default_device()`` defaults
+    #. ``torch.cuda.current_device()`` / ``torch.cuda.device()`` contexts
+
+
+    This is slightly different from torch's own precedence, which is weirder:
+
+    #. If ``device=None`` in a function call:
+
+       #. ``torch.device()`` context managers
+       #. ``torch.set_default_device()`` defaults
+
+    #. If ``device="cuda"`` in a function call or from the previous step:
+
+       #. ``torch.cuda.current_device()`` / ``torch.cuda.device()`` contexts
+
+
+    Note that in torch, ``device="cuda"`` ignores the local ``torch.device()``
+    context, but respects the local ``torch.cuda.device()`` context.
+    This is not the case here, where ``device="cuda"`` respects either.
+
+    Both in torch and here, if ``device=None`` but the local ``torch.device()``
+    or ``torch.set_default_device()`` contexts are ``"cuda"`` without an index,
+    then the index is determined according to ``torch.cuda.current_device()``,
+    the same as if ``device="cuda"`` had been passed.
+
+    This function makes every attempt to not initialize CUDA
+    if it is not already initialized, since that is slow (~600 ms).
+
+    Notes:
+        This should not be called if CUDA is not available.
+
+    Returns:
+        The active CUDA device.
+    """
+    if (
+        (local_device := _resolve_device_by_context()) is not None
+        and local_device.type == "cuda"
+        and local_device.index is not None
+    ):
+        # Only rely on this if it resolves a specific CUDA device.
+        return local_device
+    elif torch.cuda.is_initialized():
+        # If CUDA is already initialized, then this is cheap to query.
+        return torch.device("cuda", torch.cuda.current_device())
+    else:
+        # Any call to torch.cuda.set_device() will initialize CUDA,
+        # so if it is not initialized then the current device must
+        # be the default, cuda:0.
+        return torch.device("cuda", 0)
+
+
 class TensorDeserializer(
     collections.abc.Mapping, contextlib.AbstractContextManager
 ):
@@ -1551,6 +1631,15 @@ class TensorDeserializer(
                 )
             if is_cuda:
                 self._preload_cuda()
+            underspecified_device: bool = is_cuda and device.index is None
+            if underspecified_device:
+                # The device context is lost to new worker threads, so if the
+                # device is "cuda" with no index, find the correct device index
+                # in advance from this thread.
+                self._device = _resolve_cuda_device()
+            # Underspecified CUDA device selections will be reëvaluated
+            # right before load-time when lazy-loading
+            self._device_is_dynamic: bool = underspecified_device and lazy_load
 
             self._verify_hash = verify_hash
             if encryption is not None and not isinstance(
@@ -1843,9 +1932,13 @@ class TensorDeserializer(
         fd: Optional[int] = None
         if hasattr(self._file, "fileno"):
             # This should cover any case where _file_spec is an int, as well
-            fd = self._file.fileno()
-            if not isinstance(fd, int) or fd < 0:
-                fd = None
+            try:
+                fd = self._file.fileno()
+            except io.UnsupportedOperation:
+                pass
+            else:
+                if not isinstance(fd, int) or fd < 0:
+                    fd = None
         if fd is not None:
             # If it is a regular file, we can try to re-open it
             true_stat = os.stat(fd)
@@ -2714,6 +2807,11 @@ class TensorDeserializer(
         if any(itertools.starmap(operator.eq, zip(keys, keys[1:]))):
             raise ValueError("Keys must not have any duplicates")
 
+        if self._device_is_dynamic:
+            # Update the active device if it was originally
+            # specified without an index
+            self._device = _resolve_cuda_device()
+
         if verify_hash is None:
             verify_hash = self._verify_hash
 
@@ -3308,7 +3406,10 @@ class TensorSerializer:
 
         # Get information about the file object's capabilities
         _fd_getter = getattr(self._file, "fileno", None)
-        self._fd = _fd_getter() if callable(_fd_getter) else None
+        try:
+            self._fd = _fd_getter() if callable(_fd_getter) else None
+        except io.UnsupportedOperation:
+            self._fd = None
         _seekable_getter = getattr(self._file, "seekable", None)
         self._seekable = (
             _seekable_getter() if callable(_seekable_getter) else True
