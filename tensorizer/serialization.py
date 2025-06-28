@@ -1,6 +1,6 @@
 ##############################################################################
-# serialization.py                                                   Wes Brown
-# Fast torch module/model serialization/deserialization     (c) 2023 Coreweave
+# serialization.py                                         Wes Brown, Eta Syra
+# Fast torch module/model serialization/deserialization     (c) 2025 Coreweave
 ##############################################################################
 import abc
 import bisect
