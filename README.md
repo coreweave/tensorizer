@@ -487,10 +487,13 @@ numpy, which doesn't change any of the underlying data. When serialized, the
 original `bfloat16` datatype string is also saved so that it will be cast back
 to `bfloat16` during the deserialization process.
 
-The `complex32` datatype is supported in a similar way, by casting to `int32`.
-The quantized datatypes (`qint8`, `qint32`, etc.) are not currently supported
-by tensorizer as they would require supplemental quantization parameters to be
-deserialized correctly.
+The `complex32` datatype is supported in a similar way, by casting to `int32`,
+as are PyTorch's native `float8_*` datatypes
+(`float8_e5m2`, `float8_e4m3fn`, etc.).
+
+The only native Pytorch datatypes that are not currently supported are the
+deprecated quantized int datatypes (`qint8`, `qint32`, etc.), as they require
+supplemental quantization parameters to be deserialized correctly.
 
 **NOTE:** The exact choice of intermediate types as `int16` and `int32` is
 considered an implementation detail, and is subject to change,
