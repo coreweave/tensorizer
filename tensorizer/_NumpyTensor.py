@@ -42,6 +42,33 @@ _ALL_TYPES = {
         "bfloat16",
         "quint4x2",
         "quint2x4",
+        "bits1x8",
+        "bits2x4",
+        "bits4x2",
+        "bits8",
+        "bits16",
+        "float8_e5m2",
+        "float8_e4m3fn",
+        "float8_e5m2fnuz",
+        "float8_e4m3fnuz",
+        "uint16",
+        "uint32",
+        "uint64",
+        "uint1",
+        "uint2",
+        "uint3",
+        "uint4",
+        "uint5",
+        "uint6",
+        "uint7",
+        "int1",
+        "int2",
+        "int3",
+        "int4",
+        "int5",
+        "int6",
+        "int7",
+        "float8_e8m0fnu",
     )
     if isinstance(v := getattr(torch, t, None), torch.dtype)
 }
@@ -60,12 +87,38 @@ _ASYMMETRIC_TYPES = {
         "torch.quint4x2",
         "torch.quint2x4",
         "torch.complex32",
+        "torch.bits1x8",
+        "torch.bits2x4",
+        "torch.bits4x2",
+        "torch.bits8",
+        "torch.bits16",
+        "torch.float8_e5m2",
+        "torch.float8_e4m3fn",
+        "torch.float8_e5m2fnuz",
+        "torch.float8_e4m3fnuz",
+        "torch.uint1",
+        "torch.uint2",
+        "torch.uint3",
+        "torch.uint4",
+        "torch.uint5",
+        "torch.uint6",
+        "torch.uint7",
+        "torch.int1",
+        "torch.int2",
+        "torch.int3",
+        "torch.int4",
+        "torch.int5",
+        "torch.int6",
+        "torch.int7",
+        "torch.float8_e8m0fnu",
     }
     & _ALL_TYPES.keys()
 }
 
 # These types aren't supported yet because they require supplemental
 # quantization parameters to deserialize correctly
+# These are deprecated in PyTorch. They do not plan to add further dtypes
+# that require extra metadata to be valid as these do
 _UNSUPPORTED_TYPES = {
     _ALL_TYPES[t]
     for t in {
@@ -264,10 +317,10 @@ class _NumpyTensor(NamedTuple):
         """
         A check to see if the dtype needs to be swapped while encoding,
         based on whether numpy has a corresponding dtype or not.
-        This check is hardcoded, not dynamic, but up to date as of torch 2.0.
+        This check is hardcoded, not dynamic, but up to date as of torch 2.7.
 
         Args:
-            dtype: The torch dtype to check
+            torch_dtype: The torch dtype to check
 
         Returns:
             True if a class is known not to have a corresponding numpy dtype,
