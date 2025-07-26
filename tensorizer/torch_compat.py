@@ -32,25 +32,27 @@ Example:
 """
 
 import contextlib
-import contextvars
 import functools
 import io
+import logging
 import os
 import pickle
 import threading
 import types
 import typing
+from contextvars import ContextVar
 from typing import Final, Optional, Tuple
 
 import torch
 
-from . import TensorDeserializer, TensorSerializer
+from .serialization import TensorDeserializer, TensorSerializer
 
 __all__ = (
     "tensorizer_saving",
     "tensorizer_loading",
 )
 
+logger = logging.getLogger(__name__)
 
 _tensorizer_file_obj_type: "typing.TypeAlias" = typing.Union[
     io.BufferedIOBase,
@@ -67,16 +69,25 @@ _wrapper_file_obj_type: "typing.TypeAlias" = typing.Union[
     typing.Callable[[torch.types.FileLike], _tensorizer_file_obj_type],
 ]
 
-_tensorizer_filename: contextvars.ContextVar[
-    Optional[_wrapper_file_obj_type]
-] = contextvars.ContextVar("_tensorizer_filename", default=None)
+_save_func_type: "typing.TypeAlias" = typing.Callable[
+    [_tensorizer_file_obj_type, typing.Iterable[torch.Tensor], dict],
+    typing.Any,
+]
 
-_tensorizer_deserializer_kwargs: contextvars.ContextVar[Optional[dict]] = (
-    contextvars.ContextVar("_tensorizer_deserializer_kwargs", default=None)
+_load_func_type: "typing.TypeAlias" = typing.Callable[
+    [_tensorizer_file_obj_type, dict], typing.Iterable[torch.Tensor]
+]
+
+_tensorizer_filename: ContextVar[Optional[_wrapper_file_obj_type]] = ContextVar(
+    "_tensorizer_filename", default=None
 )
 
-_tensorizer_serializer_kwargs: contextvars.ContextVar[Optional[dict]] = (
-    contextvars.ContextVar("_tensorizer_serializer_kwargs", default=None)
+_tensorizer_deserializer_kwargs: ContextVar[Optional[dict]] = ContextVar(
+    "_tensorizer_deserializer_kwargs", default=None
+)
+
+_tensorizer_serializer_kwargs: ContextVar[Optional[dict]] = ContextVar(
+    "_tensorizer_serializer_kwargs", default=None
 )
 
 
@@ -132,18 +143,23 @@ class _TensorizerPickler(pickle.Pickler):
         if self.__tensors:
             if self.__filename is None:
                 self.__tensors.clear()
-                self.__tensor_idx = 0
+                self.__tensor_ids.clear()
                 return
             kwargs = _tensorizer_serializer_kwargs.get()
             if kwargs is None:
                 kwargs = {}
-            serializer = TensorSerializer(self.__filename, **kwargs)
             try:
-                serializer.write_state_dict(self.__tensors)
-                serializer.close()
+                if (save_func := _save_wrapper_save_func.get()) is None:
+                    serializer = TensorSerializer(self.__filename, **kwargs)
+                    serializer.write_state_dict(self.__tensors)
+                    serializer.close()
+                else:
+                    save_func(self.__filename, self.__tensors, kwargs)
             finally:
-                self.__tensors.clear()
-                self.__tensor_idx = 0
+                # Don't call .clear() on self.__tensors in case it was saved
+                # somewhere by save_func
+                self.__tensors = []
+                self.__tensor_ids.clear()
 
     @staticmethod
     def __storage_to_tensor(
@@ -211,8 +227,13 @@ class _TensorizerUnpickler(pickle.Unpickler):
             kwargs = _tensorizer_deserializer_kwargs.get()
             if kwargs is None:
                 kwargs = {}
-            with TensorDeserializer(self.__filename, **kwargs) as deserializer:
-                self.__tensors = deserializer.tree()
+            if (load_func := _load_wrapper_load_func.get()) is None:
+                with TensorDeserializer(
+                    self.__filename, **kwargs
+                ) as deserializer:
+                    self.__tensors = deserializer.tree()
+            else:
+                self.__tensors = list(load_func(self.__filename, kwargs))
         try:
             return super().load()
         finally:
@@ -299,6 +320,13 @@ _ORIG_TORCH_LOAD: Final[callable] = torch.load
 
 
 def _infer_tensor_ext_name(f: torch.types.FileLike):
+    if isinstance(f, io.BytesIO):
+        logger.warning(
+            "Cannot infer .tensors location from io.BytesIO;"
+            " not using tensorizer backend"
+            " (set the file_obj parameter to choose a location instead)"
+        )
+        return None
     filename: str
     try:
         filename = os.fsdecode(f)
@@ -325,21 +353,27 @@ def _contextual_torch_filename(f: torch.types.FileLike):
             _tensorizer_filename.reset(token)
 
 
-_save_wrapper_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
+_save_wrapper_active: ContextVar[bool] = ContextVar(
     "_save_wrapper_active", default=False
 )
 _save_wrapper_active_count: int = 0
 _save_wrapper_active_mutex: threading.Lock = threading.Lock()
 _save_wrapper_wrapped: Optional[callable] = None
+_save_wrapper_save_func: ContextVar[Optional[_save_func_type]] = ContextVar(
+    "_save_wrapper_save_func", default=None
+)
 
-_load_wrapper_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
+_load_wrapper_active: ContextVar[bool] = ContextVar(
     "_load_wrapper_active", default=False
 )
 _load_wrapper_active_count: int = 0
 _load_wrapper_active_mutex: threading.Lock = threading.Lock()
 _load_wrapper_wrapped: Optional[callable] = None
+_load_wrapper_load_func: ContextVar[Optional[_load_func_type]] = ContextVar(
+    "_load_wrapper_load_func", default=None
+)
 
-_suppress_weights_only: contextvars.ContextVar[bool] = contextvars.ContextVar(
+_suppress_weights_only: ContextVar[bool] = ContextVar(
     "_suppress_weights_only", default=False
 )
 
@@ -410,7 +444,10 @@ def _load_wrapper(
 
 @contextlib.contextmanager
 def tensorizer_saving(
-    file_obj: Optional[_wrapper_file_obj_type] = None, **kwargs
+    file_obj: Optional[_wrapper_file_obj_type] = None,
+    *,
+    save_func: Optional[_save_func_type] = None,
+    **kwargs,
 ):
     """
     Context manager that modifies calls to ``torch.save`` to use tensorizer
@@ -435,6 +472,15 @@ def tensorizer_saving(
             the type ``torch.types.FileLike``, and output a type accepted
             by a `TensorSerializer`. The default behaviour is to use a callable
             that appends ``".tensors"`` to any filename passed as ``f``.
+            If a provided callable returns ``None``, tensorizer deserialization
+            is not used.
+        save_func: An optional callable with the signature
+            ``save_func(file_obj, tensors: Iterable[Tensor], kwargs: dict)``
+            that may be used to override the default saving logic for tensors.
+            `file_obj` and `kwargs` correspond to the ones passed to this
+            function. This may be used, for instance, to make serialization
+            asynchronous by writing a `save_func` that serializes in
+            a background thread or process.
         **kwargs: Further keyword arguments to pass to the `TensorSerializer`
             object used to save tensor data.
     """
@@ -442,6 +488,7 @@ def tensorizer_saving(
     active_token = _save_wrapper_active.set(True)
     kwargs_token = _tensorizer_serializer_kwargs.set(kwargs)
     filename_token = _tensorizer_filename.set(file_obj)
+    save_func_token = _save_wrapper_save_func.set(save_func)
     with _save_wrapper_active_mutex:
         _save_wrapper_active_count += 1
         if _save_wrapper_active_count == 1:
@@ -456,6 +503,7 @@ def tensorizer_saving(
                 assert _save_wrapper_wrapped is not None
                 torch.save = _save_wrapper_wrapped
                 _save_wrapper_wrapped = None
+        _save_wrapper_save_func.reset(save_func_token)
         _tensorizer_filename.reset(filename_token)
         _tensorizer_serializer_kwargs.reset(kwargs_token)
         _save_wrapper_active.reset(active_token)
@@ -465,6 +513,7 @@ def tensorizer_saving(
 def tensorizer_loading(
     file_obj: Optional[_wrapper_file_obj_type] = None,
     *,
+    load_func: Optional[_load_func_type] = None,
     suppress_weights_only: bool = False,
     **kwargs,
 ):
@@ -493,7 +542,19 @@ def tensorizer_loading(
             argument of the type ``torch.types.FileLike``, and output a type
             accepted by a `TensorDeserializer`. The default behaviour is to use
             a callable that appends ``".tensors"`` to any filename passed as
-            ``f``.
+            ``f``. If a provided callable returns ``None``, tensorizer
+            serialization is not used.
+        load_func: An optional callable with the signature
+            ``load_func(file_obj, kwargs: dict) -> Iterable[Tensor]``
+            that may be used to override the default loading logic for tensors.
+            `file_obj` and `kwargs` correspond to the ones passed to this
+            function.
+        suppress_weights_only: If set to ``True``, replace ``weights_only=True``
+            with ``weights_only=False`` in calls to ``torch.load`` within this
+            context. Using ``torch.load`` with tensorizer as a backend is
+            incompatible with ``weights_only=True`` because ``torch`` counts it
+            using a custom ``pickle_module`` as being a non-weights-only load,
+            even though tensorizer only loads weights in practice.
         **kwargs: Further keyword arguments to pass to the `TensorDeserializer`
             object used to load tensor data.
     """
@@ -502,6 +563,7 @@ def tensorizer_loading(
     weights_token = _suppress_weights_only.set(suppress_weights_only)
     kwargs_token = _tensorizer_deserializer_kwargs.set(kwargs)
     filename_token = _tensorizer_filename.set(file_obj)
+    load_func_token = _load_wrapper_load_func.set(load_func)
     with _load_wrapper_active_mutex:
         _load_wrapper_active_count += 1
         if _load_wrapper_active_count == 1:
@@ -516,6 +578,7 @@ def tensorizer_loading(
                 assert _load_wrapper_wrapped is not None
                 torch.load = _load_wrapper_wrapped
                 _load_wrapper_wrapped = None
+        _load_wrapper_load_func.reset(load_func_token)
         _tensorizer_filename.reset(filename_token)
         _tensorizer_deserializer_kwargs.reset(kwargs_token)
         _suppress_weights_only.reset(weights_token)
