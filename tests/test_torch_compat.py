@@ -406,6 +406,7 @@ class TestTorchCompat(unittest.TestCase):
             if not _path.exists():
                 self.addCleanup(_path.unlink, missing_ok=True)
             file_obj = _path.open("rb" if _path.exists() else "wb+")
+            self.addCleanup(file_obj.close)
             return typing.cast(io.BufferedIOBase, file_obj)
 
         with tensorizer_saving(path_callback):
