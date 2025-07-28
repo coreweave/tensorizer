@@ -41,7 +41,7 @@ import threading
 import types
 import typing
 from contextvars import ContextVar
-from typing import Final, Optional, Tuple
+from typing import Any, Callable, Final, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -54,7 +54,7 @@ __all__ = (
 
 logger = logging.getLogger(__name__)
 
-_tensorizer_file_obj_type: "typing.TypeAlias" = typing.Union[
+_tensorizer_file_obj_type: "typing.TypeAlias" = Union[
     io.BufferedIOBase,
     io.RawIOBase,
     typing.BinaryIO,
@@ -64,18 +64,22 @@ _tensorizer_file_obj_type: "typing.TypeAlias" = typing.Union[
     int,
 ]
 
-_wrapper_file_obj_type: "typing.TypeAlias" = typing.Union[
+_wrapper_file_obj_type: "typing.TypeAlias" = Union[
     _tensorizer_file_obj_type,
-    typing.Callable[[torch.types.FileLike], _tensorizer_file_obj_type],
+    Callable[[torch.types.FileLike], _tensorizer_file_obj_type],
 ]
 
-_save_func_type: "typing.TypeAlias" = typing.Callable[
-    [_tensorizer_file_obj_type, typing.Iterable[torch.Tensor], dict],
-    typing.Any,
+_save_func_type: "typing.TypeAlias" = Callable[
+    [_tensorizer_file_obj_type, Iterable[torch.Tensor], dict],
+    Any,
 ]
 
-_load_func_type: "typing.TypeAlias" = typing.Callable[
-    [_tensorizer_file_obj_type, dict], typing.Iterable[torch.Tensor]
+_load_func_type: "typing.TypeAlias" = Callable[
+    [_tensorizer_file_obj_type, dict], Iterable[torch.Tensor]
+]
+
+_storage_type: "typing.TypeAlias" = Union[
+    torch.UntypedStorage, torch.TypedStorage
 ]
 
 _tensorizer_filename: ContextVar[Optional[_wrapper_file_obj_type]] = ContextVar(
@@ -91,25 +95,21 @@ _tensorizer_serializer_kwargs: ContextVar[Optional[dict]] = ContextVar(
 )
 
 
-def _storage_device(
-    storage: typing.Union[torch.UntypedStorage, torch.TypedStorage],
-) -> torch.device:
+def _storage_device(storage: _storage_type) -> torch.device:
     if isinstance(storage, torch.TypedStorage):
         return getattr(storage, "_untyped_storage", storage).device
     else:
         return storage.device
 
 
-def _has_data(
-    storage: typing.Union[torch.UntypedStorage, torch.TypedStorage],
-) -> bool:
+def _has_data(storage: _storage_type) -> bool:
     maybe_untyped = getattr(storage, "_untyped_storage", storage)
     return maybe_untyped.device.type != "meta" and maybe_untyped.data_ptr() != 0
 
 
 class _TensorizerPickler(pickle.Pickler):
     __filename: Optional[_tensorizer_file_obj_type]
-    __tensors: typing.List[torch.Tensor]
+    __tensors: List[torch.Tensor]
     __tensor_ids: typing.Dict[Tuple[typing.Hashable, ...], int]
 
     def __init__(self, *args, **kwargs):
@@ -162,9 +162,7 @@ class _TensorizerPickler(pickle.Pickler):
                 self.__tensor_ids.clear()
 
     @staticmethod
-    def __storage_to_tensor(
-        storage: typing.Union[torch.UntypedStorage, torch.TypedStorage],
-    ) -> torch.Tensor:
+    def __storage_to_tensor(storage: _storage_type) -> torch.Tensor:
         # Convert a storage into an equivalent tensor
         # for compatibility with a TensorSerializer
         if not isinstance(storage, torch.UntypedStorage):
@@ -181,7 +179,7 @@ class _TensorizerPickler(pickle.Pickler):
     def persistent_id(self, obj):
         if (
             self.__filename is not None
-            and isinstance(obj, (torch.UntypedStorage, torch.TypedStorage))
+            and torch.is_storage(obj)
             and _has_data(obj)
         ):
             tensor_view = self.__storage_to_tensor(obj)
@@ -242,7 +240,7 @@ class _TensorizerUnpickler(pickle.Unpickler):
     @staticmethod
     def __tensor_to_storage(
         tensor: torch.Tensor, dtype: Optional[torch.dtype]
-    ) -> typing.Union[torch.UntypedStorage, torch.TypedStorage]:
+    ) -> _storage_type:
         # Convert a tensor into an equivalent storage
         # for compatibility with a TensorDeserializer
         if dtype is None:
@@ -382,7 +380,7 @@ _suppress_weights_only: ContextVar[bool] = ContextVar(
 def _save_wrapper(
     obj: object,
     f: torch.types.FileLike,
-    pickle_module: typing.Any = pickle,
+    pickle_module: Any = pickle,
     *args,
     **kwargs,
 ):
@@ -401,7 +399,7 @@ def _save_wrapper(
 
 # This signature quietly changed in torch 1.13.0 to default to None,
 # but the documentation wasn't updated to reflect that.
-_LOAD_WRAPPER_DEFAULT_MODULE: typing.Any = (
+_LOAD_WRAPPER_DEFAULT_MODULE: Any = (
     pickle if torch.__version__ < (1, 13, 0) else None
 )
 
@@ -410,7 +408,7 @@ _LOAD_WRAPPER_DEFAULT_MODULE: typing.Any = (
 def _load_wrapper(
     f: torch.types.FileLike,
     map_location: torch.serialization.MAP_LOCATION = None,
-    pickle_module: typing.Any = _LOAD_WRAPPER_DEFAULT_MODULE,
+    pickle_module: Any = _LOAD_WRAPPER_DEFAULT_MODULE,
     *args,
     weights_only: Optional[bool] = None,
     **kwargs,
