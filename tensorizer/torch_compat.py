@@ -82,8 +82,11 @@ _storage_type: "typing.TypeAlias" = Union[
     torch.UntypedStorage, torch.TypedStorage
 ]
 
-_tensorizer_filename: ContextVar[Optional[_wrapper_file_obj_type]] = ContextVar(
-    "_tensorizer_filename", default=None
+_tensorizer_loading_filename: ContextVar[Optional[_wrapper_file_obj_type]] = (
+    ContextVar("_tensorizer_loading_filename", default=None)
+)
+_tensorizer_saving_filename: ContextVar[Optional[_wrapper_file_obj_type]] = (
+    ContextVar("_tensorizer_saving_filename", default=None)
 )
 
 _tensorizer_deserializer_kwargs: ContextVar[Optional[dict]] = ContextVar(
@@ -114,7 +117,7 @@ class _TensorizerPickler(pickle.Pickler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.__filename = _tensorizer_filename.get()
+        self.__filename = _tensorizer_saving_filename.get()
         self.__tensors = []
         self.__tensor_ids = {}
 
@@ -217,7 +220,7 @@ class _TensorizerUnpickler(pickle.Unpickler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.__filename = _tensorizer_filename.get()
+        self.__filename = _tensorizer_loading_filename.get()
         self.__tensors = []
 
     def load(self):
@@ -337,18 +340,21 @@ def _infer_tensor_ext_name(f: torch.types.FileLike):
 
 
 @contextlib.contextmanager
-def _contextual_torch_filename(f: torch.types.FileLike):
-    if _tensorizer_filename.get() is None:
-        token = _tensorizer_filename.set(_infer_tensor_ext_name(f))
-    elif callable(filename_callback := _tensorizer_filename.get()):
-        token = _tensorizer_filename.set(filename_callback(f))
+def _contextual_torch_filename(
+    f: torch.types.FileLike,
+    filename_ctx_var: ContextVar[Optional[_wrapper_file_obj_type]],
+):
+    if filename_ctx_var.get() is None:
+        token = filename_ctx_var.set(_infer_tensor_ext_name(f))
+    elif callable(filename_callback := filename_ctx_var.get()):
+        token = filename_ctx_var.set(filename_callback(f))
     else:
         token = None
     try:
         yield
     finally:
         if token is not None:
-            _tensorizer_filename.reset(token)
+            filename_ctx_var.reset(token)
 
 
 _save_wrapper_active: ContextVar[bool] = ContextVar(
@@ -391,7 +397,7 @@ def _save_wrapper(
             "Tensorizer-based torch serialization is incompatible with"
             " using a pickle_module other than the default"
         )
-    with _contextual_torch_filename(f):
+    with _contextual_torch_filename(f, _tensorizer_saving_filename):
         return _ORIG_TORCH_SAVE(
             obj, f, *args, pickle_module=_tensorizer_pickle, **kwargs
         )
@@ -427,7 +433,7 @@ def _load_wrapper(
             "Tensorizer-based torch serialization is incompatible with"
             " using a pickle_module other than the default"
         )
-    with _contextual_torch_filename(f):
+    with _contextual_torch_filename(f, _tensorizer_loading_filename):
         if _suppress_weights_only.get():
             weights_only = False
         return _ORIG_TORCH_LOAD(
@@ -485,7 +491,7 @@ def tensorizer_saving(
     global _save_wrapper_active_count, _save_wrapper_wrapped
     active_token = _save_wrapper_active.set(True)
     kwargs_token = _tensorizer_serializer_kwargs.set(kwargs)
-    filename_token = _tensorizer_filename.set(file_obj)
+    filename_token = _tensorizer_saving_filename.set(file_obj)
     save_func_token = _save_wrapper_save_func.set(save_func)
     with _save_wrapper_active_mutex:
         _save_wrapper_active_count += 1
@@ -502,7 +508,7 @@ def tensorizer_saving(
                 torch.save = _save_wrapper_wrapped
                 _save_wrapper_wrapped = None
         _save_wrapper_save_func.reset(save_func_token)
-        _tensorizer_filename.reset(filename_token)
+        _tensorizer_saving_filename.reset(filename_token)
         _tensorizer_serializer_kwargs.reset(kwargs_token)
         _save_wrapper_active.reset(active_token)
 
@@ -560,7 +566,7 @@ def tensorizer_loading(
     active_token = _load_wrapper_active.set(True)
     weights_token = _suppress_weights_only.set(suppress_weights_only)
     kwargs_token = _tensorizer_deserializer_kwargs.set(kwargs)
-    filename_token = _tensorizer_filename.set(file_obj)
+    filename_token = _tensorizer_loading_filename.set(file_obj)
     load_func_token = _load_wrapper_load_func.set(load_func)
     with _load_wrapper_active_mutex:
         _load_wrapper_active_count += 1
@@ -577,7 +583,7 @@ def tensorizer_loading(
                 torch.load = _load_wrapper_wrapped
                 _load_wrapper_wrapped = None
         _load_wrapper_load_func.reset(load_func_token)
-        _tensorizer_filename.reset(filename_token)
+        _tensorizer_loading_filename.reset(filename_token)
         _tensorizer_deserializer_kwargs.reset(kwargs_token)
         _suppress_weights_only.reset(weights_token)
         _load_wrapper_active.reset(active_token)

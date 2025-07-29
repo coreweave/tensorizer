@@ -1,11 +1,14 @@
 import concurrent.futures
+import contextlib
 import inspect
 import io
+import itertools
 import pickle
 import tempfile
 import threading
 import typing
 import unittest
+from functools import partial
 from pathlib import Path
 from typing import ClassVar, Final, Optional, Sequence, Tuple
 
@@ -420,3 +423,201 @@ class TestTorchCompat(unittest.TestCase):
             loaded_model = torch.load(self.pt_path)
 
         self.check_model(loaded_model)
+
+    def test_nested_contexts(self):
+        sd = {
+            f"layer.{i:d}": torch.randn(
+                (16, 16), device="cpu", dtype=torch.float32
+            )
+            for i in range(4)
+        }
+        keys = tuple(sd.keys())
+
+        def check_sd(_sd):
+            self.assertTupleEqual(keys, tuple(_sd.keys()))
+            for name, tensor in sd.items():
+                self.assertTrue(torch.equal(tensor, _sd[name]))
+
+        # These produce reusable callables with frozen args
+        cpu_loading = partial(tensorizer_loading, device="cpu")
+        saving = partial(partial, tensorizer_saving)
+        loading = partial(partial, cpu_loading)
+
+        def permuted(context1, context2):
+            @contextlib.contextmanager
+            def _ctx():
+                with self.subTest(f"{name1} + {name2}"), ctx1(), ctx2():
+                    yield
+
+            for (name1, ctx1), (name2, ctx2) in itertools.permutations(
+                (context1, context2)
+            ):
+                yield _ctx
+
+        for ctx in permuted(
+            ("tensorizer_saving", saving()),
+            ("tensorizer_loading", loading()),
+        ):
+            with ctx():
+                torch.save(sd, self.pt_path)
+                self.assertTrue(self.pt_path.is_file())
+                self.assertTrue(self.tensors_path.is_file())
+                check_sd(torch.load(self.pt_path))
+            self.pt_path.unlink(missing_ok=True)
+            self.tensors_path.unlink(missing_ok=True)
+
+        alt_tensors_path = self.tmp_dir_path / "test-2.pt.tensors"
+        self.addCleanup(alt_tensors_path.unlink, missing_ok=True)
+
+        def cleanup() -> None:
+            self.pt_path.unlink(missing_ok=True)
+            self.tensors_path.unlink(missing_ok=True)
+            alt_tensors_path.unlink(missing_ok=True)
+
+        def check_saved_primary() -> None:
+            self.assertTrue(self.pt_path.is_file())
+            self.assertTrue(self.tensors_path.is_file())
+            self.assertFalse(alt_tensors_path.exists())
+
+        def check_saved_alt() -> None:
+            self.assertTrue(self.pt_path.is_file())
+            self.assertFalse(self.tensors_path.exists())
+            self.assertTrue(alt_tensors_path.is_file())
+
+        #
+        # Test mixing tensorizer_saving and tensorizer_loading together
+        #
+
+        # Try saving to an alternate path but not loading from it
+        for ctx in permuted(
+            ("tensorizer_saving(path)", saving(alt_tensors_path)),
+            ("tensorizer_loading", loading()),
+        ):
+            with ctx():
+                torch.save(sd, self.pt_path)
+                check_saved_alt()
+                with self.assertRaises(OSError):
+                    torch.load(self.pt_path)
+            cleanup()
+
+        # Try loading from an alternate path but not saving to it
+        for ctx in permuted(
+            ("tensorizer_saving", saving()),
+            ("tensorizer_loading(path)", loading(alt_tensors_path)),
+        ):
+            with ctx():
+                torch.save(sd, self.pt_path)
+                check_saved_primary()
+                with self.assertRaises(OSError):
+                    torch.load(self.pt_path)
+            cleanup()
+
+        # Try both saving to and loading from an alternate path
+        for ctx in permuted(
+            ("tensorizer_saving(path)", saving(alt_tensors_path)),
+            ("tensorizer_loading(path)", loading(alt_tensors_path)),
+        ):
+            with ctx():
+                torch.save(sd, self.pt_path)
+                check_saved_alt()
+                check_sd(torch.load(self.pt_path))
+            cleanup()
+
+        #
+        # Test nesting multiple levels of the same type of context manager
+        # The most recent context should take precedence
+        #
+
+        # Nested saving context managers
+        for save_name, default_save in (
+            ("tensorizer_saving", saving()),
+            ("tensorizer_saving(default)", saving(self.tensors_path)),
+        ):
+            with self.subTest(f"{save_name} + tensorizer_saving(path)"):
+                with default_save(), tensorizer_saving(alt_tensors_path):
+                    torch.save(sd, self.pt_path)
+                check_saved_alt()
+                with cpu_loading(alt_tensors_path):
+                    check_sd(torch.load(self.pt_path))
+            cleanup()
+
+            with self.subTest(f"tensorizer_saving(path) + {save_name}"):
+                with tensorizer_saving(alt_tensors_path), default_save():
+                    torch.save(sd, self.pt_path)
+                check_saved_primary()
+                with cpu_loading():
+                    check_sd(torch.load(self.pt_path))
+            cleanup()
+
+            # Make sure an outer context is restored
+            # correctly after leaving an inner context
+            with self.subTest(f"tensorizer_saving(path) after {save_name}"):
+                with tensorizer_saving(alt_tensors_path):
+                    with default_save():
+                        # This should temporarily change the context,
+                        # but bring it back once the block is over.
+                        pass
+                    torch.save(sd, self.pt_path)
+                check_saved_alt()
+                with cpu_loading(alt_tensors_path):
+                    check_sd(torch.load(self.pt_path))
+            cleanup()
+
+            with self.subTest(f"{save_name} after tensorizer_saving(path)"):
+                with default_save():
+                    with tensorizer_saving(alt_tensors_path):
+                        # This should temporarily change the context,
+                        # but bring it back once the block is over.
+                        pass
+                    torch.save(sd, self.pt_path)
+                check_saved_primary()
+                with cpu_loading():
+                    check_sd(torch.load(self.pt_path))
+            cleanup()
+
+        # Nested loading context managers
+        for load_name, default_load in (
+            ("tensorizer_loading", loading()),
+            ("tensorizer_loading(default)", loading(self.tensors_path)),
+        ):
+            with self.subTest(f"{load_name} + tensorizer_loading(path)"):
+                with tensorizer_saving(alt_tensors_path):
+                    torch.save(sd, self.pt_path)
+                check_saved_alt()
+                with default_load(), cpu_loading(alt_tensors_path):
+                    check_sd(torch.load(self.pt_path))
+            cleanup()
+
+            with self.subTest(f"tensorizer_loading(path) + {load_name}"):
+                with tensorizer_saving():
+                    torch.save(sd, self.pt_path)
+                check_saved_primary()
+                with cpu_loading(alt_tensors_path), default_load():
+                    check_sd(torch.load(self.pt_path))
+            cleanup()
+
+            # Make sure an outer context is restored
+            # correctly after leaving an inner context
+            with self.subTest(f"tensorizer_loading(path) after {save_name}"):
+                with tensorizer_saving(alt_tensors_path):
+                    torch.save(sd, self.pt_path)
+                check_saved_alt()
+                with cpu_loading(alt_tensors_path):
+                    with default_load():
+                        # This should temporarily change the context,
+                        # but bring it back once the block is over.
+                        pass
+                    check_sd(torch.load(self.pt_path))
+            cleanup()
+
+            with self.subTest(f"{save_name} after tensorizer_loading(path)"):
+                with tensorizer_saving():
+                    torch.save(sd, self.pt_path)
+                check_saved_primary()
+                with cpu_loading():
+                    with cpu_loading(alt_tensors_path):
+                        # This should temporarily change the context,
+                        # but bring it back once the block is over.
+                        pass
+                    check_sd(torch.load(self.pt_path))
+            cleanup()
