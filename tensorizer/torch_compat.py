@@ -479,7 +479,7 @@ def tensorizer_saving(
             function. This may be used, for instance, to make serialization
             asynchronous by writing a `save_func` that serializes in
             a background thread or process.
-        **kwargs: Further keyword arguments to pass to the `TensorSerializer`
+        kwargs: Further keyword arguments to pass to the `TensorSerializer`
             object used to save tensor data.
     """
     global _save_wrapper_active_count, _save_wrapper_wrapped
@@ -553,7 +553,7 @@ def tensorizer_loading(
             incompatible with ``weights_only=True`` because ``torch`` counts it
             using a custom ``pickle_module`` as being a non-weights-only load,
             even though tensorizer only loads weights in practice.
-        **kwargs: Further keyword arguments to pass to the `TensorDeserializer`
+        kwargs: Further keyword arguments to pass to the `TensorDeserializer`
             object used to load tensor data.
     """
     global _load_wrapper_active_count, _load_wrapper_wrapped
