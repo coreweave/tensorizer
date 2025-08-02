@@ -621,3 +621,28 @@ class TestTorchCompat(unittest.TestCase):
                         pass
                     check_sd(torch.load(self.pt_path))
             cleanup()
+
+    def test_save_load_without_tensors(self):
+        original = [1, "2", 3.0, torch.device("meta")]
+
+        with tensorizer_saving():
+            torch.save(original, self.pt_path)
+
+        self.assertTrue(self.pt_path.is_file())
+        self.assertFalse(self.tensors_path.exists())
+
+        with tensorizer_loading():
+            loaded = torch.load(self.pt_path)
+
+        self.assertListEqual(original, loaded)
+
+    def test_load_with_regular_file(self):
+        torch.save(self.model, self.pt_path)
+
+        self.assertTrue(self.pt_path.is_file())
+        self.assertFalse(self.tensors_path.exists())
+
+        with tensorizer_loading():
+            loaded_model = torch.load(self.pt_path)
+
+        self.check_model(loaded_model)

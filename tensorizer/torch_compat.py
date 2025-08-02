@@ -33,6 +33,7 @@ Example:
 
 import contextlib
 import functools
+import inspect
 import io
 import logging
 import os
@@ -216,29 +217,40 @@ class _TensorizerPickler(pickle.Pickler):
 
 class _TensorizerUnpickler(pickle.Unpickler):
     __filename: Optional[_tensorizer_file_obj_type]
-    __tensors: list
+    __has_tensors: bool
+    __tensors: Optional[list]
+    __cached_super_load: Optional[callable]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.__filename = _tensorizer_loading_filename.get()
-        self.__tensors = []
+        self.__has_tensors = self.__filename is not None
+        self.__tensors = None
+        self.__cached_super_load = None
 
     def load(self):
-        if self.__filename is not None:
-            kwargs = _tensorizer_deserializer_kwargs.get()
-            if kwargs is None:
-                kwargs = {}
-            if (load_func := _load_wrapper_load_func.get()) is None:
-                with TensorDeserializer(
-                    self.__filename, **kwargs
-                ) as deserializer:
-                    self.__tensors = deserializer.tree()
-            else:
-                self.__tensors = list(load_func(self.__filename, kwargs))
         try:
             return super().load()
         finally:
-            self.__tensors.clear()
+            if self.__tensors is not None:
+                self.__tensors.clear()
+                self.__tensors = None
+
+    def __load_tensors(self) -> None:
+        # Load and cache tensors from a sidecar file
+        if self.__tensors is not None:
+            return
+        elif not self.__has_tensors:
+            raise RuntimeError("Tried to load tensors without a path")
+        kwargs = _tensorizer_deserializer_kwargs.get()
+        if kwargs is None:
+            kwargs = {}
+        if (load_func := _load_wrapper_load_func.get()) is None:
+            with TensorDeserializer(self.__filename, **kwargs) as deserializer:
+                self.__tensors = deserializer.tree()
+        else:
+            self.__tensors = list(load_func(self.__filename, kwargs))
+        assert self.__tensors is not None
 
     @staticmethod
     def __tensor_to_storage(
@@ -254,9 +266,48 @@ class _TensorizerUnpickler(pickle.Unpickler):
             wrap_storage=tensor.untyped_storage(), dtype=dtype, _internal=True
         )
 
+    def __get_storage(self, idx: int, dtype: Optional[torch.dtype]):
+        # This will load all tensors the first time a "TensorizerPickler"
+        # persistent_id is encountered, indicating that this was a file
+        # created by a _TensorizerPickler. Deferring it to this point
+        # will avoid trying to engage the load logic on .pt files
+        # that were NOT created by a _TensorizerPickler, where there
+        # is probably no corresponding .tensors file anyway, where trying
+        # to load that would fail.
+        if self.__tensors is None:
+            self.__load_tensors()
+        tensor_view = self.__tensors[idx]
+        return self.__tensor_to_storage(tensor_view, dtype)
+
+    @property
+    def __super_load(self) -> Callable[[Any], Any]:
+        if self.__cached_super_load is not None:
+            return self.__cached_super_load
+        super_load = super().persistent_load
+        super_load_func = getattr(super_load, "__func__", super_load)
+        # Evil Python behaviour can make the super method equal this method
+        # prior to Python 3.13, so check for that to avoid accidental recursion.
+        # _is_load_wrapper is set on dynamically-created wrappers
+        # that ultimately recurse back to this function; avoid those too.
+        if super_load_func == _TensorizerUnpickler.persistent_load or getattr(
+            super_load_func, "_is_load_wrapper", False
+        ):
+            # To avoid recursing forever, just raise the
+            # default error from pickle.Unpickler instead
+            self.__cached_super_load = self.__fallback_super_load
+        else:
+            # Will probably just throw an error,
+            # but could redirect to a sibling class
+            self.__cached_super_load = super_load
+        return self.__cached_super_load
+
+    @staticmethod
+    def __fallback_super_load(_pid):
+        raise pickle.UnpicklingError("unsupported persistent id encountered")
+
     def persistent_load(self, pid):
         if (
-            self.__filename is not None
+            self.__has_tensors
             and isinstance(pid, tuple)
             and pid[0] == "TensorizerPickler"
             and len(pid) >= 3
@@ -269,15 +320,13 @@ class _TensorizerUnpickler(pickle.Unpickler):
             object_type = pid[2]
             if object_type == "storage":
                 idx, dtype = pid[3:]
-                tensor_view = self.__tensors[idx]
-                return self.__tensor_to_storage(tensor_view, dtype)
+                return self.__get_storage(idx, dtype)
             else:
                 raise pickle.UnpicklingError(
                     f"Unsupported TensorizerPickler object type ({object_type})"
                 )
         else:
-            # Will probably just throw an error
-            return super().persistent_load(pid)
+            return self.__super_load(pid)
 
     @staticmethod
     def __wrap_persistent_load(persistent_load_func: callable):
@@ -285,16 +334,44 @@ class _TensorizerUnpickler(pickle.Unpickler):
         @functools.wraps(persistent_load_func)
         def _persistent_load(self, pid):
             try:
-                return super(self.__class__, self).persistent_load(pid)
+                if self.__class__ is _TensorizerUnpickler:
+                    # For instances of this class, call this class's method
+                    return self.__class__.persistent_load(self, pid)
+                else:
+                    # For subclasses, defer to the super method
+                    return super(self.__class__, self).persistent_load(pid)
             except pickle.UnpicklingError:
                 pass
-            return persistent_load_func(self, pid)
+            # This is being set on an instance, not the class,
+            # so this wouldn't expect to be passed self as well,
+            # as it is not an unbound method here
+            return persistent_load_func(pid)
 
         return _persistent_load
 
     def __setattr__(self, key, value):
         if key == "persistent_load":
-            value = self.__wrap_persistent_load(value)
+            # If this method is being overridden dynamically, modify it
+            # to defer to the persistent_load method from this class first
+            wrapped_func = self.__wrap_persistent_load(value)
+            # Mark this as a wrapper for recursion detection later on
+            wrapped_func._is_load_wrapper = True
+            value = types.MethodType(wrapped_func, self)
+            # Necessary witchcraft prior to Python 3.13:
+            # pickle.Unpickler may internally cache persistent_load functions,
+            # and it would normally update the cached value using a PyGetSetDef
+            # descriptor, but having a class in the inheritance hierarchy
+            # that defines persistent_load as a non-descriptor prevents
+            # attribute updates from reaching that descriptor's set method,
+            # so the cached value that the unpickler actually uses isn't
+            # properly updated, even though the Python object shows it as being
+            # updated. We can force this update to propagate to that descriptor
+            # by manipulating it directly.
+            if (
+                pickle.Unpickler in self.__class__.__mro__
+                and inspect.isgetsetdescriptor(pickle.Unpickler.persistent_load)
+            ):
+                pickle.Unpickler.persistent_load.__set__(self, value)
         super().__setattr__(key, value)
 
     def __init_subclass__(cls, **kwargs):
