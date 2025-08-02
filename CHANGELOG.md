@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `tensorizer.torch_compat` is a new module for using `tensorizer` as a backend
+  for handling tensor data during standard `torch.save` and `torch.load` calls
+  - To use `tensorizer` as a backend for `torch.save`,
+    wrap the call in the `tensorizer_saving` context manager
+    - The file created must then be loaded using `tensorizer_loading`
+  - To use `tensorizer` as a backend for `torch.load`,
+    wrap the call in the `tensorizer_loading` context manager
+    - The file to load must have been created using `tensorizer_saving`
+
 ## [2.10.1] - 2025-06-27
 
 ### Fixed
@@ -472,6 +485,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
+[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.10.1...HEAD
 [2.10.1]: https://github.com/coreweave/tensorizer/compare/v2.10.0...v2.10.1
 [2.10.0]: https://github.com/coreweave/tensorizer/compare/v2.9.3...v2.10.0
 [2.9.3]: https://github.com/coreweave/tensorizer/compare/v2.9.2...v2.9.3
