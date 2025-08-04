@@ -469,8 +469,8 @@ have no side effects.
 
 For additional parameters, caveats, and advanced usage information,
 refer to the docstrings for `tensorizer_saving` and `tensorizer_loading` in
-the file `tensorizer/torch_compat.py`, or view their function documentation
-inline in an IDE.
+the file [tensorizer/torch_compat.py](/tensorizer/torch_compat.py),
+or view their function documentation inline in an IDE.
 
 ## Benchmarks
 
