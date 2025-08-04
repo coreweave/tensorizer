@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.11.0] - 2025-08-04
 
 ### Added
 
@@ -485,7 +485,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_gpu_name`
   - `no_init_or_tensor`
 
-[Unreleased]: https://github.com/coreweave/tensorizer/compare/v2.10.1...HEAD
+[2.11.0]: https://github.com/coreweave/tensorizer/compare/v2.10.1...v2.11.0
 [2.10.1]: https://github.com/coreweave/tensorizer/compare/v2.10.0...v2.10.1
 [2.10.0]: https://github.com/coreweave/tensorizer/compare/v2.9.3...v2.10.0
 [2.9.3]: https://github.com/coreweave/tensorizer/compare/v2.9.2...v2.9.3
