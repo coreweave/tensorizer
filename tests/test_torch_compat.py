@@ -402,7 +402,9 @@ class TestTorchCompat(unittest.TestCase):
             ".pt.tensors.dynamic"
         )
 
-        def path_callback(f: torch.types.FileLike) -> io.BufferedIOBase:
+        def path_callback(
+            f: tensorizer.torch_compat._FileLike,
+        ) -> io.BufferedIOBase:
             # Test with an exotic function that returns a pre-opened
             # stream dynamically, based on the input file's name
             _path = Path(f).with_suffix(".pt.tensors.dynamic")
