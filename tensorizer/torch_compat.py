@@ -65,9 +65,11 @@ _tensorizer_file_obj_type: "typing.TypeAlias" = Union[
     int,
 ]
 
+_FileLike: "typing.TypeAlias" = Union[str, os.PathLike[str], typing.IO[bytes]]
+
 _wrapper_file_obj_type: "typing.TypeAlias" = Union[
     _tensorizer_file_obj_type,
-    Callable[[torch.types.FileLike], _tensorizer_file_obj_type],
+    Callable[[_FileLike], _tensorizer_file_obj_type],
 ]
 
 _save_func_type: "typing.TypeAlias" = Callable[
@@ -397,7 +399,7 @@ _ORIG_TORCH_SAVE: Final[callable] = torch.save
 _ORIG_TORCH_LOAD: Final[callable] = torch.load
 
 
-def _infer_tensor_ext_name(f: torch.types.FileLike):
+def _infer_tensor_ext_name(f: _FileLike):
     if isinstance(f, io.BytesIO):
         logger.warning(
             "Cannot infer .tensors location from io.BytesIO;"
@@ -418,7 +420,7 @@ def _infer_tensor_ext_name(f: torch.types.FileLike):
 
 @contextlib.contextmanager
 def _contextual_torch_filename(
-    f: torch.types.FileLike,
+    f: _FileLike,
     filename_ctx_var: ContextVar[Optional[_wrapper_file_obj_type]],
 ):
     if filename_ctx_var.get() is None:
@@ -462,7 +464,7 @@ _suppress_weights_only: ContextVar[bool] = ContextVar(
 @functools.wraps(_ORIG_TORCH_SAVE)
 def _save_wrapper(
     obj: object,
-    f: torch.types.FileLike,
+    f: _FileLike,
     pickle_module: Any = pickle,
     *args,
     **kwargs,
@@ -489,7 +491,7 @@ _LOAD_WRAPPER_DEFAULT_MODULE: Any = (
 
 @functools.wraps(_ORIG_TORCH_LOAD)
 def _load_wrapper(
-    f: torch.types.FileLike,
+    f: _FileLike,
     map_location: torch.serialization.MAP_LOCATION = None,
     pickle_module: Any = _LOAD_WRAPPER_DEFAULT_MODULE,
     *args,
