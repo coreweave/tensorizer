@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import torch
 
+import tensorizer
+
 os.environ["TOKENIZERS_PARALLELISM"] = (
     "false"  # avoids excessive warnings about forking after using a tokenizer
 )
@@ -268,6 +270,18 @@ def temporary_file(*args, **kwargs):
 
 
 class TestSerialization(unittest.TestCase):
+    @staticmethod
+    def get_version(deserializer: tensorizer.TensorDeserializer) -> int:
+        return deserializer._file_header.version_number
+
+    @staticmethod
+    def free_cpu_ram() -> None:
+        gc.collect()
+        if empty_cache := getattr(torch._C, "_host_emptyCache", None):
+            # Clear up pinned memory held by PyTorch's caching allocator
+            empty_cache()
+        gc.collect()
+
     def test_serialization(self):
         for device, method in itertools.product(
             ("cuda", "cpu"),
@@ -292,6 +306,10 @@ class TestSerialization(unittest.TestCase):
                     deserialized = TensorDeserializer(
                         serialized_model, device="cpu"
                     )
+                    self.assertEqual(
+                        self.get_version(deserialized),
+                        serialization.NON_OPAQUE_TENSORIZER_VERSION,
+                    )
                     check_deserialized(
                         self,
                         deserialized,
@@ -311,7 +329,7 @@ class TestSerialization(unittest.TestCase):
         num_elements: int = 36000 * 36000
         bytes_required: int = num_elements * 4
         assert bytes_required > 1 << 32
-        gc.collect()
+        self.free_cpu_ram()
         free_mem = utils.CPUMemoryUsage.now().free
         working_space: int = 10 << 20
         if free_mem < bytes_required + working_space:
@@ -352,6 +370,111 @@ class TestSerialization(unittest.TestCase):
                     self.assertTrue(torch.equal(tensor, deserialized_tensor))
         del deserializer, tensor, deserialized_tensor
         gc.collect()
+
+    def test_long_dimensions(self):
+        # Test serializing tensors with individual dimensions longer than
+        # 2^32 elements, only supported in tensorizer data version 5 and up
+        # (corresponding to tensorizer code version 2.12 and up)
+        # This test takes a lot of RAM, so free up as much as possible first
+        self.free_cpu_ram()
+
+        tensor_length: int = (1 << 32) + 128
+        free_mem = utils.CPUMemoryUsage.now().free
+        working_space: int = 10 << 20
+        if free_mem < tensor_length + working_space:
+            self.skipTest(
+                reason="Insufficient RAM to test long dimension serialization"
+            )
+        plentiful_ram: bool = free_mem > (tensor_length + working_space) * 2
+        long_tensor = torch.empty(
+            (tensor_length,), dtype=torch.int8, device="cpu"
+        )
+        # Insert some arbitrary fixed values for an easy integrity check later
+        long_tensor[0] = 62
+        long_tensor[tensor_length - 64] = 72
+        long_tensor[-1] = 82
+
+        def validate_long_tensor(t: torch.Tensor) -> None:
+            self.assertEqual(t[0], 62)
+            self.assertEqual(t[tensor_length - 64], 72)
+            self.assertEqual(t[-1], 82)
+
+        def rand_tensor() -> torch.Tensor:
+            return torch.rand((16, 16), dtype=torch.float, device="cpu")
+
+        state_dict: "typing.TypeAlias" = typing.Dict[str, torch.Tensor]
+
+        # First, serialize three normal tensors
+        # These should have their headers rewritten later,
+        # even if the long-dimension tensor is written separately
+        sd1: state_dict = {i: rand_tensor() for i in "123"}
+
+        # Then, try serializing a very long tensor betwixt two normal tensors
+        # This ensures that metadata buffering is working properly
+        sd2: state_dict = {
+            "4": rand_tensor(),
+            "5": long_tensor,
+            "6": rand_tensor(),
+        }
+        del long_tensor
+
+        # Then, in a third write operation, do that last part again
+        # This ensures that the internal state is still usable after
+        # the previous write operation has ended
+        sd3: state_dict = dict(zip("789", sd2.values()))
+
+        # Finally, in a fourth write, serialize three normal tensors
+        # This ensures that even if a later write operation doesn't contain
+        # a tensor with long dimensions, it will continue writing with the
+        # newer format anyway because previous ones did
+        sd4: state_dict = {i: rand_tensor() for i in "ABC"}
+
+        with temporary_file(mode="wb+") as file:
+            with file:
+                serializer = TensorSerializer(file)
+                serializer.write_state_dict(sd1)
+                serializer.write_state_dict(sd2)
+                serializer.write_state_dict(sd3)
+                serializer.write_state_dict(sd4)
+                serializer.close()
+            # Keys 5 and 8 are the (same) long tensor, so remove references
+            # to them to free up memory for deserialization
+            del serializer, sd2["5"], sd3["8"]
+            gc.collect()
+            rand_tensors: state_dict = {**sd1, **sd2, **sd3, **sd4}
+            if plentiful_ram:
+                with TensorDeserializer(
+                    file.name, device="cpu"
+                ) as deserializer:
+                    self.assertEqual(
+                        self.get_version(deserializer),
+                        serialization.LONG_TENSOR_TENSORIZER_VERSION,
+                    )
+                    for k, rt in rand_tensors.items():
+                        self.assertTrue(torch.equal(deserializer[k], rt))
+                    validate_long_tensor(deserializer["5"])
+                    validate_long_tensor(deserializer["8"])
+                del deserializer
+                gc.collect()
+            else:
+                # Check this twice, but only loading one of the long tensors
+                # each time, to be light on RAM
+                for check, skip in ("58", "85"):
+                    with TensorDeserializer(
+                        file.name,
+                        num_readers=1,
+                        device="cpu",
+                        filter_func=lambda name: name != skip,
+                    ) as deserializer:
+                        self.assertEqual(
+                            self.get_version(deserializer),
+                            serialization.LONG_TENSOR_TENSORIZER_VERSION,
+                        )
+                        for k, rt in rand_tensors.items():
+                            self.assertTrue(torch.equal(deserializer[k], rt))
+                        validate_long_tensor(deserializer[check])
+                    del deserializer
+                    gc.collect()
 
     def test_bfloat16(self):
         shape = (50, 50)
