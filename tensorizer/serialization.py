@@ -158,7 +158,11 @@ class TensorType(IntEnum):
 
 
 # Current version
-TENSORIZER_VERSION = 4
+TENSORIZER_VERSION = 5
+
+# To serialize tensors with individual dimensions longer than 2^32 elements,
+# data version 5 is required.
+LONG_TENSOR_TENSORIZER_VERSION = 5
 
 # To serialize meta tensors into metadata-only tensors
 # that deserialize back into zeroed-out buffers, data version 4 is required.
@@ -197,6 +201,7 @@ class TensorHash:
 @dataclasses.dataclass(order=True)
 class TensorEntry:
     __slots__ = (
+        "metadata_version",
         "name",
         "type",
         "dtype",
@@ -207,6 +212,7 @@ class TensorEntry:
         "hashes",
         "header_hashes",
     )
+    metadata_version: int
     name: _TensorPath
     type: TensorType
     dtype: str
@@ -224,6 +230,10 @@ class TensorEntry:
         element_size: int = numpy.dtype(self.dtype).itemsize
         num_elements: int = numpy.prod(self.shape)
         return element_size * num_elements
+
+    @property
+    def is_long_tensor(self) -> bool:
+        return self.metadata_version >= LONG_TENSOR_TENSORIZER_VERSION
 
 
 class _FileFeatureFlags(enum.IntFlag):
@@ -313,6 +323,7 @@ class _TensorHeaderSerializer:
     # other fields are calculated per-instance
     buffer: bytearray
     size: int
+    has_long_dimensions: bool
 
     start_segment: ClassVar[struct.Struct] = struct.Struct(
         "<"  # Little-endian
@@ -330,7 +341,7 @@ class _TensorHeaderSerializer:
         "B"  # Tensor dtype length
         "{dtype_len:d}s"  # Tensor dtype UTF-8 bytes
         "B"  # Tensor shape length
-        "{shape_len:d}I"  # Tensor shape I array
+        "{shape_len:d}{shape_type:.1s}"  # Tensor shape int array
     )
     variable_length_segment: struct.Struct
     variable_length_offset: ClassVar[int] = start_segment.size
@@ -383,7 +394,7 @@ class _TensorHeaderSerializer:
         "B"  # Dtype length
         "{dtype_len:d}s"  # Dtype
         "B"  # Shape length
-        "{shape_len:d}I"  # Shape
+        "{shape_len:d}{shape_type:.1s}"  # Shape
         "Q"  # Header start (relative to the file)
         "Q"  # Tensor data start (relative to the file)
         "Q"  # Tensor length
@@ -409,6 +420,11 @@ class _TensorHeaderSerializer:
         # NB: shape_len is the number of dimensions,
         # not the encoded byte length
         shape_len = len(shape)
+        short_dimension_limit: int = 1 << 32
+        self.has_long_dimensions: bool = any(
+            dim >= short_dimension_limit for dim in shape
+        )
+        shape_type: str = "Q" if self.has_long_dimensions else "I"
         self.crypt_info = crypt_info
         if crypt_info is None:
             crypt_info_len = 0
@@ -419,6 +435,7 @@ class _TensorHeaderSerializer:
                 name_len=name_len,
                 dtype_len=dtype_len,
                 shape_len=shape_len,
+                shape_type=shape_type,
             )
         )
         crc32_len = sha256_len = self.hash_count = 0
@@ -498,6 +515,7 @@ class _TensorHeaderSerializer:
                 name_len=name_len,
                 dtype_len=dtype_len,
                 shape_len=shape_len,
+                shape_type=shape_type,
             )
         )
 
@@ -587,12 +605,23 @@ class _TensorHeaderDeserializer:
         "<HB"  # Module index, tensor type
     )
 
-    read_name = partial(_variable_read, length_fmt="H", data_fmt="s")
-    read_dtype = partial(_variable_read, length_fmt="B", data_fmt="s")
-    read_shape = partial(_variable_read, length_fmt="B", data_fmt="I")
-    read_hash_block = partial(_variable_read, length_fmt="H", data_fmt="s")
-    read_crypt_info_block = partial(
-        _variable_read, length_fmt="Q", data_fmt="s"
+    read_name = staticmethod(
+        partial(_variable_read, length_fmt="H", data_fmt="s")
+    )
+    read_dtype = staticmethod(
+        partial(_variable_read, length_fmt="B", data_fmt="s")
+    )
+    read_shape_short = staticmethod(
+        partial(_variable_read, length_fmt="B", data_fmt="I")
+    )
+    read_shape_long = staticmethod(
+        partial(_variable_read, length_fmt="B", data_fmt="Q")
+    )
+    read_hash_block = staticmethod(
+        partial(_variable_read, length_fmt="H", data_fmt="s")
+    )
+    read_crypt_info_block = staticmethod(
+        partial(_variable_read, length_fmt="Q", data_fmt="s")
     )
 
     data_length_segment: ClassVar[struct.Struct] = struct.Struct("<q")
@@ -603,6 +632,7 @@ class _TensorHeaderDeserializer:
         reader: io.BufferedIOBase,
         zero_hashes: bool = True,
         check_crypt_info: bool = False,
+        long_shape_tensors: frozenset = frozenset(),
     ) -> Optional["_TensorHeaderDeserializer"]:
         # We read the entire header into memory rather than reading
         # it piecewise to avoid the overhead of many small reads,
@@ -617,7 +647,10 @@ class _TensorHeaderDeserializer:
         with memoryview(buffer) as mv:
             reader.readinto(mv[offset:])
         return cls(
-            buffer, zero_hashes=zero_hashes, check_crypt_info=check_crypt_info
+            buffer,
+            zero_hashes=zero_hashes,
+            check_crypt_info=check_crypt_info,
+            long_shape_tensors=long_shape_tensors,
         )
 
     def __init__(
@@ -625,6 +658,7 @@ class _TensorHeaderDeserializer:
         buffer: bytearray,
         zero_hashes: bool = True,
         check_crypt_info: bool = False,
+        long_shape_tensors: frozenset = frozenset(),
     ):
         self.buffer = buffer
         offset = self.header_len_segment.size
@@ -650,7 +684,11 @@ class _TensorHeaderDeserializer:
             self.dtype: str = str(dtype_slice, "utf-8")
 
         # Read the shape.
-        self.shape, offset = self.read_shape(buffer, offset)
+        long_shapes: bool = self.name in long_shape_tensors
+        read_shape_func: callable = (
+            self.read_shape_long if long_shapes else self.read_shape_short
+        )
+        self.shape, offset = read_shape_func(buffer, offset)
 
         # Read our hashes in.
         hashes_slice, offset = self.read_hash_block(buffer, offset)
@@ -765,10 +803,20 @@ class _TensorHeaderDeserializer:
 
 class _MetadataDeserializer(dict):
     _total_len_segment: ClassVar[struct.Struct] = struct.Struct("<Q")
-    _read_name = partial(_variable_read, length_fmt="H", data_fmt="s")
+    _version_segment: ClassVar[struct.Struct] = struct.Struct("<I")
+    _read_name = staticmethod(
+        partial(_variable_read, length_fmt="H", data_fmt="s")
+    )
     _tensor_type_segment: ClassVar[struct.Struct] = struct.Struct("<B")
-    _read_dtype = partial(_variable_read, length_fmt="B", data_fmt="s")
-    _read_shape = partial(_variable_read, length_fmt="B", data_fmt="I")
+    _read_dtype = staticmethod(
+        partial(_variable_read, length_fmt="B", data_fmt="s")
+    )
+    _read_shape_short = staticmethod(
+        partial(_variable_read, length_fmt="B", data_fmt="I")
+    )
+    _read_shape_long = staticmethod(
+        partial(_variable_read, length_fmt="B", data_fmt="Q")
+    )
     _location_segment: ClassVar[struct.Struct] = struct.Struct(
         "<"
         "Q"  # Tensor header offset
@@ -778,7 +826,11 @@ class _MetadataDeserializer(dict):
 
     @classmethod
     def from_io(
-        cls, reader: io.BufferedIOBase, count: int
+        cls,
+        reader: io.BufferedIOBase,
+        count: int,
+        versioned: bool,
+        accepted_versions: Optional[Iterable[int]],
     ) -> Tuple["_MetadataDeserializer", _TensorPathRegistry, bytes]:
         raw = reader.read(cls._total_len_segment.size)
         total_len: int = cls._total_len_segment.unpack(raw)[0]
@@ -787,24 +839,59 @@ class _MetadataDeserializer(dict):
         else:
             encoded_metadata: bytes = reader.read(total_len)
             raw += encoded_metadata
-            return cls.from_buffer(encoded_metadata, count) + (raw,)
+            return cls.from_buffer(
+                encoded_metadata, count, versioned, accepted_versions
+            ) + (raw,)
 
     @classmethod
     def from_buffer(
-        cls, buffer: bytes, count: int
+        cls,
+        buffer: bytes,
+        count: int,
+        versioned: bool,
+        accepted_versions: Optional[Iterable[int]],
     ) -> Tuple["_MetadataDeserializer", _TensorPathRegistry]:
         offset = 0
         entries = cls()
         registry = _TensorPathRegistry()
         for i in range(count):
-            entry, offset = cls._read_entry(buffer, offset, registry)
+            entry, offset = cls._read_entry(
+                buffer, offset, registry, versioned, accepted_versions
+            )
             entries[entry.name] = entry
         return entries, registry
 
     @classmethod
     def _read_entry(
-        cls, buffer: bytes, offset: int, registry: _TensorPathRegistry
+        cls,
+        buffer: bytes,
+        offset: int,
+        registry: _TensorPathRegistry,
+        versioned: bool,
+        accepted_versions: Optional[Iterable[int]],
     ) -> Tuple[TensorEntry, int]:
+        long_shapes: bool = False
+        version: int = NON_OPAQUE_TENSORIZER_VERSION
+        if versioned:
+            version = cls._version_segment.unpack_from(buffer, offset)[0]
+            offset += cls._version_segment.size
+            if version not in accepted_versions:
+                # This shouldn't come up in a valid file, because a newer
+                # metadata version implies a newer file version, so this ought
+                # to be rejected by the file-level version check first.
+                # Nonetheless, for an invalid file violating this assumption,
+                # give a descriptive error message
+                accepted_versions_str: str = ", ".join(
+                    map(str, sorted(set(accepted_versions)))
+                )
+                message = (
+                    "Unsupported version: this data stream uses tensorizer"
+                    f" metadata version {version}, which is not supported"
+                    " in this release of tensorizer."
+                    f"\nSupported metadata versions: {accepted_versions_str}"
+                )
+                raise ValueError(message)
+            long_shapes = version >= LONG_TENSOR_TENSORIZER_VERSION
         # Read the name.
         name_slice, offset = cls._read_name(buffer, offset)
         with name_slice:
@@ -820,7 +907,10 @@ class _MetadataDeserializer(dict):
             dtype: str = str(dtype_slice, "utf-8")
 
         # Read the shape.
-        shape, offset = cls._read_shape(buffer, offset)
+        read_shape_func: callable = (
+            cls._read_shape_long if long_shapes else cls._read_shape_short
+        )
+        shape, offset = read_shape_func(buffer, offset)
 
         (
             header_offset,
@@ -831,6 +921,7 @@ class _MetadataDeserializer(dict):
 
         return (
             TensorEntry(
+                metadata_version=version,
                 name=name,
                 type=tensor_type,
                 dtype=dtype,
@@ -1702,6 +1793,7 @@ class TensorDeserializer(
                 OPAQUE_TENSORIZER_VERSION,
                 ENCRYPTION_TENSORIZER_VERSION,
                 META_TENSOR_TENSORIZER_VERSION,
+                LONG_TENSOR_TENSORIZER_VERSION,
                 TENSORIZER_VERSION,
             )
             encryption_ver: int = ENCRYPTION_TENSORIZER_VERSION
@@ -1745,6 +1837,9 @@ class TensorDeserializer(
                 raise CryptographyError(
                     "Tensor is encrypted, but decryption was not requested"
                 )
+            self._has_versioned_metadata: bool = (
+                version_number >= LONG_TENSOR_TENSORIZER_VERSION
+            )
 
             # The total size of the file.
             # WARNING: this is not accurate. This field isn't used in the
@@ -1757,13 +1852,28 @@ class TensorDeserializer(
             # This is a list of offsets into the file where the per-tensor data
             # is stored.
             self._metadata: Dict[_TensorPath, TensorEntry]
+            accepted_metadata_versions: Optional[Tuple[int, ...]] = (
+                (NON_OPAQUE_TENSORIZER_VERSION, LONG_TENSOR_TENSORIZER_VERSION)
+                if self._has_versioned_metadata
+                else None
+            )
             self._metadata, structure, self._metadata_raw = (
                 _MetadataDeserializer.from_io(
-                    self._file, self._file_header.tensor_count
+                    self._file,
+                    self._file_header.tensor_count,
+                    self._has_versioned_metadata,
+                    accepted_metadata_versions,
                 )
             )
             if not self._metadata:
                 raise ValueError("Tensor index in the file is empty")
+            self._long_shape_tensors: typing.FrozenSet[_TensorPath] = frozenset(
+                {
+                    path
+                    for path, entry in self._metadata.items()
+                    if entry.is_long_tensor
+                }
+            )
             # filter_func is a test that determines the tensor names to read.
             # If filter_func is None, all tensors are read.
             if filter_func is not None:
@@ -2961,6 +3071,7 @@ class TensorDeserializer(
                     file_,
                     zero_hashes=True,
                     check_crypt_info=unsafe_self._has_crypt_info,
+                    long_shape_tensors=unsafe_self._long_shape_tensors,
                 )
 
                 if header is None:
@@ -3545,8 +3656,8 @@ class TensorSerializer:
         self._metadata_loc = self._file.tell()
         self._write(bytes(metadata_size))
         self._flush()
-        self._metadata_cur = self._metadata_loc
         self._metadata_end = self._metadata_loc + metadata_size
+        self._metadata_handler = self._MetadataHandler()
 
     @property
     def total_tensor_bytes(self):
@@ -3739,6 +3850,9 @@ class TensorSerializer:
             thread_pool.shutdown(wait=False)
 
     def _synchronize_pools(self):
+        # Synchronizing metadata should happen at the same time as synchronizing
+        # pools, although it is not itself executed in a separate thread.
+        self._synchronize_metadata()
         for j in self._jobs:
             j.result(timeout=_TIMEOUT)
         self._jobs.clear()
@@ -3783,6 +3897,139 @@ class TensorSerializer:
             raise RuntimeError("Illegal nonce reuse")
         self._used_nonces.update(nonces)
         return nonces
+
+    def _synchronize_metadata(self):
+        buffers, total_length, relative_pos = self._metadata_handler.commit()
+        pos: int = self._metadata_loc + relative_pos
+        if pos + total_length > self._metadata_end:
+            raise RuntimeError("Metadata overflow")
+        self._pwrite_bulk(buffers, pos, total_length)
+
+    def _pwrite_bulk(
+        self, buffers: Sequence[bytes], offset: int, expected_length: int
+    ):
+        # This doesn't bother using os.pwritev because it's only called for
+        # small amounts of data here, though if larger buffers get involved,
+        # os.pwritev would be helpful
+        staged_length: int = 0
+        with io.BytesIO() as staging_buffer:
+            for b in buffers:
+                staged_length += staging_buffer.write(b)
+            assert staged_length == expected_length
+            self._pwrite(staging_buffer.getvalue(), offset, expected_length)
+
+    @dataclasses.dataclass(init=False)
+    class _MetadataHandler:
+        """
+        Tracks and buffers metadata to be written to the file header.
+
+        This class takes care of the logic around writing version tags
+        on metadata headers, as well as adding version tags to already-written
+        metadata headers if necessary.
+
+        The interface to this class is two functions:
+        ``submit()`` and ``commit()``. To buffer a metadata entry to be written
+        later, call ``submit()``. When a batch of metadata entries are ready
+        to be written, call ``commit()`` to get a sequence of ``bytes`` objects
+        and the offset to which to write them. State persists across multiple
+        ``commit()`` calls. The writing offset typically advances on successive
+        calls to ``commit()``, but it may go backwards if previously-committed
+        metadata entries need to be rewritten because of other entries written
+        in subsequent batches.
+
+        Internally, it functions like a state machine.
+
+        In its initial state, it tracks pending metadata entries to be written,
+        as well as past metadata entries that were already written. It stays
+        in this state as long as the tensors being written all use the V1
+        metadata scheme (i.e. the original metadata scheme from tensorizer
+        data versions 1 through 4).
+
+        Once it is given any tensor using a metadata scheme newer than V1,
+        it transitions to its second state. In this state, all
+        previously-written metadata entries are moved back into a pending state,
+        and version tags are prepended to every entry. It stays in this state
+        until the next write operation (i.e. the next call to ``commit()``),
+        after which it moves into its final state.
+
+        In its final state, no more history is saved for previously-written
+        metadata entries, as historical entries will at this point never again
+        need to be rewritten. Version tags continue to be prepended
+        to new entries. It remains in this state forever.
+        """
+
+        __slots__ = ("pending", "past", "version", "_pos", "_state")
+        pending: list
+        past: list
+        version: int
+        _pos: int
+
+        class _MetadataHandlerState(enum.Enum):
+            TRACKING_PAST = 1
+            STAGING_PAST = 2
+            NO_PAST = 3
+
+        _state: _MetadataHandlerState
+        V1_TAG: ClassVar[bytes] = b"\x01\x00\x00\x00"
+
+        @property
+        def _tracking_past(self) -> bool:
+            return self._state is self._MetadataHandlerState.TRACKING_PAST
+
+        @property
+        def _staging_past(self) -> bool:
+            return self._state is self._MetadataHandlerState.STAGING_PAST
+
+        @property
+        def _no_past(self) -> bool:
+            return self._state is self._MetadataHandlerState.NO_PAST
+
+        def __init__(self):
+            self.pending = []
+            self.past = []
+            self.version = 1
+            self._pos = 0
+            self._state = self._MetadataHandlerState.TRACKING_PAST
+
+        def submit(self, metadata: bytes, version: int):
+            if version > self.version:
+                if self.version == 1:
+                    self._update()
+                self.version = version
+            if not self._tracking_past:
+                self.pending.append(version.to_bytes(4, byteorder="little"))
+            self.pending.append(metadata)
+
+        def commit(self):
+            # Return a buffer array, total length, and relative write position
+            # Successive write positions are not a monotone sequence
+            pending = self.pending
+            self.pending = []
+            if self._tracking_past:
+                self.past.extend(pending)
+            elif self._staging_past:
+                self._state = self._MetadataHandlerState.NO_PAST
+            total_length = sum(len(d) for d in pending)
+            pos = self._pos
+            self._pos += total_length
+            return pending, total_length, pos
+
+        def _update(self):
+            # This is only called the one time that self.version is updated
+            # up from 1, so this should always be in the initial state
+            assert self._tracking_past
+            # At the time this is called, everything in self.past and
+            # self.pending must be version 1, so no complicated checking is
+            # needed to figure out what needs to be tagged with a v1 tag
+            pending = []
+            v1_tag: typing.Final[bytes] = self.V1_TAG
+            for metadata in itertools.chain(self.past, self.pending):
+                pending.append(v1_tag)
+                pending.append(metadata)
+            self.pending = pending
+            self.past.clear()
+            self._pos = 0
+            self._state = self._MetadataHandlerState.STAGING_PAST
 
     def write_tensor(
         self,
@@ -3972,20 +4219,16 @@ class TensorSerializer:
 
         # Add our tensor metadata to the index.
         metadata = header.metadata_entry
-        # Check for overflow
-        if self._metadata_cur + len(metadata) > self._metadata_end:
-            raise RuntimeError("Metadata overflow")
-
-        metadata_pos = self._metadata_cur
-        metadata_len = len(metadata)
-        self._metadata_cur += metadata_len
-
-        # This task is I/O-bound and has no prerequisites,
-        # so it goes into the regular writer pool.
-        def write_metadata():
-            self._pwrite(metadata, metadata_pos, verify=metadata_len)
-
-        self._jobs.append(self._writer_pool.submit(write_metadata))
+        metadata_version: int
+        if header.has_long_dimensions:
+            metadata_version = LONG_TENSOR_TENSORIZER_VERSION
+            self._file_header.version_number = max(
+                self._file_header.version_number,
+                LONG_TENSOR_TENSORIZER_VERSION,
+            )
+        else:
+            metadata_version = NON_OPAQUE_TENSORIZER_VERSION
+        self._metadata_handler.submit(metadata, metadata_version)
 
         # Calculate the hashes.
 
