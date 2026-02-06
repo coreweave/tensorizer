@@ -1641,3 +1641,373 @@ class TestVerification(unittest.TestCase):
                         self.assertTrue(
                             status, f"Unexpected mismatch on {tensor_name}"
                         )
+
+
+class TestDeviceMap(unittest.TestCase):
+    """Tests for the device_map parameter in TensorDeserializer."""
+
+    _serialized_model_path: str
+
+    @classmethod
+    def setUpClass(cls):
+        serialized_model_path = serialize_model(model_name, "cpu").filename
+        cls._serialized_model_path = serialized_model_path
+        gc.collect()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.unlink(cls._serialized_model_path)
+
+    def _get_all_keys(self) -> list:
+        """Open a lazy probe to retrieve all tensor key names."""
+        with TensorDeserializer(
+            self._serialized_model_path, device="cpu", lazy_load=True
+        ) as probe:
+            return list(probe.keys())
+
+    def _assert_device_placement(self, deserialized, expected_device_map):
+        """Assert every tensor in deserialized sits on its expected device.
+
+        Args:
+            deserialized: An open TensorDeserializer.
+            expected_device_map: A dict mapping tensor name to expected
+                torch.device.
+        """
+        for k, v in deserialized.items():
+            expected = expected_device_map.get(k)
+            if expected is not None:
+                self.assertEqual(
+                    v.device,
+                    expected,
+                    f"Tensor {k} should be on {expected}",
+                )
+
+    def test_device_map_none_preserves_existing_behavior(self):
+        with TensorDeserializer(
+            self._serialized_model_path, device="cpu", device_map=None
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            for k, v in deserialized.items():
+                self.assertEqual(
+                    v.device,
+                    torch.device("cpu"),
+                    f"Tensor {k} should be on cpu with device_map=None",
+                )
+
+    def test_device_map_string_raises_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            TensorDeserializer(
+                self._serialized_model_path,
+                device="cpu",
+                device_map="cuda:0",
+            )
+        self.assertIn("str", str(ctx.exception))
+
+    def test_device_map_wrong_type_raises_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            TensorDeserializer(
+                self._serialized_model_path,
+                device="cpu",
+                device_map=42,
+            )
+        self.assertIn("int", str(ctx.exception))
+
+    def test_device_map_empty_sequence_raises_error(self):
+        with self.assertRaises(ValueError):
+            TensorDeserializer(
+                self._serialized_model_path,
+                device="cpu",
+                device_map=[],
+            )
+
+    def test_device_map_invalid_tensor_name_raises_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            TensorDeserializer(
+                self._serialized_model_path,
+                device="cpu",
+                device_map={"nonexistent.tensor.name": "cpu"},
+            )
+        self.assertIn("not found", str(ctx.exception))
+        self.assertIn("Available tensors", str(ctx.exception))
+
+    def test_explicit_device_map_cpu(self):
+        all_keys = self._get_all_keys()
+        half = len(all_keys) // 2
+        device_map = {k: "cpu" for k in all_keys[:half]}
+
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            device_map=device_map,
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            cpu = torch.device("cpu")
+            self._assert_device_placement(
+                deserialized, {k: cpu for k in deserialized.keys()}
+            )
+
+    def test_sequence_device_map_cpu(self):
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            device_map=["cpu"],
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            for k, v in deserialized.items():
+                self.assertEqual(
+                    v.device,
+                    torch.device("cpu"),
+                    f"Tensor {k} should be on cpu",
+                )
+
+    def test_filter_func_with_device_map(self):
+        pattern = re.compile(r"transformer\.h\.0.*")
+
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            filter_func=pattern.match,
+            device_map=["cpu"],
+        ) as deserialized:
+            check_deserialized(
+                self, deserialized, model_name, allow_subset=True
+            )
+            for k in deserialized.keys():
+                self.assertTrue(
+                    pattern.match(k),
+                    f"Tensor {k} should match filter pattern",
+                )
+
+    def test_lazy_load_with_device_map(self):
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            device_map=["cpu"],
+            lazy_load=True,
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+
+    @unittest.skipUnless(
+        is_cuda_available, reason="Requires CUDA"
+    )
+    def test_explicit_device_map_cuda(self):
+        all_keys = self._get_all_keys()
+        device_map = {k: "cuda:0" for k in all_keys}
+
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            device_map=device_map,
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            cuda0 = torch.device("cuda", 0)
+            self._assert_device_placement(
+                deserialized, {k: cuda0 for k in deserialized.keys()}
+            )
+
+    @unittest.skipUnless(
+        is_cuda_available, reason="Requires CUDA"
+    )
+    def test_sequence_device_map_single_cuda(self):
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            device_map=["cuda:0"],
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            for k, v in deserialized.items():
+                self.assertEqual(
+                    v.device,
+                    torch.device("cuda", 0),
+                    f"Tensor {k} should be on cuda:0",
+                )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.device_count() >= 2,
+        reason="Requires at least 2 CUDA devices",
+    )
+    def test_explicit_device_map_multi_gpu(self):
+        d0 = torch.device("cuda", 0)
+        d1 = torch.device("cuda", 1)
+        all_keys = self._get_all_keys()
+
+        device_map = {k: d0 if i % 2 == 0 else d1 for i, k in enumerate(all_keys)}
+
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            device_map=device_map,
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            self._assert_device_placement(deserialized, device_map)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.device_count() >= 2,
+        reason="Requires at least 2 CUDA devices",
+    )
+    def test_sequence_device_map_multi_gpu_balanced(self):
+        d0 = torch.device("cuda", 0)
+        d1 = torch.device("cuda", 1)
+
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            device_map=[d0, d1],
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+
+            bytes_per_device = {d0: 0, d1: 0}
+            for k, v in deserialized.items():
+                self.assertIn(
+                    v.device,
+                    (d0, d1),
+                    f"Tensor {k} should be on cuda:0 or cuda:1",
+                )
+                bytes_per_device[v.device] += (
+                    v.element_size() * v.nelement()
+                )
+
+            total = sum(bytes_per_device.values())
+            self.assertGreater(total, 0, "No tensor bytes loaded")
+            for dev, dev_bytes in bytes_per_device.items():
+                ratio = dev_bytes / total
+                self.assertGreater(
+                    ratio,
+                    0.3,
+                    f"Device {dev} has only {ratio:.1%} of total bytes,"
+                    f" expected at least 30% for balanced distribution",
+                )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.device_count() >= 2,
+        reason="Requires at least 2 CUDA devices",
+    )
+    def test_device_map_with_multiple_readers(self):
+        d0 = torch.device("cuda", 0)
+        d1 = torch.device("cuda", 1)
+
+        for num_readers in (1, 4):
+            with self.subTest(num_readers=num_readers), TensorDeserializer(
+                self._serialized_model_path,
+                device="cpu",
+                device_map=[d0, d1],
+                num_readers=num_readers,
+            ) as deserialized:
+                check_deserialized(self, deserialized, model_name)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.device_count() >= 2,
+        reason="Requires at least 2 CUDA devices",
+    )
+    def test_device_map_fallback_device(self):
+        d0 = torch.device("cuda", 0)
+        d1 = torch.device("cuda", 1)
+        all_keys = self._get_all_keys()
+
+        # Map only the first tensor; the rest should fall back to device=d0.
+        device_map = {all_keys[0]: d1}
+        expected = {k: d0 for k in all_keys}
+        expected[all_keys[0]] = d1
+
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device=d0,
+            device_map=device_map,
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            self._assert_device_placement(deserialized, expected)
+
+    def test_device_map_invalid_device(self):
+        """Verify RuntimeError when targeting a non-existent CUDA device."""
+        fake_device_index = 99
+        with self.assertRaises(RuntimeError) as ctx:
+            TensorDeserializer(
+                self._serialized_model_path,
+                device="cpu",
+                device_map=[f"cuda:{fake_device_index}"],
+            )
+        self.assertIn("device_map", str(ctx.exception))
+
+    def test_device_map_num_readers_produce_identical_values(self):
+        """num_readers=1 and num_readers=4 should produce identical tensors."""
+        results = {}
+        for num_readers in (1, 4):
+            with self.subTest(num_readers=num_readers), TensorDeserializer(
+                self._serialized_model_path,
+                device="cpu",
+                device_map=["cpu"],
+                num_readers=num_readers,
+            ) as deserialized:
+                results[num_readers] = {
+                    k: TensorInfo.from_tensor(v)
+                    for k, v in deserialized.items()
+                }
+
+        self.assertEqual(
+            results[1].keys(),
+            results[4].keys(),
+            "Keys should be identical across num_readers values",
+        )
+        for k in results[1]:
+            self.assertEqual(
+                results[1][k].hash,
+                results[4][k].hash,
+                f"Tensor {k} hash differs between num_readers=1 and num_readers=4",
+            )
+
+    @unittest.skipUnless(
+        is_cuda_available, reason="Requires CUDA"
+    )
+    def test_device_map_cpu_and_cuda_mixed(self):
+        """Mix of CPU and CUDA devices in the explicit map."""
+        all_keys = self._get_all_keys()
+        cuda_device = torch.device("cuda", 0)
+        cpu_device = torch.device("cpu")
+        device_map = {
+            k: cuda_device if i % 2 == 0 else cpu_device
+            for i, k in enumerate(all_keys)
+        }
+
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            device_map=device_map,
+        ) as deserialized:
+            check_deserialized(self, deserialized, model_name)
+            self._assert_device_placement(deserialized, device_map)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.device_count() >= 2,
+        reason="Requires at least 2 CUDA devices",
+    )
+    def test_device_map_load_into_module(self):
+        """load_into_module respects device_map placement."""
+        d0 = torch.device("cuda", 0)
+        d1 = torch.device("cuda", 1)
+        all_keys = self._get_all_keys()
+
+        config = AutoConfig.from_pretrained(model_name)
+        with utils.no_init_or_tensor():
+            model = AutoModelForCausalLM.from_config(config)
+
+        device_map = {k: d0 if i % 2 == 0 else d1 for i, k in enumerate(all_keys)}
+
+        with TensorDeserializer(
+            self._serialized_model_path,
+            device="cpu",
+            device_map=device_map,
+        ) as deserialized:
+            deserialized.load_into_module(model)
+
+        # Verify each named parameter/buffer is on the device specified
+        # in the device_map, using the map lookup rather than index order.
+        named_tensors = dict(model.named_parameters())
+        named_tensors.update(model.named_buffers())
+        for name in device_map:
+            if name in named_tensors:
+                self.assertEqual(
+                    named_tensors[name].device,
+                    device_map[name],
+                    f"Parameter {name} should be on {device_map[name]}"
+                    f" after load_into_module",
+                )
