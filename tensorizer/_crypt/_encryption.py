@@ -346,6 +346,21 @@ crypto_stream_salsa20_xor_ic = init_crypto_stream_salsa20_xor_ic()
 sodium_memzero = init_sodium_memzero()
 
 
+def _pop_annotations(dct: dict) -> dict:
+    """Extract annotations from a metaclass namespace dict.
+
+    In Python 3.14+ (PEP 649), annotations are lazily evaluated and stored
+    as ``__annotate_func__`` instead of ``__annotations__``.
+    """
+    annotations = dct.pop("__annotations__", None)
+    if annotations is not None:
+        return annotations
+    annotate_func = dct.get("__annotate_func__")
+    if annotate_func is not None:
+        return annotate_func(1)
+    return {}
+
+
 class Constants(type):
     @staticmethod
     def _get_constant(name, typ) -> int:
@@ -355,7 +370,7 @@ class Constants(type):
         return getter()
 
     def __new__(cls, name: str, bases: tuple, dct: dict) -> NamedTuple:
-        annotations = dct.pop("__annotations__", {})
+        annotations = _pop_annotations(dct)
         entries = {}
         for constant_name, constant_type in dct.items():
             if constant_name.startswith("_"):
