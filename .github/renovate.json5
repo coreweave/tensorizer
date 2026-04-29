@@ -1,0 +1,18 @@
+{
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions updates into single PR",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "Disable container image updates - GitHub Actions pinning only",
+      "matchDatasources": ["docker"],
+      "enabled": false
+    }
+  ]
+}
