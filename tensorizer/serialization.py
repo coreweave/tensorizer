@@ -40,6 +40,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Mapping,
     Optional,
     Sequence,
     Set,
@@ -1602,7 +1603,8 @@ class TensorDeserializer(
     Args:
         file_obj: A file-like object to read from. It can also be a string
             representing a path to a file or an HTTP/HTTPS/S3 URI.
-        device: The device to load the tensors to.
+        device: The device to load the tensors to. Acts as a fallback
+            for tensors not covered by ``device_map``.
         filter_func: A function ``(tensor_name: str) -> bool`` that returns True
             if a tensor should be loaded, or False if it should be skipped.
             If None, all tensors are loaded.
@@ -1614,6 +1616,14 @@ class TensorDeserializer(
             ``(tensor_path: str | Sequence[str | int] -> bool)`` instead.
         dtype: The dtype to cast the tensors as when loading them into a torch
             module. If None, the dtype will be inferred from the file.
+        device_map: Optional mapping of tensor names to devices, or a sequence
+            of devices for automatic balancing by tensor size.
+            When a ``Mapping``, keys are tensor names and values are target
+            devices. When a ``Sequence`` of devices, tensors are assigned
+            using a greedy largest-first strategy that places each tensor on
+            the device with the smallest accumulated byte total, balancing
+            memory across the listed devices. ``None`` (the default) places
+            all tensors on ``device``.
         lazy_load: If True, tensors will be loaded and cached when keys are
             accessed. If False, all tensors will be loaded into memory up
             front.
@@ -1692,6 +1702,12 @@ class TensorDeserializer(
         filter_func: Optional[FilterFuncType] = None,
         dtype: Optional[torch.dtype] = None,
         *,
+        device_map: Optional[
+            Union[
+                Mapping[str, Union[str, torch.device]],
+                Sequence[Union[str, torch.device]],
+            ]
+        ] = None,
         lazy_load: bool = False,
         plaid_mode: Optional[bool] = None,  # pylint: disable=unused-argument
         plaid_mode_buffers: Optional[
@@ -1896,6 +1912,12 @@ class TensorDeserializer(
                 structure.filter(self._metadata.__contains__)
             self._structure: Dict[Union[str, int], Any] = structure.dict()
 
+            self._tensor_devices: Optional[Dict[_TensorPath, torch.device]] = (
+                None
+            )
+            if device_map is not None:
+                self._tensor_devices = self._resolve_device_map(device_map)
+
             dynamic_num_readers: bool = num_readers is None
             if not dynamic_num_readers and not isinstance(num_readers, int):
                 raise TypeError(
@@ -2014,7 +2036,14 @@ class TensorDeserializer(
             # loading to the GPU, because after eager loading finishes and data
             # has been moved from the CPU to the GPU, there is no need to keep
             # around the CPU buffers anymore, and we can clean up early.
-            if self._lazy_load or not is_cuda:
+            any_cuda = is_cuda or (
+                self._tensor_devices is not None
+                and any(
+                    d.type == "cuda"
+                    for d in self._tensor_devices.values()
+                )
+            )
+            if self._lazy_load or not any_cuda:
                 self._cleanup = self._cleanup.pop_all()
 
     @property
@@ -2189,6 +2218,110 @@ class TensorDeserializer(
             return lambda timeout=None: None
 
     _preload_cuda_called: ClassVar[bool] = False
+
+    def _resolve_device_map(
+        self,
+        device_map: Union[
+            Mapping[str, Union[str, torch.device]],
+            Sequence[Union[str, torch.device]],
+        ],
+    ) -> Dict[_TensorPath, torch.device]:
+        if isinstance(device_map, str):
+            raise ValueError(
+                "device_map: expected a Mapping[str, device] or"
+                " Sequence[device], got str."
+                " Pass a list of devices instead, e.g. [\"cuda:0\", \"cuda:1\"]"
+            )
+        if isinstance(device_map, collections.abc.Mapping):
+            return self._resolve_explicit_device_map(device_map)
+        elif isinstance(device_map, collections.abc.Sequence):
+            return self._resolve_sequence_device_map(device_map)
+        else:
+            raise ValueError(
+                "device_map: expected a Mapping[str, device] or"
+                " Sequence[device], got"
+                f" {device_map.__class__.__name__}"
+            )
+
+    def _resolve_explicit_device_map(
+        self,
+        device_map: Mapping[str, Union[str, torch.device]],
+    ) -> Dict[_TensorPath, torch.device]:
+        available_names = {
+            path.normalize_(): path for path in self._metadata.keys()
+        }
+        result: Dict[_TensorPath, torch.device] = {}
+        for name, dev in device_map.items():
+            if name not in available_names:
+                available = sorted(str(k) for k in available_names.keys())
+                raise ValueError(
+                    f"device_map: tensor {name!r} not found in serialized file."
+                    f" Available tensors: {available}"
+                )
+            dev = torch.device(dev)
+            dev = self._validate_target_device(dev)
+            result[available_names[name]] = dev
+        return result
+
+    def _resolve_sequence_device_map(
+        self,
+        devices: Sequence[Union[str, torch.device]],
+    ) -> Dict[_TensorPath, torch.device]:
+        if not devices:
+            raise ValueError("device_map: sequence must not be empty")
+        resolved_devices: List[torch.device] = [
+            self._validate_target_device(torch.device(dev))
+            for dev in devices
+        ]
+
+        # Greedy largest-first balancing: sort tensors by size descending,
+        # assign each to the device with the smallest current total bytes.
+        entries = sorted(
+            (
+                (entry.deserialized_length, path)
+                for path, entry in self._metadata.items()
+            ),
+            reverse=True,
+        )
+
+        # Min-heap of [total_bytes, device_index].  Lists are used because
+        # the total_bytes element is mutated in-place before re-pushing.
+        device_loads: List[List[int]] = [
+            [0, i] for i in range(len(resolved_devices))
+        ]
+        heapq.heapify(device_loads)
+
+        result: Dict[_TensorPath, torch.device] = {}
+        for size, path in entries:
+            least_loaded = heapq.heappop(device_loads)
+            result[path] = resolved_devices[least_loaded[1]]
+            least_loaded[0] += size
+            heapq.heappush(device_loads, least_loaded)
+        return result
+
+    @staticmethod
+    def _validate_target_device(dev: torch.device) -> torch.device:
+        if dev.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    f"device_map: cannot target {dev} because"
+                    " CUDA is not available"
+                )
+            if dev.index is None:
+                dev = torch.device("cuda", torch.cuda.current_device())
+            device_count = torch.cuda.device_count()
+            if dev.index >= device_count:
+                raise RuntimeError(
+                    f"device_map: cannot target {dev} because"
+                    f" only {device_count} CUDA"
+                    f" device{'s' * (device_count != 1)} available"
+                )
+        return dev
+
+    def _get_tensor_device(self, name: _TensorPath) -> torch.device:
+        if self._tensor_devices is not None and name in self._tensor_devices:
+            return self._tensor_devices[name]
+        return self._device
 
     def _read_single_tensor(
         self, expected_path: _TensorPath
@@ -2783,6 +2916,13 @@ class TensorDeserializer(
             raise RuntimeError(
                 "read_numpy_arrays is only valid when deserializing to the CPU"
             )
+        if self._tensor_devices is not None and any(
+            d.type != "cpu" for d in self._tensor_devices.values()
+        ):
+            raise RuntimeError(
+                "read_numpy_arrays is not supported when device_map"
+                " targets non-CPU devices"
+            )
         copied_data = self._read_numpytensors(
             filter_func=filter_func,
             num_tensors=num_tensors,
@@ -2810,18 +2950,21 @@ class TensorDeserializer(
             yield module_idx, tensor_type, name.normalize_(), arr, is_opaque, torch_dtype
 
     def _to_torch_parameter(
-        self, tensor: Union[torch.Tensor, torch.nn.Parameter]
+        self,
+        tensor: Union[torch.Tensor, torch.nn.Parameter],
+        target_device: Optional[torch.device] = None,
     ) -> torch.nn.Parameter:
         """
         Convert a tensor to a torch.nn.Parameter on a device, forcing
         gradient when appropriate. We also handle torch.nn.Parameter objects in
         a passthrough manner.
         """
+        device = target_device if target_device is not None else self._device
         original_device: torch.device = tensor.device
         if isinstance(tensor, torch.nn.Parameter):
-            tensor.data = tensor.data.to(self._device)
+            tensor.data = tensor.data.to(device)
             if tensor.grad is not None:
-                tensor.grad = tensor.grad.to(self._device)
+                tensor.grad = tensor.grad.to(device)
             return tensor
 
         # Cast the tensor if a global dtype was given to the TensorDeserializer
@@ -2837,7 +2980,7 @@ class TensorDeserializer(
         gradient = tensor.dtype.is_complex or tensor.dtype.is_floating_point
 
         start = time.perf_counter_ns() if _perf_stats else 0
-        tensor_on_device = tensor.to(device=self._device, dtype=target_dtype)
+        tensor_on_device = tensor.to(device=device, dtype=target_dtype)
         end = time.perf_counter_ns() if _perf_stats else 0
 
         result = torch.nn.Parameter(
@@ -3003,10 +3146,25 @@ class TensorDeserializer(
         # Need to get rid of self or more safely have thread-local storage
 
         try:
-            is_cuda = unsafe_self._device.type == "cuda"
-            cuda_stream = None
-            if is_cuda:
-                cuda_stream = torch.cuda.Stream(unsafe_self._device)
+            # Determine whether any tensor in this thread targets CUDA.
+            # When device_map is active, each tensor may target a
+            # different device, so we check all of them.
+            has_device_map = unsafe_self._tensor_devices is not None
+            if has_device_map:
+                is_cuda = any(
+                    unsafe_self._get_tensor_device(t.name).type == "cuda"
+                    for t in tensor_items
+                )
+            else:
+                is_cuda = unsafe_self._device.type == "cuda"
+
+            cuda_streams: Dict[torch.device, torch.cuda.Stream] = {}
+            if is_cuda and not has_device_map:
+                # Pre-create the single stream for the common case where
+                # all tensors share one CUDA device.
+                cuda_streams[unsafe_self._device] = torch.cuda.Stream(
+                    unsafe_self._device
+                )
 
             # Allocating pinned memory seems to block creating new threads, so
             # ensure all threads are created before we go
@@ -3136,16 +3294,31 @@ class TensorDeserializer(
                 is_meta = needed_buffer_size > 0 and header.data_length == 0
                 assert is_meta or needed_buffer_size == header.data_length
 
-                if is_cuda:
+                # Resolve the target device for this specific tensor.
+                # When no device_map is active, avoid the per-tensor
+                # method call and dict lookup on the hot path.
+                if has_device_map:
+                    tensor_device = unsafe_self._get_tensor_device(
+                        header.name
+                    )
+                    tensor_is_cuda = tensor_device.type == "cuda"
+                else:
+                    tensor_device = unsafe_self._device
+                    tensor_is_cuda = is_cuda
+
+                if tensor_is_cuda:
                     if is_meta:
                         shared_buffer_tensor[:needed_buffer_size].zero_()
                     mv: memoryview = shared_buffer_mv[:needed_buffer_size]
                 else:
-                    # Not in CUDA, no pinned memory.
-                    # Allocate a new buffer for each tensor
-                    # because that's what we're going to be using long-term
+                    # Allocate a dedicated CPU buffer for this tensor.
+                    # This is necessary both when no CUDA is involved and
+                    # when this tensor targets CPU while a shared pinned
+                    # buffer exists for other CUDA-targeted tensors.
                     buffer_tensor = torch.empty(
-                        (needed_buffer_size,), device="cpu", dtype=torch.uint8
+                        (needed_buffer_size,),
+                        device="cpu",
+                        dtype=torch.uint8,
                     )
                     if is_meta:
                         buffer_tensor.zero_()
@@ -3186,13 +3359,21 @@ class TensorDeserializer(
                 del mv
                 tensor = numpy_tensor.to_tensor()
 
-                stream_context = (
-                    torch.cuda.stream(cuda_stream)
-                    if is_cuda
-                    else contextlib.nullcontext()
-                )
+                if tensor_is_cuda:
+                    # Get or create a CUDA stream for this device
+                    cuda_stream = cuda_streams.get(tensor_device)
+                    if cuda_stream is None:
+                        cuda_stream = torch.cuda.Stream(tensor_device)
+                        cuda_streams[tensor_device] = cuda_stream
+                    stream_context = torch.cuda.stream(cuda_stream)
+                else:
+                    cuda_stream = None
+                    stream_context = contextlib.nullcontext()
+
                 with stream_context:
-                    parameter = unsafe_self._to_torch_parameter(tensor)
+                    parameter = unsafe_self._to_torch_parameter(
+                        tensor, target_device=tensor_device
+                    )
                     if cuda_stream is not None:
                         cuda_stream.synchronize()
 
