@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import secrets
+import struct
 import sys
 import tempfile
 import time
@@ -344,6 +345,40 @@ class TestSerialization(unittest.TestCase):
                     del deserialized
                 finally:
                     os.unlink(serialized_model)
+
+    def test_oversized_tensor_header_is_rejected(self):
+        with temporary_file("wb+") as tensorized_file:
+            serializer = TensorSerializer(tensorized_file)
+            serializer.write_state_dict({"tensor": torch.zeros(1)})
+            serializer.close()
+
+            with TensorDeserializer(
+                tensorized_file.name,
+                device="cpu",
+                lazy_load=True,
+                num_readers=1,
+            ) as deserializer:
+                entry = deserializer._metadata[("tensor",)]
+
+            with open(tensorized_file.name, "rb") as file:
+                data = bytearray(file.read())
+
+            legal_header_len = entry.data_offset - entry.offset
+            struct.pack_into(
+                "<Q", data, entry.offset, legal_header_len + 1
+            )
+            with open(tensorized_file.name, "wb") as file:
+                file.write(data)
+
+            with TensorDeserializer(
+                tensorized_file.name,
+                device="cpu",
+                lazy_load=True,
+                num_readers=1,
+            ) as deserializer, self.assertRaisesRegex(
+                ValueError, "Tensor header length exceeds metadata bounds"
+            ):
+                deserializer["tensor"]
 
     def test_large_unbuffered_tensor(self):
         shape = (36000, 36000)  # 4.828 GiB
