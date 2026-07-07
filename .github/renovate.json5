@@ -1,0 +1,24 @@
+{
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions updates into single PR",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "Disable GitHub Actions version updates - SHA pinning only",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "enabled": false
+    },
+    {
+      "description": "Disable container image updates - GitHub Actions pinning only",
+      "matchDatasources": ["docker"],
+      "enabled": false
+    }
+  ]
+}
