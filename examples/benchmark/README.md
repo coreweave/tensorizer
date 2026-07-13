@@ -9,7 +9,7 @@ and [HuggingFace Transformers](https://huggingface.co/docs/transformers/index).
 
 As configured, the benchmark job will deserialize
 [OPT-30B](https://huggingface.co/facebook/opt-30b) 100 times using each library.
-This can be reconfigured by changing the the `MODEL_ID` and `MODEL_PATH`
+This can be reconfigured by changing the `MODEL_ID` and `MODEL_PATH`
 environment variables described under [Serialization](#serialization)
 and [Deserialization](#deserialization) below.
 
