@@ -4,6 +4,7 @@ import io
 import logging
 import mmap
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -40,6 +41,10 @@ _BASE_USER_AGENT = f"Tensorizer/{_version.__version__}"
 # Curl's user agent is curl/<version>, but it's not worth
 # spawning another subprocess just to check that
 _CURL_USER_AGENT = f"{_BASE_USER_AGENT} (curl)"
+
+# Matches a successful (2xx) status line for any HTTP version cURL may report,
+# e.g. "HTTP/1.0 200 OK", "HTTP/1.1 206 Partial Content", or "HTTP/2 200"
+_HTTP_SUCCESS_STATUS_LINE = re.compile(rb"HTTP/\d+(?:\.\d+)? 2")
 
 # Botocore appends " Botocore/<version>" to the end of the user agent on its own
 _BOTO_USER_AGENT = f"{_BASE_USER_AGENT} (Boto3/{boto3.__version__})"
@@ -328,7 +333,7 @@ class CURLStreamFile(io.BufferedIOBase):
         self.popen_latencies.append(popen_end - popen_start)
         self.http_response_latencies.append(resp_begin - popen_end)
 
-        if not resp.startswith((b"HTTP/1.1 2", b"HTTP/2 2")):
+        if not _HTTP_SUCCESS_STATUS_LINE.match(resp):
             # If the error was caused by an invalid response, display that
             explanation = f": {resp.decode('utf-8')}" if resp.strip() else ""
             if not explanation:
