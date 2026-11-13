@@ -8,7 +8,7 @@ env:
 jobs:
   build:
     name: Build & push docker image
-    runs-on: ubuntu-latest
+    runs-on: cw-static-pub-x64-4c
     steps:
       - uses: actions/checkout@v4
       

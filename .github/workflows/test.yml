@@ -5,7 +5,7 @@ on: [push, pull_request]
 jobs:
   run_tests:
     name: Run tests
-    runs-on: ubuntu-22.04
+    runs-on: cw-static-pub-x64-4c
     steps:
       - uses: actions/checkout@v4
 

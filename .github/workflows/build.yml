@@ -7,7 +7,7 @@ on:
 jobs:
   build_dist:
     name: Build distribution on Ubuntu
-    runs-on: ubuntu-22.04
+    runs-on: cw-static-pub-x64-4c
     steps:
       - uses: actions/checkout@v4
 
@@ -28,7 +28,7 @@ jobs:
   upload_dist:
     needs: [ build_dist ]
     name: Upload distribution to PyPI
-    runs-on: ubuntu-22.04
+    runs-on: cw-static-pub-x64-4c
     if: github.event_name == 'release' && github.event.action == 'published'
     steps:
       - uses: actions/download-artifact@v3
