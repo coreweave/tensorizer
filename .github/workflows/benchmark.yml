@@ -5,15 +5,19 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
     name: Build & push docker image
-    runs-on: ubuntu-latest
+    runs-on: cw-static-pub-x64-4c
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       
       - name: 'Login to GitHub Container Registry'
-        uses: docker/login-action@v1
+        uses: docker/login-action@dd4fa0671be5250ee6f50aedf4cb05514abda2c7  # v1
         with:
           registry: ${{env.REGISTRY}}
           username: ${{github.actor}}
@@ -21,7 +25,7 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v5.0.0
+        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934  # v5.0.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags:
