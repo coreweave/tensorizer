@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import http.server
 import logging
 import os
 import re
@@ -89,6 +90,66 @@ class TestCurlStream(unittest.TestCase):
         self.assertEqual(b"GPT Neo", stream.read(7))
         stream.seek(13)
         self.assertEqual(b"[DOI]", stream.read(5))
+
+
+@contextlib.contextmanager
+def local_http_server(directory: str, protocol_version: str) -> str:
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=directory, **kwargs)
+
+        def log_message(self, *args):
+            pass
+
+    Handler.protocol_version = protocol_version
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]:d}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=30)
+
+
+class TestCurlStreamLocalServer(unittest.TestCase):
+    # Python's http.server answers with an "HTTP/1.0 200 OK" status line
+    # by default, as do many other simple and static file servers.
+    PROTOCOL_VERSIONS = ("HTTP/1.0", "HTTP/1.1")
+    CONTENT = b"tensorizer local http stream test\n" * 64
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp_dir = tempfile.TemporaryDirectory()
+        with open(os.path.join(cls._tmp_dir.name, "data.bin"), "wb") as f:
+            f.write(cls.CONTENT)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp_dir.cleanup()
+
+    def test_curl_stream_http_versions(self):
+        for protocol_version in self.PROTOCOL_VERSIONS:
+            with self.subTest(protocol_version=protocol_version):
+                with local_http_server(
+                    self._tmp_dir.name, protocol_version
+                ) as url:
+                    stream = stream_io.CURLStreamFile(f"{url}/data.bin")
+                    try:
+                        self.assertEqual(self.CONTENT[:10], stream.read(10))
+                        self.assertEqual(self.CONTENT[10:], stream.read())
+                    finally:
+                        stream.close()
+
+    def test_curl_stream_http_error(self):
+        for protocol_version in self.PROTOCOL_VERSIONS:
+            with self.subTest(protocol_version=protocol_version):
+                with local_http_server(
+                    self._tmp_dir.name, protocol_version
+                ) as url:
+                    with self.assertRaises(OSError):
+                        stream_io.CURLStreamFile(f"{url}/missing.bin")
 
 
 def set_up_moto(*endpoints):
