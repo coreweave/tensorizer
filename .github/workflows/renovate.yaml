@@ -1,0 +1,39 @@
+name: Renovate
+
+on:
+  workflow_dispatch:
+    inputs:
+      dryRun:
+        description: Run Renovate in dry-run mode
+        type: boolean
+        default: false
+      logLevel:
+        description: Renovate log level
+        type: choice
+        default: info
+        options:
+          - debug
+          - info
+          - warn
+          - error
+  schedule:
+    - cron: "17 8 * * *"
+  push:
+    branches: ["main"]
+    paths:
+      - .github/renovate.json5
+      - .github/renovate/**.json5
+      - .github/workflows/renovate.yaml
+
+concurrency:
+  group: run-renovate-bot
+  cancel-in-progress: true
+
+jobs:
+  renovate:
+    uses: coreweave/actions/.github/workflows/run-renovate.yml@workflows-v2
+    secrets: inherit
+    with:
+      runs-on: cw-dind-small-org
+      dry-run: ${{ inputs.dryRun }}
+      log-level: ${{ inputs.logLevel }}
