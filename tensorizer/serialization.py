@@ -2829,6 +2829,7 @@ class TensorDeserializer(
             self._dtype is not None
             and tensor.dtype != torch.bool
             and tensor.dtype != self._dtype
+            and not (tensor.dtype.is_complex and not self._dtype.is_complex)
         ):
             target_dtype = self._dtype
         else:

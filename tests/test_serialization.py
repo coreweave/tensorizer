@@ -519,6 +519,101 @@ class TestSerialization(unittest.TestCase):
 
         self.assertTrue(torch.equal(tensor, deserialized_tensor))
 
+    def test_complex64(self):
+        shape = (8, 8)
+        real = torch.normal(0, 0.5, shape, dtype=torch.float32)
+        imag = torch.normal(0, 0.5, shape, dtype=torch.float32)
+        tensor = torch.complex(real, imag)
+        self.assertEqual(tensor.dtype, torch.complex64)
+
+        with temporary_file(mode="wb+") as tensorized_file:
+            serializer = TensorSerializer(tensorized_file)
+            serializer.write_state_dict({"test_tensor": tensor})
+            serializer.close()
+
+            with TensorDeserializer(
+                tensorized_file.name, device="cpu"
+            ) as deserializer:
+                deserialized_tensor = deserializer["test_tensor"]
+
+        self.assertEqual(deserialized_tensor.dtype, torch.complex64)
+        self.assertTrue(torch.equal(tensor, deserialized_tensor))
+
+    def test_casting_mixed_dtypes_to_real(self):
+        # Passing a dtype to TensorDeserializer must cast real tensors,
+        # but must not cast complex tensors to a real dtype, as that would
+        # discard the imaginary part.
+        shape = (8, 8)
+        bf16_tensor = torch.normal(0, 0.5, shape, dtype=torch.bfloat16)
+        fp32_tensor = torch.normal(0, 0.5, shape, dtype=torch.float32)
+        complex_tensor = torch.complex(
+            torch.normal(0, 0.5, shape, dtype=torch.float32),
+            torch.normal(0, 0.5, shape, dtype=torch.float32),
+        )
+        sd = {
+            "bf16": bf16_tensor,
+            "fp32": fp32_tensor,
+            "complex": complex_tensor,
+        }
+
+        with temporary_file(mode="wb+") as tensorized_file:
+            serializer = TensorSerializer(tensorized_file)
+            serializer.write_state_dict(sd)
+            serializer.close()
+
+            with TensorDeserializer(
+                tensorized_file.name,
+                device="cpu",
+                dtype=torch.bfloat16,
+            ) as deserializer:
+                out_bf16 = deserializer["bf16"]
+                out_fp32 = deserializer["fp32"]
+                out_complex = deserializer["complex"]
+
+        self.assertEqual(out_bf16.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(bf16_tensor, out_bf16))
+
+        self.assertEqual(out_fp32.dtype, torch.bfloat16)
+        self.assertTrue(
+            torch.allclose(fp32_tensor.to(torch.bfloat16), out_fp32)
+        )
+
+        self.assertEqual(out_complex.dtype, torch.complex64)
+        self.assertTrue(torch.equal(complex_tensor, out_complex))
+
+    def test_casting_mixed_dtypes_to_complex(self):
+        # Casts to a complex target dtype should be honoured for both
+        # complex and real source tensors.
+        shape = (8, 8)
+        complex_tensor = torch.complex(
+            torch.normal(0, 0.5, shape, dtype=torch.float32),
+            torch.normal(0, 0.5, shape, dtype=torch.float32),
+        )
+        self.assertEqual(complex_tensor.dtype, torch.complex64)
+        fp32_tensor = torch.normal(0, 0.5, shape, dtype=torch.float32)
+        sd = {"complex": complex_tensor, "fp32": fp32_tensor}
+
+        with temporary_file(mode="wb+") as tensorized_file:
+            serializer = TensorSerializer(tensorized_file)
+            serializer.write_state_dict(sd)
+            serializer.close()
+
+            with TensorDeserializer(
+                tensorized_file.name,
+                device="cpu",
+                dtype=torch.complex128,
+            ) as deserializer:
+                out_complex = deserializer["complex"]
+                out_fp32 = deserializer["fp32"]
+
+        self.assertEqual(out_complex.dtype, torch.complex128)
+        self.assertTrue(
+            torch.equal(complex_tensor.to(torch.complex128), out_complex)
+        )
+
+        self.assertEqual(out_fp32.dtype, torch.complex128)
+        self.assertTrue(torch.equal(fp32_tensor.to(torch.complex128), out_fp32))
+
     def test_meta_tensors(self):
         # This test is modeled after self.test_persistent_buffers
         shape = (50, 50)
